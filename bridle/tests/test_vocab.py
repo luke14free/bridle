@@ -22,6 +22,7 @@ names.
 import re
 import sys
 
+from bridle.skill.spec import _quantity
 from bridle.skill.vocab import (
     CHASSIS, MEASURES, PREDICATES, TERMS, Frame, Sign, base_term, vocab_document,
 )
@@ -69,6 +70,35 @@ def run_checks():
     check("mode choices are exactly add|replace|floor",
           set(mode_param.choices) == {"add", "replace", "floor"})
 
+    # ── every closed set is `choices`, never prose (2026-08-12 re-review, minor 3) ────────────────
+    # PredicateBonus.mode was fixed above and the same hole was left open in five more places:
+    # `predicate_ref` stated `per_step | latched` in its doc and declared `choices=()`, so
+    # `predicate_ref: "per_stpe"` parsed clean and reached the fold; `kernel`, `side` and `norm` the
+    # same. SuccessBonus.mode was worse than prose-only — its prose said `add | replace` while the
+    # fold has always honoured `floor` too. The expected sets are compile.py's `_HONOURED` table,
+    # i.e. what the fold actually implements, so the schema tier cannot declare legal a value the
+    # fold will refuse (or the reverse).
+    for term_name, pname, expected in (
+            ("SuccessBonus", "predicate_ref", {"per_step", "latched"}),
+            ("SuccessBonus", "mode", {"add", "replace", "floor"}),
+            ("HingePenalty", "side", {"above", "below"}),
+            ("DistancePull", "kernel", {"one_minus_tanh", "neg_linear", "gaussian"}),
+            ("ActionPenalty", "norm", {"l2"}),
+    ):
+        p = next(x for x in TERMS[term_name].params if x.name == pname)
+        check(f"{term_name}.{pname} declares its legal set as `choices`, not prose",
+              set(p.choices) == expected)
+    # ...and the general rule, so the NEXT parameter added with a prose set cannot repeat the gap:
+    # the house convention for spelling a legal set in a doc is `a | b`, and a doc that does it must
+    # back it with `choices`. (This is the recurrence guard; the table above is the content.)
+    prose_only = sorted(f"{t}.{p.name}" for t, term in TERMS.items() for p in term.params
+                        if p.type == "str" and re.search(r"\w \| \w", p.doc) and not p.choices)
+    check("no str param spells a legal set in prose without declaring `choices`" +
+          (f" (prose-only: {prose_only})" if prose_only else ""),
+          not prose_only)
+    check("the prose-set guard bites on the shape it names (some doc does spell `a | b`)",
+          any(re.search(r"\w \| \w", p.doc) for term in TERMS.values() for p in term.params))
+
     # ── measures: sign and frame are mandatory and load-bearing ──
     check("height_above_seat_live exists", "height_above_seat_live" in MEASURES)
     check("height_above_seat_live is SIGNED — an unsigned one zeroes the crush penalty",
@@ -84,6 +114,29 @@ def run_checks():
           {"height_above_seat_live", "height_above_seat_static_goal"} <= set(MEASURES) and
           all(MEASURES[n].sign is Sign.SIGNED
               for n in ("height_above_seat_live", "height_above_seat_static_goal")))
+
+    # ── the frame-collision rule, as a GENERAL invariant (2026-08-12 re-review, Important 1) ──────
+    # Design doc §1.2: a quantity readable in more than one frame carries its frame IN THE KEY, and
+    # the bare quantity names nothing. Nothing enforced that beyond the seat height. spec.py builds
+    # its ambiguity table `_FRAME_VARIANTS` under the filter `len(keys) > 1 and q not in MEASURES`,
+    # so a family that grew a frame-qualified sibling beside a BARE key — add
+    # `height_above_resting_static_goal` next to the existing `height_above_resting` — drops OUT of
+    # the table, and the bare name goes on resolving silently to LIVE. Same defect, different family.
+    # Neither guard written for the seat-height rename can see it: `set(LEGAL_MEASURE_NAMES) ==
+    # set(MEASURES)` is a tautology (LEGAL_MEASURE_NAMES is literally `frozenset(MEASURES)`), and the
+    # sibling check above only asserts the one string "height_above_seat" is absent.
+    #
+    # So assert the property itself, over every key: a measure's quantity stem is either the measure
+    # itself or is not a measure at all. `_quantity` is imported from spec.py rather than reimplemented
+    # so the test cannot drift from the stem function the ambiguity table is actually built with.
+    # PROVEN TO BITE: adding a colliding `height_above_resting_static_goal` to MEASURES fails this
+    # check with `collisions: ['height_above_resting_static_goal']` while every other check stays green.
+    collisions = sorted(k for k in MEASURES if _quantity(k) != k and _quantity(k) in MEASURES)
+    check("no frame-qualified measure shadows a bare measure of the same quantity" +
+          (f" (collisions: {collisions})" if collisions else ""),
+          not collisions)
+    check("the collision check bites on the shape it names (a stem-stripping frame suffix exists)",
+          any(_quantity(k) != k for k in MEASURES))
     check("every chassis default names a measure that exists (the rename can't half-land)",
           all(row["measure"] in MEASURES
               for chassis in CHASSIS.values() for row in chassis.defaults.values()
@@ -163,8 +216,37 @@ def run_checks():
     check("document names every measure", all(m in doc for m in MEASURES))
     check("document states each default's rationale", doc.count("why") >= 6 or "because" in doc)
     check("document marks which measures are signed", "signed" in doc.lower())
-    # budget: ~4 chars/token. The audit budgeted 3400-4600 tokens for the whole payload.
-    check(f"document fits a 30B prompt ({len(doc)} chars, budget 24000)", len(doc) < 24000)
+    # ── SIZE: a derived token budget, not a round char count (2026-08-12 re-review, Important 2) ──
+    # This used to read `len(doc) < 24000` against a measured 23,995 — FOUR characters of slack. The
+    # next word added to any measure doc, term doc or chassis `why` would fail a test in a file
+    # unrelated to the change, and the cheapest way to green it is deleting rationale prose: exactly
+    # the evidence the "comments carry their measurement" rule exists to protect. The 24,000 was also
+    # a raw char count standing in for a token budget, with no recorded derivation. Both fixed here.
+    #
+    # WHERE THE CEILING COMES FROM. This document is a 27-30B model's prompt payload and has to fit
+    # alongside a task description and one worked example. The audit's §5 SIZE table costs the
+    # vocabulary at 3,400-4,600 tokens and the FULL authoring prompt — vocabulary plus the 55-field
+    # scene/tolerance schema inline — at a worst case of ~8,000, and concludes: "That fits a 30B
+    # model's working context with large margin (32k minimum for anything current). Context length is
+    # not the constraint." 8,000 tokens is therefore the ceiling: the largest payload the audit
+    # costed and still called comfortable, applied to its largest single component.
+    #
+    # WHY THE MARGIN IS WHAT IT IS. The document measures ~6,000 estimated tokens today — above the
+    # audit's 3,400-4,600 vocabulary line because that table prices no chassis at all (the 6 presets
+    # with their `why` rationales are the audit's own §6 recommendation, costed nowhere in its §5),
+    # plus amendment 1's added measures and terms. Against 8,000 that leaves ~2,000 tokens (~8,000
+    # chars) of headroom — room to add a rationale to every chassis row without touching this test,
+    # which is the point of the margin. A document that DOUBLED would estimate ~12,000 tokens and
+    # still fail, which is the point of there being a ceiling at all.
+    #
+    # ~4 chars/token is the working conversion this repo already uses. It is an estimate, and the
+    # ceiling is sized so that being 30% wrong about it does not change the verdict.
+    est_tokens = len(doc) / 4
+    check(f"the prompt payload fits its token budget ({len(doc)} chars ~= {est_tokens:.0f} est. "
+          f"tokens, ceiling 8000 = the audit's §5 worst case for the whole authoring prompt)",
+          est_tokens < 8000)
+    check(f"...and the ceiling still bites: a doubled document ({2 * est_tokens:.0f} est. tokens) "
+          f"would fail it", 2 * est_tokens >= 8000)
     check("document is not a stub", len(doc) > 3000)
 
 

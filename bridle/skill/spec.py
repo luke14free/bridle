@@ -126,6 +126,15 @@ def _quantity(name):
 #: "unknown measure". The bare quantity is the spelling every source comment and the design doc's §4
 #: example use, so it is the likeliest thing an author writes, and "one name, two truths" is the
 #: thing they have to be told.
+#:
+#: THE `q not in MEASURES` FILTER IS CONDITIONAL ON AN INVARIANT, AND THE INVARIANT IS TESTED
+#: ELSEWHERE (2026-08-12 re-review, Important 1). It is here so this table can never shadow a
+#: measure that IS a legal name; but it also means that if a family ever grew a frame-qualified
+#: sibling beside a BARE key — `height_above_resting_static_goal` next to the existing
+#: `height_above_resting` — that family would drop out of the table and the bare name would go on
+#: resolving silently to LIVE, which is exactly the §1.2 rule the seat-height rename was for,
+#: defeated in a different family. `test_vocab.py` asserts the general property that makes the
+#: filter safe: a frame-qualified key's quantity stem is never itself a MEASURES key.
 _FRAME_VARIANTS = {}
 for _key, _measure in MEASURES.items():
     _FRAME_VARIANTS.setdefault(_quantity(_key), set()).add(_key)
@@ -318,9 +327,13 @@ def _chassis_defaults_for(chassis, term_name, authored):
     The unchosen candidates come back with the answer so a downstream refusal can NAME them — an
     author told only "the chassis supplies nothing" cannot tell that it in fact supplies two things
     and they have to pick (2026-08-12 review, finding 3).
+
+    `chassis` is never None: `parse_spec` refuses an unknown `kind:` before assigning
+    `CHASSIS[kind]`, so every caller has a real chassis. The `chassis is None` guard that used to
+    open this function, and the `chassis.name if chassis else 'none'` fallback in
+    `_required_param_error`, were unreachable (2026-08-12 re-review, minor 6) — and an unreachable
+    fallback is worse than none, because it reads as a supported mode and invites a caller to try it.
     """
-    if chassis is None:
-        return {}, []
     candidates = [row for key, row in chassis.defaults.items() if base_term(key) == term_name]
     if len(candidates) == 1:
         return candidates[0], []
@@ -377,8 +390,7 @@ def _required_param_error(path, param, term_name, chassis, candidates):
             legal=legal or discriminators)
     return SpecError(
         where,
-        f"{head} and neither the row nor the "
-        f"'{chassis.name if chassis else 'none'}' chassis supplies one",
+        f"{head} and neither the row nor the '{chassis.name}' chassis supplies one",
         legal=legal)
 
 
@@ -452,6 +464,33 @@ def _parse_term_row(path, raw, chassis, declared_params):
     return Row(term=term_name, params=_freeze(values), expr=None, custom=None, why=raw["why"])
 
 
+def _expr_error(path, source, exc, declared_params):
+    """`expr.py`'s refusal, made actionable in the one case this module knows more than it does.
+
+    THE PARAM PREFIX IS SPELLED TWO WAYS ACROSS THE TIERS (2026-08-12 re-review, Important 3). A
+    tier-1 row writes `setpoint: params.hover`, and so does the `success:` criterion; a tier-2 row
+    wants the BARE name (`expr: "2.5 * hover"`), because an expression is PARSED and `params.hover`
+    parses as attribute access — a construct the grammar refuses outright, which is what turns
+    `x.__class__` into a parse-time error rather than a possibility. Re-raising expr.py's generic
+    whitelist text for that case ("'attribute access (e.g. x.attr)' is not allowed ...") names no
+    path fix, no legal spelling and no suggestion, and lands on an author who learned the `params.`
+    prefix one tier up: precisely the round trip this module exists to prevent. `params.` in the
+    source says unambiguously what was meant, so say so and print the corrected line.
+    """
+    if _PARAM_REF_RE.search(source):
+        fixed = _PARAM_REF_RE.sub(r"\1", source)
+        return SpecError(
+            path,
+            f"inside an `expr:` a declared param is named by its BARE name, with no `params.` "
+            f"prefix — write {fixed!r}, not {source!r}. (The prefix is right in a term row's "
+            f"fields and in `success:`; it is wrong here because an expression is parsed, and "
+            f"`params.x` parses as attribute access, which the expression grammar refuses "
+            f"outright.) The underlying refusal was: {exc}",
+            legal=declared_params or None,
+            suggestion=fixed)
+    return SpecError(path, str(exc))
+
+
 def _parse_expr_row(path, raw, declared_params):
     for key in raw:
         if key not in ("expr", "why"):
@@ -461,7 +500,7 @@ def _parse_expr_row(path, raw, declared_params):
     try:
         parsed = parse_expr(raw["expr"])
     except ExprError as exc:
-        raise SpecError(f"{path}.expr", str(exc)) from exc
+        raise _expr_error(f"{path}.expr", raw["expr"], exc, declared_params) from exc
     for name in sorted(parsed.names):
         # A declared param shadows a measure of the same name: the author wrote the param, so the
         # author meant the param. Nothing in the corpus collides today.
@@ -606,32 +645,48 @@ def _parse_reward_scale(raw, chassis, declared_params):
     it rescales every gradient, so `retrain` is the honest tag, and `params:` is the only place this
     document can say that. Same numeric-only restriction as rows: `unnormalized` is a bool and takes
     no reference.
+
+    TWO MORE ASYMMETRIES CLOSED (2026-08-12 re-review, minors 4 and 5). (a) `reward_scale: null` —
+    the whole BLOCK nulled, not a field inside it — used to be silently read as `{}` and fall
+    through, while `init: null`, `params: null` and `preflight: null` were all refused; one null
+    rule now covers the document. A null field INSIDE the block still falls through, exactly as a
+    null key inside a reward row does. (b) the type and `params.X` checks used to run on AUTHORED
+    values only, so a chassis-supplied or term-default divisor reached `RewardPlan` unchecked —
+    harmless while the inherited value is the literal 12.0, but it breaks the "one validation path
+    for authored and chassis-supplied alike" rule this module states for measures and enforces in
+    `_parse_term_row`, and it is the path a future per-chassis divisor would arrive on.
     """
     term = TERMS["RewardScale"]
     declared = {p.name: p for p in term.params}
-    authored = raw if raw is not None else {}
+    if raw is None:
+        raise SpecError("reward_scale", "`reward_scale:` is a mapping of {divisor, unnormalized} "
+                                        "and this one is empty — omit the key entirely to inherit "
+                                        "the chassis' divisor, or write `{unnormalized: true}` to "
+                                        "declare the reward is already at the scale PPO should see")
+    authored = raw
     if not isinstance(authored, dict):
         raise SpecError("reward_scale", f"`reward_scale:` is a mapping of "
                                         f"{{divisor, unnormalized}}, got {type(authored).__name__}")
     for key in authored:
         if key not in declared:
             raise _unknown(f"reward_scale.{key}", "reward_scale field", key, declared)
-    inherited = chassis.defaults.get("RewardScale", {}) if chassis else {}
+    inherited = chassis.defaults.get("RewardScale", {})
     values = {}
     for param in term.params:
         # The null rule of `_parse_term_row` applies here too: `divisor:` with nothing after it
         # falls through to the chassis' 12.0 rather than becoming a None nobody can divide by.
         if authored.get(param.name) is not None:
             value = authored[param.name]
-            field_path = f"reward_scale.{param.name}"
-            if isinstance(value, str):
-                _check_param_refs(field_path, value, declared_params)
-            if not _is_param_ref(param, value):
-                _check_type(field_path, param, value)
         elif inherited.get(param.name) is not None:
             value = inherited[param.name]
         else:
             value = param.default
+        field_path = f"reward_scale.{param.name}"
+        if value is not None:   # a None here is a term default spelling "optional, off"
+            if isinstance(value, str):
+                _check_param_refs(field_path, value, declared_params)
+            if not _is_param_ref(param, value):
+                _check_type(field_path, param, value)
         values[param.name] = value
     return values
 
@@ -724,7 +779,10 @@ def parse_spec(doc: dict) -> SkillSpec:
     if not isinstance(init, dict):
         raise SpecError("init", f"`init:` is a mapping, got {type(init).__name__}")
 
-    reward_scale = _parse_reward_scale(doc.get("reward_scale"), chassis, params)
+    # `doc.get(..., {})` and NOT `doc.get(...)`: an ABSENT `reward_scale:` inherits the chassis
+    # divisor, a PRESENT-but-null one is refused like `init: null` — `_parse_reward_scale` can only
+    # tell those apart if the absent case never reaches it as None.
+    reward_scale = _parse_reward_scale(doc.get("reward_scale", {}), chassis, params)
 
     rows = doc["reward"]
     if not isinstance(rows, list):
@@ -775,9 +833,18 @@ def _param_json(param):
 
 def _merge_param_schemas(variants):
     """One property per parameter NAME across the eight row terms. Identical constraints merge
-    cleanly; a name two terms constrain differently (`mode` is a closed choice set on
-    PredicateBonus and open on SuccessBonus) widens to the shared JSON type rather than picking a
-    winner — a schema that rejected a legal document would be worse than one that admits an extra.
+    cleanly; a name two terms constrain differently widens to the shared JSON type rather than
+    picking a winner — a schema that rejected a legal document would be worse than one that admits
+    an extra.
+
+    NO NAME DIVERGES TODAY (2026-08-12 re-review, minor 3). `mode` used to be the example — a closed
+    choice set on PredicateBonus and open on SuccessBonus — and giving SuccessBonus its real
+    `choices` made the two identical, so all five shared names (`gate`, `measure`, `mode`, `scope`,
+    `weight`) now merge cleanly and the widening branch is defensive only. It stays because the
+    divergence it handles is a schema-emission decision, not a bug: the alternative, picking one
+    term's constraint for a shared property, is how a flat row schema comes to refuse a legal
+    document. (The flat `term_row` bag itself — 27 keys under `additionalProperties: false`, where a
+    `oneOf` over per-term variants is the real fix — is deferred to the whole-branch review.)
     """
     first = variants[0]
     if all(v == first for v in variants):
@@ -858,9 +925,14 @@ def json_schema() -> dict:
                 "required": ["expr", "why"],
                 "properties": {
                     "expr": {"type": "string", "minLength": 1,
-                             "description": "arithmetic over measures, predicates and params: "
-                                            "+ - * / **, comparisons, and abs tanh exp log sqrt "
-                                            "clamp min max where"},
+                             "description": "arithmetic over measures, predicates and this "
+                                            "document's declared params, each named BARE: write "
+                                            "`2.5 * hover`, NOT `2.5 * params.hover` — the "
+                                            "`params.` prefix belongs to a term row's fields and "
+                                            "to `success:`, and inside an expression it parses as "
+                                            "attribute access, which is refused. Operators "
+                                            "+ - * / ** and comparisons; calls abs tanh exp log "
+                                            "sqrt clamp min max where"},
                     "why": _WHY_SCHEMA,
                 },
             },

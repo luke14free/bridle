@@ -51,7 +51,7 @@ import sys
 from bridle.skill.spec import (
     LEGAL_MEASURE_NAMES, Row, SkillSpec, SpecError, json_schema, parse_spec,
 )
-from bridle.skill.vocab import CHASSIS, MEASURES, TERMS
+from bridle.skill.vocab import CHASSIS, MEASURES, TERMS, Sign
 
 FAILS = []
 
@@ -364,6 +364,29 @@ def run_checks():
             "weight", "float", path="reward[0].weight")
     refuses("a value outside a declared choice set", row_edited(0, mode="clobber"),
             "clobber", "replace", path="reward[0].mode")
+
+    # ── minor 3: a legal set stated only in prose cannot be checked ──────────────────────────────
+    # (2026-08-12 re-review) `SuccessBonus.predicate_ref` declared `choices=()` with `per_step |
+    # latched` in its doc text alone, so `predicate_ref: "per_stpe"` parsed clean and reached the
+    # fold — in the module whose premise is that every refusal names the legal set. `kernel`, `side`
+    # and `norm` had the same gap, and SuccessBonus' `mode` was worse than prose-only (its prose said
+    # `add | replace` while the fold has always honoured `floor`). The sets are compile.py's
+    # `_HONOURED` table, so the two tiers cannot disagree about what is legal.
+    refuses("a typo'd predicate_ref", row_edited(7, predicate_ref="per_stpe"),
+            "per_stpe", "per_step", "latched", path="reward[7].predicate_ref",
+            suggestion="per_step")
+    refuses("a typo'd HingePenalty side", row_edited(3, side="abve"), "abve", "above", "below",
+            path="reward[3].side", suggestion="above")
+    refuses("a typo'd DistancePull kernel", row_edited(1, kernel="one_minus_tan"),
+            "one_minus_tan", "one_minus_tanh", "neg_linear", path="reward[1].kernel",
+            suggestion="one_minus_tanh")
+    refuses("a norm the fold does not implement", row_edited(8, norm="l3"), "l3", "l2",
+            path="reward[8].norm")
+    refuses("a SuccessBonus mode outside the set the fold honours", row_edited(7, mode="multiply"),
+            "multiply", "replace", path="reward[7].mode")
+    check("...and the values the vocabulary now declares legal are still the deployed ones",
+          parse_spec(descend_doc()).reward[7].params["predicate_ref"] == "per_step" and
+          parse_spec(descend_doc()).reward[3].params["side"] == "below")
     refuses("a required parameter with no default anywhere",
             doc_with(reward=[{"term": "Ramp", "measure": "object_z", "why": "ramp the lift."}]),
             "cap", "required", path="reward[0].cap")
@@ -403,11 +426,34 @@ def run_checks():
     check("a null key and an absent key are refused identically",
           str(error_from(row_edited(3, measure=None))) == str(error_from(row_edited(3,
                                                                                    measure=DROP))))
-    check("no accepted row leaves a needs_signed_measure term without a measure",
-          all(r.term is None or not TERMS[r.term].needs_signed_measure
-              or r.params.get("measure") is not None
-              for d in (descend_doc(), row_edited(3, measure="gripper_qpos"))
-              for r in parse_spec(d).reward))
+    # (2026-08-12 re-review, minor 2) This read as a global invariant — "no accepted row leaves a
+    # needs_signed_measure term without a measure" — while iterating TWO hand-picked documents,
+    # NEITHER of which contains a null measure, so it could not fail under the defect it appears to
+    # guard. Generalised over every way a measure can reach the parser; the null and absent arms are
+    # the ones the old form never reached, and they are the ones `_parse_term_row`'s null rule and
+    # the signed gate's `is not None` guard are for.
+    signed_terms = sorted(t for t, term in TERMS.items() if term.needs_signed_measure)
+    check("the vocabulary declares a needs_signed_measure term (the loop has something to bite on)",
+          signed_terms == ["HingePenalty"])
+    leaks = []
+    for term_name in signed_terms:
+        for label, variant in (("authored signed", "height_above_seat_live"),
+                               ("authored magnitude", "tcp_to_object"),
+                               ("authored null", None),
+                               ("absent", DROP),
+                               ("not a string", 0.0),
+                               ("unknown name", "hieght_above_seat_live")):
+            d = row_edited(3, term=term_name, measure=variant)
+            exc = error_from(d)
+            if exc is None:
+                got = parse_spec(d).reward[3].params.get("measure")
+                if got not in MEASURES or MEASURES[got].sign is not Sign.SIGNED:
+                    leaks.append(f"{term_name}/{label} accepted -> measure={got!r}")
+            elif not isinstance(exc, SpecError):
+                leaks.append(f"{term_name}/{label} raised {type(exc).__name__}: {exc}")
+    check("every way a measure can reach a needs_signed_measure term either refuses with a "
+          "SpecError or lands a real SIGNED measure" + (f" (leaks: {leaks})" if leaks else ""),
+          not leaks)
     refuses("a null predicate on PredicateBonus is refused",
             row_edited(0, predicate=None), "required", path="reward[0].predicate")
     refuses("a null cap does not satisfy Ramp's required cap",
@@ -420,9 +466,31 @@ def run_checks():
           nulled.reward[0].params["weight"] == 1.0)
     check("a null optional still ends up at the term's own default, not None",
           parse_spec(row_edited(0, mode=None)).reward[0].params["mode"] == "add")
-    check("a term default that IS None still comes through as None (axes/gate are optional)",
+    # (2026-08-12 re-review, minor 1) This pair used to ship under the label "a term default that IS
+    # None still comes through as None (axes/gate are optional)" while asserting `scope ==
+    # "preceding"` (a non-None TERM default) and `gate == "grasped"` (a CHASSIS-inherited value, on
+    # PredicateBonus, which has no `gate` parameter at all). Nothing in the file asserted the None
+    # branch — `_parse_term_row`'s `values[name] = None; continue` arm, the one the signed-measure
+    # gate's `is not None` guard is written around. Relabelled to what it checks, plus a real one.
+    check("an omitted optional falls back to the term default, and to the chassis value where the "
+          "chassis has one",
           spec.reward[0].params.get("scope") == "preceding" and
           parse_spec(row_edited(1, gate=DROP)).reward[1].params["gate"] == "grasped")
+    approach_pull = parse_spec({
+        "name": "reach", "kind": "approach", "contract": "reach", "env_id": "SO100Reach-v1",
+        "scene": {"held": {"type": "cube", "half": 0.014}},
+        "reward": [{"term": "DistancePull", "why": "the approach chassis supplies the measure."}],
+        "success": "grasped",
+    }).reward[0]
+    optional_nones = sorted(p.name for p in TERMS["DistancePull"].params
+                            if p.default is None and not p.required)
+    check("DistancePull declares None-defaulted optionals, and the approach chassis supplies "
+          "neither (the check bites)",
+          optional_nones == ["axes", "gate"] and
+          not any(n in CHASSIS["approach"].defaults["DistancePull"] for n in optional_nones))
+    check("a term default that IS None comes through as a present None, not a missing key",
+          all(n in approach_pull.params and approach_pull.params[n] is None
+              for n in optional_nones))
     check("an authored null on a single-candidate chassis inherits the chassis value",
           parse_spec({
               "name": "reach", "kind": "approach", "contract": "reach", "env_id": "SO100Reach-v1",
@@ -471,6 +539,51 @@ def run_checks():
                            doc_with(reward_scale={"divisor": None}))
     check("...it falls through to the chassis' 12.0",
           nulled_scale is not None and nulled_scale.reward_scale["divisor"] == 12.0)
+
+    # ── minor 4: one null rule for the whole document ────────────────────────────────────────────
+    # (2026-08-12 re-review) A null FIELD inside a block falls through, as above and as in a reward
+    # row. A null BLOCK is refused — but `reward_scale: null` used to be read as `{}` and fall
+    # through silently, while `init: null`, `params: null` and `preflight: null` were all refused.
+    # An author cannot learn a rule that holds for three keys out of four.
+    refuses("a null `reward_scale:` block is refused, not silently read as {}",
+            doc_with(reward_scale=None), "reward_scale", "omit the key", path="reward_scale")
+    for field in ("init", "params", "preflight"):
+        check(f"...and `{field}: null` is still refused too (the rule is the document's, not one "
+              f"key's)", isinstance(error_from(doc_with(**{field: None})), SpecError))
+    check("...while an ABSENT reward_scale still inherits, rather than being refused as null",
+          parse_spec(doc_with(reward_scale=DROP)).reward_scale["divisor"] == 12.0)
+
+    # ── minor 5: one validation path for authored and chassis-supplied alike ─────────────────────
+    # (2026-08-12 re-review) `_parse_reward_scale` ran `_check_type`/`_check_param_refs` on AUTHORED
+    # values only, so an inherited or defaulted divisor reached the plan unchecked. Low risk today —
+    # every chassis' value is the literal 12.0 — but `_parse_term_row` validates inherited values and
+    # this module states that rule for measures in its own comments, so the two paths disagreed on
+    # principle. The only way to feed an invalid INHERITED value is to plant one; the test plants one
+    # and puts it back.
+    approach_scale = CHASSIS["approach"].defaults["RewardScale"]
+    saved_scale = dict(approach_scale)
+    scale_doc = {
+        "name": "reach", "kind": "approach", "contract": "reach", "env_id": "SO100Reach-v1",
+        "scene": {"held": {"type": "cube", "half": 0.014}},
+        "reward": [{"term": "DistancePull", "why": "the approach chassis supplies the measure."}],
+        "success": "grasped",
+    }
+    check("the planted-value test bites only because the chassis really does supply a divisor",
+          approach_scale.get("divisor") == 12.0 and
+          parse_spec(dict(scale_doc)).reward_scale["divisor"] == 12.0)
+    try:
+        approach_scale["divisor"] = "twelve"
+        refuses("a CHASSIS-supplied divisor is type-checked like an authored one",
+                dict(scale_doc), "divisor", "float", path="reward_scale.divisor")
+        approach_scale["divisor"] = "params.nonesuch"
+        refuses("...and its params.X references are resolved like an authored one",
+                dict(scale_doc), "nonesuch", path="reward_scale.divisor")
+    finally:
+        approach_scale.clear()
+        approach_scale.update(saved_scale)
+    check("the chassis default was restored after the planted-value test",
+          CHASSIS["approach"].defaults["RewardScale"] == saved_scale and
+          parse_spec(dict(scale_doc)).reward_scale["divisor"] == 12.0)
     refuses("a params.X in the success criterion that resolves to nothing",
             doc_with(success="all[grasped, height_above_resting_in(params.lowband)]"),
             "lowband", "low_band", path="success")
@@ -521,6 +634,32 @@ def run_checks():
             doc_with(reward=[dict(expr_row, expr="2.5 * height_above_seat")]),
             "frame", "live", path="reward[0].expr")
 
+    # ── Important 3: `params.X` is spelled two ways across the tiers, so the refusal must say so ──
+    # (2026-08-12 re-review) Tier 1 teaches `setpoint: params.hover`, and `success:` uses the same
+    # prefix; tier 2 wants the BARE name, because an expression is PARSED and `params.hover` parses
+    # as attribute access — the construct the grammar refuses outright to keep `x.__class__` out.
+    # `expr: "2.5 * params.hover"` used to re-raise expr.py's generic whitelist text verbatim
+    # ("'attribute access (e.g. x.attr)' is not allowed in a reward expression; allowed constructs
+    # are arithmetic ... and calls to one of the whitelisted functions"), which names no path fix, no
+    # legal spelling and no suggestion — landing on an author who learned the prefix one tier up.
+    check("the bare spelling is the accepted one (the finding's premise)",
+          parse_spec(doc_with(reward=[dict(expr_row, expr="2.5 * hover")])).reward[0].expr is not None)
+    prefixed = refuses("a `params.` prefix inside an expr is told which spelling to use",
+                       doc_with(reward=[dict(expr_row, expr="2.5 * params.hover")]),
+                       "BARE", "params.hover", "'2.5 * hover'", path="reward[0].expr",
+                       suggestion="2.5 * hover")
+    check("...and states the params this document declares, as the legal set",
+          all(p in str(prefixed) for p in ("center_tol", "hover", "low_band")))
+    check("...and the corrected spelling it prints is one that actually parses",
+          parse_spec(doc_with(reward=[dict(expr_row, expr="2.5 * hover")])
+                     ).reward[0].expr.source == "2.5 * hover")
+    check("...while a non-params attribute chain still gets the generic whitelist refusal",
+          "attribute access" in str(error_from(
+              doc_with(reward=[dict(expr_row, expr="2.5 * bin.inner_radius")]))))
+    check("...and a params.-free expr error is untouched by the new branch",
+          "attribute access" in str(error_from(
+              doc_with(reward=[dict(expr_row, expr="(1).__class__")]))))
+
     # ── tier 3: allowed, but marked ─────────────────────────────────────────────────────────────
     custom = {"custom": "primitives.descend_to_target.descend_env:crush_term",
               "why": "the seat-crush term reads a per-env buffer the vocabulary has no name for."}
@@ -567,6 +706,19 @@ def run_checks():
     check("json_schema's measure enum still covers the unambiguous measures",
           {"tcp_to_object", "object_to_goal_xy"} <= set(measure_enum) and
           len(measure_enum) == len(MEASURES))
+    # the closed sets reach the machine-readable half too, not only parse_spec (minor 3)
+    for pname, expected in (("kernel", {"one_minus_tanh", "neg_linear", "gaussian"}),
+                            ("side", {"above", "below"}),
+                            ("predicate_ref", {"per_step", "latched"}),
+                            ("norm", {"l2"}),
+                            ("mode", {"add", "replace", "floor"})):
+        check(f"json_schema publishes {pname}'s legal set as an enum",
+              set(js["$defs"]["term_row"]["properties"][pname].get("enum", ())) == expected)
+    # (Important 3) the schema description is the other half of the two-spellings fix: an author
+    # reading only the schema must not have to discover the rule from a refusal.
+    expr_desc = js["$defs"]["expr_row"]["properties"]["expr"]["description"]
+    check("the expr_row description disambiguates the two spellings of a param reference",
+          "BARE" in expr_desc and "params.hover" in expr_desc and "success:" in expr_desc)
     # it is handed to a model and written to disk, so it has to survive a round trip
     check("json_schema is JSON-serializable", isinstance(json.dumps(js), str))
 

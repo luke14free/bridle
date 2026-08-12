@@ -41,7 +41,11 @@ Homepage = "https://github.com/luke14free/bridle"
 # install lags. Packaging must not be able to take a running robot down.
 [tool.setuptools]
 # bridle.tests is EXCLUDED from the wheel on purpose: tests are for the repo, not the distribution.
-packages = ["bridle", "bridle.adapters"]
+# Every other subpackage MUST be listed: this is an explicit list, not autodiscovery, so a new
+# subpackage is missing from the wheel until someone adds it here — `bridle.skill` (the whole skill
+# compiler) shipped omitted, and the omission is invisible on PYTHONPATH, which is how the reference
+# consumer imports bridle.
+packages = ["bridle", "bridle.adapters", "bridle.skill"]
 
 [tool.pytest.ini_options]
 testpaths = ["bridle/tests"]

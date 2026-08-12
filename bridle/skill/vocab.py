@@ -181,6 +181,15 @@ class Param:
     required: bool = False
     choices: tuple = ()  # explicit legal values for a str param, e.g. mode's ("add","replace","floor")
     # — schema-level, so a check can assert against it instead of grepping free-text doc.
+    #
+    # EVERY CLOSED SET LIVES HERE, NOT IN `doc` (2026-08-12 re-review). `predicate_ref` stated
+    # `per_step | latched` in prose alone and declared `choices=()`, so `predicate_ref: "per_stpe"`
+    # parsed clean and reached the fold — the same shape of hole for `kernel`, `side`, `norm` and
+    # SuccessBonus' `mode` (whose prose said `add | replace` while the fold has always honoured
+    # `floor` too). The sets written here are the ones `compile.py`'s `_HONOURED` table implements,
+    # so the schema tier and the fold cannot disagree about what is legal; `test_vocab.py` asserts
+    # both that specific table and the general rule that a `a | b`-shaped prose set must be backed
+    # by `choices`, so the next parameter added cannot repeat the gap.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -298,7 +307,9 @@ def _t(name, params, doc, needs_signed_measure=False, stateful=False):
 TERMS = dict([
     _t("ActionPenalty", [
             Param("weight", "float", 0.001, "penalty magnitude"),
-            Param("norm", "str", "l2", "vector norm; l2 in all 15 audited instances"),
+            Param("norm", "str", "l2",
+                  "vector norm; l2 in all 15 audited instances and the only one the fold "
+                  "implements", choices=("l2",)),
             Param("measure", "str", "action_norm",
                   "which measure to penalize; jerk-like variant is `action_delta_norm`"),
         ],
@@ -311,11 +322,13 @@ TERMS = dict([
     _t("SuccessBonus", [
             Param("value", "float", 9.0, "terminal bonus paid on success"),
             Param("mode", "str", "add",
-                  "add | replace — replace is `torch.where(success, value, reward)`, a positional "
-                  "fold over the PRECEDING rows, not an independent field"),
+                  "add | replace | floor — replace is `torch.where(success, value, reward)`, a "
+                  "positional fold over the PRECEDING rows, not an independent field",
+                  choices=("add", "replace", "floor")),
             Param("scope", "str", "preceding", "which rows mode=replace overwrites"),
             Param("predicate_ref", "str", "per_step",
-                  "per_step | latched — latched pays every step once success has EVER been true"),
+                  "per_step | latched — latched pays every step once success has EVER been true",
+                  choices=("per_step", "latched")),
         ],
        "constant paid on the success predicate. `mode=add` in 11/15 primitives (values 9.0 x7, "
        "12.0 x1, 50.0 x2, 12.0 x1); `mode=replace` in 4 — fires after every shaping row but BEFORE "
@@ -338,7 +351,8 @@ TERMS = dict([
     _t("DistancePull", [
             Param("weight", "float", 1.0, "shaping magnitude"),
             Param("measure", "str", None, "distance-like measure to shape", True),
-            Param("kernel", "str", "one_minus_tanh", "one_minus_tanh | neg_linear | gaussian"),
+            Param("kernel", "str", "one_minus_tanh", "one_minus_tanh | neg_linear | gaussian",
+                  choices=("one_minus_tanh", "neg_linear", "gaussian")),
             Param("k", "float", 4.0, "kernel sharpness (tanh/gaussian); observed 3.0/4.0/5.0/6.0"),
             Param("setpoint", "float", 0.0,
                   "the kernel's peak, in measure units — NON-ZERO in 4 instances, load-bearing"),
@@ -356,7 +370,8 @@ TERMS = dict([
             Param("measure", "str", None, "the SIGNED measure being bounded", True),
             Param("threshold", "float", 0.0, "the bound"),
             Param("side", "str", "below",
-                  "'above' penalizes measure > threshold, 'below' penalizes measure < threshold"),
+                  "'above' penalizes measure > threshold, 'below' penalizes measure < threshold",
+                  choices=("above", "below")),
             Param("gate", "str", None, "predicate name; multiplies the whole row"),
             Param("enabled_if", "str", None,
                   "spec-level condition gating whether this row exists at all"),
