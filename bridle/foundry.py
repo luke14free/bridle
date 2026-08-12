@@ -70,8 +70,19 @@ def contract_env(contract) -> dict:
     Names are the app's own convention, supplied by the recipe; bridle only guarantees that the
     VALUES come from the contract rather than from someone's memory.
     """
-    out = {"BRIDLE_CONTRACT_FINGERPRINT": contract.fingerprint(),
-           "BRIDLE_CONTRACT_NAME": contract.name or ""}
+    fp = contract.fingerprint()
+    out = {"BRIDLE_CONTRACT_FINGERPRINT": fp,
+           "BRIDLE_CONTRACT_NAME": contract.name or "",
+           # EXPERIMENT TRACKING. Every build is a training run somebody will want to compare
+           # against another one months later, and a run you cannot find is a run you will repeat.
+           # The run is NAMED BY ITS CONTRACT FINGERPRINT, so the question "what was this policy
+           # actually trained for?" is answerable from the dashboard alone rather than from whoever
+           # remembers launching it.
+           "BRIDLE_WANDB": os.environ.get("BRIDLE_WANDB", "1"),
+           "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", "bridle"),
+           "WANDB_RUN_GROUP": contract.name or "unnamed",
+           "WANDB_NAME": f"{contract.name or 'run'}@{fp}",
+           "WANDB_TAGS": f"bridle,{contract.name or 'unnamed'},{fp}"}
     r = getattr(contract, "release", None)
     if r is not None:
         out.update({
