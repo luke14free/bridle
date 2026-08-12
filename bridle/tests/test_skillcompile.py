@@ -65,14 +65,15 @@ import warnings
 from pathlib import Path
 
 from bridle.skill.compile import (
-    CompileError, FloodingError, Op, RewardPlan, compile_spec, evaluate_plan,
+    CompileError, FloodingError, Note, Op, RewardPlan, compile_spec, evaluate_plan,
 )
 from bridle.skill.compile import (
-    _bind_number, _CONTACT_SURFACE_MEASURES, _HONOURED, _SCOPE_REACH,
-    _ZERO_IS_NOT_A_CONTACT_SURFACE,
+    _bind_number, _clamp, _CONTACT_SURFACE_MEASURES, _derive_contact_surfaces,
+    _derive_peaked_kernels, _HONOURED, _KERNEL_PEAK_IS_NOT_AT_SETPOINT, _max, _min, _PEAKED_KERNELS,
+    _relu, _SCOPE_REACH, _where, _ZERO_IS_NOT_A_CONTACT_SURFACE,
 )
 from bridle.skill.spec import SpecError, parse_spec
-from bridle.skill.vocab import MEASURES, TERMS, Sign, vocab_document
+from bridle.skill.vocab import MEASURES, TERMS, Frame, Measure, Sign, vocab_document
 from bridle.tests.test_skillspec import descend_doc, doc_with, row_edited
 
 FAILS = []
@@ -114,7 +115,10 @@ class Vec:
 
     def _zip(self, other, f, flip=False):
         o = other.xs if isinstance(other, Vec) else (float(other),) * len(self.xs)
-        return Vec(f(b, a) if flip else f(a, b) for a, b in zip(self.xs, o))
+        # `type(self)`, not `Vec`: a BoolVec that stopped being a BoolVec after one arithmetic op
+        # would exercise the bool-condition path once and then quietly fall back to plain floats,
+        # which is how `_clamp`'s SECOND comparison would stop being tested.
+        return type(self)(f(b, a) if flip else f(a, b) for a, b in zip(self.xs, o))
 
     def __add__(self, o): return self._zip(o, operator.add)
     def __radd__(self, o): return self._zip(o, operator.add, flip=True)
@@ -125,16 +129,66 @@ class Vec:
     def __truediv__(self, o): return self._zip(o, operator.truediv)
     def __gt__(self, o): return self._zip(o, lambda a, b: float(a > b))
     def __lt__(self, o): return self._zip(o, lambda a, b: float(a < b))
-    def __abs__(self): return Vec(abs(x) for x in self.xs)
-    def __neg__(self): return Vec(-x for x in self.xs)
-    def tanh(self): return Vec(math.tanh(x) for x in self.xs)
-    def exp(self): return Vec(math.exp(x) for x in self.xs)
-    def __repr__(self): return f"Vec{self.xs}"
+    def __abs__(self): return type(self)(abs(x) for x in self.xs)
+    def __neg__(self): return type(self)(-x for x in self.xs)
+    def tanh(self): return type(self)(math.tanh(x) for x in self.xs)
+    def exp(self): return type(self)(math.exp(x) for x in self.xs)
+    def __repr__(self): return f"{type(self).__name__}{self.xs}"
 
     def __bool__(self):
         raise AssertionError("the fold called bool() on a batch — a Python `if` on a batched "
                              "condition takes one branch for all 4096 environments, which is a "
                              "different reward, not a slower one")
+
+
+class BoolMask:
+    """What a comparison on a real tensor returns: a BOOLEAN batch, which REFUSES subtraction.
+
+    `Vec` above cannot see the defect this exists for, because `Vec.__gt__` hands back floats — it
+    is a batch whose comparisons are already numeric, which is the one shape of batch the
+    branch-free helpers happened to work for. torch is not that shape:
+
+        >>> 1 - torch.tensor([True, False])
+        RuntimeError: Subtraction, the `-` operator, with a bool tensor is not supported.
+
+    so `compile._relu(torch.tensor([-1., 2.]))` raised, `HingePenalty` and `Ramp` could not fold a
+    raw tensor at all, and both modules' docstrings said otherwise. `__sub__`/`__rsub__` therefore
+    raise here the way torch does; `* 1` is the conversion the fold has to perform before treating a
+    condition as a number, and it is the only route out of this type.
+    """
+
+    def __init__(self, bs):
+        self.bs = tuple(bool(b) for b in bs)
+
+    def _as_numbers(self):
+        # A BoolVec, not a plain Vec: the numeric form of a mask feeds straight back into `_where`'s
+        # arithmetic, and a plain Vec there would make every comparison DOWNSTREAM of the first one
+        # numeric again — `_clamp`'s second helper would then never see a boolean condition.
+        return BoolVec(1.0 if b else 0.0 for b in self.bs)
+
+    def __mul__(self, o): return self._as_numbers() * o
+    def __rmul__(self, o): return o * self._as_numbers()
+    def __sub__(self, o): raise AssertionError(self._REFUSAL)
+    def __rsub__(self, o): raise AssertionError(self._REFUSAL)
+    def __repr__(self): return f"BoolMask{self.bs}"
+
+    _REFUSAL = ("arithmetic on a BOOLEAN batch — torch raises `Subtraction, the `-` operator, with "
+                "a bool tensor is not supported` here, so a helper that computes `1 - c` on a raw "
+                "comparison cannot fold a tensor at all")
+
+    def __bool__(self):
+        raise AssertionError("bool() on a batched mask — see Vec.__bool__")
+
+
+class BoolVec(Vec):
+    """A `Vec` whose COMPARISONS yield a `BoolMask`, i.e. a torch-shaped batch rather than a
+    conveniently pre-numeric one. Everything else is inherited."""
+
+    def __gt__(self, o): return BoolMask(a > b for a, b in zip(self.xs, self._other(o)))
+    def __lt__(self, o): return BoolMask(a < b for a, b in zip(self.xs, self._other(o)))
+
+    def _other(self, o):
+        return o.xs if isinstance(o, Vec) else (float(o),) * len(self.xs)
 
 
 def close_all(got, expected, tol=1e-12):
@@ -525,7 +579,10 @@ def run_checks():
     text = warning_text(plan)
     check("the horizon-integrated ratio is computed and warned about, not refused",
           "320.0" in text and "12.0" in text)
-    check("the integrated warning states the horizon it used", "64" in text)
+    # `"64" in text` — the previous form — stays green off the `320.0` and `768.0` already in the
+    # line, so it would pass for a warning that printed the wrong horizon entirely. Pin the phrase.
+    check("the integrated warning states the horizon it used, in a form a wrong number cannot fake",
+          "5.0/step x 64 steps" in text)
     check("the integrated warning says it is a warning, not a refusal",
           "WARNING (not a refusal)" in text)
     with warnings.catch_warnings(record=True) as caught:
@@ -548,7 +605,20 @@ def run_checks():
         warnings.simplefilter("error")
         werror = error_from(compile_spec, parse_spec(descend_doc()), horizon=HORIZON,
                             terminate_on_success=False)
-    check("...so a caller under `-W error` can compile a legal document", werror is None)
+        # THE LABEL IS NARROW ON PURPOSE. It used to read as a general "-W error can compile a legal
+        # document" guarantee while pinning only `terminate_on_success=False`; the same document
+        # compiled the default way, and any `horizon=None` compile, still raise — and SHOULD, since
+        # each carries a note the caller can act on. What the level split fixed was emitting on
+        # EVERY compile including the clean ones, not emitting at all. Both directions pinned so
+        # neither claim can drift into the other.
+        default_werror = error_from(compile_spec, parse_spec(descend_doc()), horizon=HORIZON)
+        nohorizon_werror = error_from(compile_spec, parse_spec(descend_doc()))
+    check("...so a caller under `-W error` can compile a document with nothing to ACT on",
+          werror is None)
+    check("...while one that HAS something to act on still stops that caller, by design",
+          isinstance(default_werror, UserWarning) and isinstance(nohorizon_werror, UserWarning)
+          and "WARNING (not a refusal)" in str(default_werror)
+          and "could NOT be computed" in str(nohorizon_werror))
     with warnings.catch_warnings(record=True) as loud:
         warnings.simplefilter("always")
         compile_spec(parse_spec(potential_doc()), horizon=HORIZON)
@@ -559,6 +629,27 @@ def run_checks():
     check("a repeated identical compile still carries the ratio on its plan",
           all("320.0" in warning_text(plan_of(descend_doc(), horizon=HORIZON,
                                               terminate_on_success=False)) for _ in range(2)))
+
+    # THE LEVEL IS PART OF THE NOTE. `compile_spec` computes `(level, text)` and used to store only
+    # the text, so a consumer of the AUTHORITATIVE channel could not tell "flooding check INCOMPLETE
+    # ... this is not a pass" from an FYI ratio; the distinction survived only in whether `warn()`
+    # had already fired — i.e. only in the channel `plan.warnings` exists because one cannot rely on
+    # it (`bridle skill` silences it, and the stdlib dedupes it per message+location).
+    with warnings.catch_warnings(record=True) as emitted:
+        warnings.simplefilter("always")
+        lplan = compile_spec(parse_spec(potential_doc()), horizon=HORIZON)
+    check("every note on the plan carries a level",
+          bool(lplan.warnings) and all(n.level in (Note.ACT, Note.FYI) for n in lplan.warnings))
+    check("...and is still a plain string, so every existing consumer is untouched",
+          all(isinstance(n, str) for n in lplan.warnings)
+          and clean.warnings[0] == str(clean.warnings[0])
+          and "320.0" in "\n".join(clean.warnings))
+    check("the notes emitted through the `warnings` module are EXACTLY the ACT ones",
+          [str(w.message) for w in emitted]
+          == [str(n) for n in lplan.warnings if n.level == Note.ACT])
+    check("an INCOMPLETE note is ACT; a clean integrated ratio is FYI",
+          any(n.level == Note.ACT and "INCOMPLETE" in n for n in lplan.warnings)
+          and [n.level for n in clean.warnings] == [Note.FYI])
 
     none_text = warning_text(plan_of(descend_doc()))
     check("with no horizon the integrated check says it could NOT be computed",
@@ -670,6 +761,26 @@ def run_checks():
     check("...but DOES change the fingerprint (order is semantic under an ordered fold)",
           reordered.fingerprint() != fp)
 
+    # ── an Op is HASHABLE, because `eq=True, frozen=True` says it is ────────────────────────────
+    # `params` is a `MappingProxyType`, which is unhashable, so the dataclass-generated `__hash__`
+    # raised `TypeError: unhashable type: 'mappingproxy'` for every `hash(op)`, `op in {...}` and
+    # `set(plan.ops)` — on a type whose own declaration invites all three. Nothing did it yet, which
+    # is the only reason it was never seen.
+    twin = plan_of(descend_doc(), horizon=HORIZON)
+    check("an Op hashes instead of raising, and equal Ops hash equal",
+          plan.ops[8] == twin.ops[8] and hash(plan.ops[8]) == hash(twin.ops[8]))
+    check("...so set membership works and does not collapse distinct ops",
+          len({plan.ops[8], twin.ops[8]}) == 1 and len(set(plan.ops)) == len(plan.ops)
+          and plan.ops[0] in set(twin.ops))
+    # `pdoc`'s last row is the tier-2 expression reading the declared `hover`, so its params hold
+    # BOTH an `Expr` and a non-empty nested `bindings` mapping — the two shapes a naive
+    # `hash(tuple(params.items()))` would still choke on.
+    check("...including an op whose params hold a nested mapping and an Expr",
+          isinstance(hash(plan_of(pdoc, horizon=HORIZON).ops[9]), int)
+          and dict(plan_of(pdoc, horizon=HORIZON).ops[9].params["bindings"]) == {"hover": 0.015})
+    check("...and an op differing only in a weight is a separate member, never an alias",
+          len({plan_of(row_edited(1, weight=1.6), horizon=HORIZON).ops[1], plan.ops[1]}) == 2)
+
     # ── refusals, each asserted AT THE TIER THAT OWNS IT ────────────────────────────────────────
     # Silently ignoring an authored parameter is the "trains, logs, contributes nothing" failure this
     # whole phase exists to stop, so every one of these is a refusal, not a default. WHICH tier
@@ -688,6 +799,13 @@ def run_checks():
                       row_edited(7, predicate_ref="whenever"), "predicate_ref", "latched")
     refuses_at_schema("a side outside above/below", row_edited(3, side="beside"),
                       "beside", "below")
+    # The other two deleted `_HONOURED` entries. Named in the check below as "no longer a dead
+    # branch" but, until now, with no replacement asserted anywhere — so deleting the schema
+    # `choices` that replaced them would have left both values SILENTLY ACCEPTED and the suite green.
+    refuses_at_schema("a norm outside the one the fold implements", row_edited(8, norm="l1"),
+                      "reward[8].norm", "l1", "l2")
+    refuses_at_schema("a PredicateBonus mode outside the vocabulary's three",
+                      row_edited(0, mode="multiply"), "reward[0].mode", "multiply", "floor")
     check("...and the compiler no longer keeps a dead branch for any of them",
           not any(key in _HONOURED for key in
                   (("DistancePull", "kernel"), ("SuccessBonus", "mode"), ("HingePenalty", "side"),
@@ -700,9 +818,38 @@ def run_checks():
             "scope", "preceding", horizon=HORIZON)
     refuses("an `axes` restriction nothing implements", row_edited(1, axes="xy"),
             "axes", "object_to_goal_xy", horizon=HORIZON)
-    check("...and those two really are open in the vocabulary, which is why the compiler owns them",
+    # The one RETAINED `_HONOURED` entry. Nothing asserted it: not the refusal, and not the fact
+    # that makes compile-tier ownership correct in the first place (`body` carries no `choices`, so
+    # `spec.py` cannot catch it). `body` gaining `choices` would make this branch dead exactly the
+    # way kernel/mode/side/norm's did, and the suite would not have noticed.
+    refuses("a VelocityPenalty body the fold does not implement", row_edited(5, body="tcp"),
+            "reward[5].body", "tcp", "held", horizon=HORIZON)
+    check("...and those three really are open in the vocabulary, which is why the compiler owns them",
           not param_of("SuccessBonus", "scope").choices
-          and not param_of("DistancePull", "axes").choices)
+          and not param_of("DistancePull", "axes").choices
+          and not param_of("VelocityPenalty", "body").choices)
+
+    # THE `_UNIMPLEMENTED` TABLE, ALL FOUR ENTRIES. Only `DistancePull.axes` above was exercised;
+    # the other three were a table nothing read. `gamma` is the one whose own comment says the two
+    # readings of it (`prev - gamma*m` vs `gamma*(prev - m)`) are DIFFERENT REWARDS, so an entry
+    # that silently stopped refusing would pick one of them on the author's behalf.
+    def potential_row_edited(**changes):
+        """move_to_target's fixture with its ProgressPotential row edited — the descend document has
+        no stateful row, so `gamma`/`terminal_zero` are not reachable through `row_edited`."""
+        d = potential_doc()
+        d["reward"][2].update(changes)
+        return d
+
+    refuses("a HingePenalty `enabled_if` nothing implements", row_edited(3, enabled_if="grasped"),
+            "reward[3].enabled_if", "decides whether a row EXISTS", "gate:", horizon=HORIZON)
+    refuses("a ProgressPotential discount other than 1.0", potential_row_edited(gamma=0.99),
+            "reward[2].gamma", "prev - gamma*m", "gamma*(prev - m)", horizon=HORIZON)
+    refuses("a ProgressPotential `terminal_zero`", potential_row_edited(terminal_zero=True),
+            "reward[2].terminal_zero", "terminal step", horizon=HORIZON)
+    check("...and each entry's own OFF value still compiles, so these are refusals and not a ban",
+          error_from(plan_of, potential_row_edited(gamma=1.0, terminal_zero=False),
+                     horizon=HORIZON) is None
+          and error_from(plan_of, row_edited(3, enabled_if=None), horizon=HORIZON) is None)
 
     # The legal scope set is not a literal: it is `tuple(_SCOPE_REACH)`, the same table the fold
     # dispatches through. Teaching the table a second scope must therefore CHANGE THE FOLD — the
@@ -764,6 +911,19 @@ def run_checks():
     check("every SIGNED measure is either checked or excluded with a stated reason",
           signed == set(_CONTACT_SURFACE_MEASURES) | set(_ZERO_IS_NOT_A_CONTACT_SURFACE)
           and all(_ZERO_IS_NOT_A_CONTACT_SURFACE.values()))
+    # THE PARTITION ABOVE IS SATISFIED BY ANY PARTITION, including the hand-list that was replaced —
+    # it cannot see the headline property, which is that a SIGNED measure added tomorrow is IN the
+    # check by DEFAULT. That needs the derivation run over a vocabulary the fixture controls.
+    grown = dict(MEASURES, seat_clearance=Measure(
+        "seat_clearance", Sign.SIGNED, Frame.LIVE, "m", "a signed measure the vocabulary gains"))
+    derived = _derive_contact_surfaces(grown)
+    check("a SIGNED measure the vocabulary gains tomorrow lands in the check with no edit here",
+          "seat_clearance" in derived and derived - {"seat_clearance"} == _CONTACT_SURFACE_MEASURES)
+    check("...while a MAGNITUDE one does not — the derivation reads `sign`, not the name",
+          "seat_span" not in _derive_contact_surfaces(dict(MEASURES, seat_span=Measure(
+              "seat_span", Sign.MAGNITUDE, Frame.LIVE, "m", "an unsigned measure"))))
+    check("...and an EXCLUDED name is still excluded after the vocabulary grows",
+          set(_ZERO_IS_NOT_A_CONTACT_SURFACE) & derived == set())
     check("no MAGNITUDE measure is in the set — move_to_3d peaks at object_to_goal_z == 0 on purpose",
           not any(MEASURES[n].sign is Sign.MAGNITUDE for n in _CONTACT_SURFACE_MEASURES)
           and error_from(plan_of, row_edited(1, setpoint=0.0), horizon=HORIZON) is None)
@@ -773,6 +933,38 @@ def run_checks():
     bullet = [ln for ln in vocab_document().splitlines() if "attractor_setpoint_not_at" in ln][0]
     check("the document advertises the rule over exactly the measures the compiler applies it to",
           {n for n in signed if n in bullet} == set(_ZERO_IS_NOT_A_CONTACT_SURFACE))
+
+    # ── THE SAME RULE ON THE KERNEL AXIS ────────────────────────────────────────────────────────
+    # Round 1 closed the measure axis and left this one open: `_PEAKED_KERNELS` named two of the
+    # three kernels and omitted `neg_linear`, which is `-|measure - setpoint|` — maximised AT the
+    # setpoint, at 0.0 rather than 1.0, which is a shallower peak and not the absence of one. So
+    # `DistancePull{measure: height_above_seat_live, kernel: neg_linear}` on DEFAULT parameters
+    # (`setpoint` defaults to 0.0) compiled clean while pulling a grasped object onto the seat: the
+    # 16/16-grasp failure of 2026-06-04, reached through the kernel the refusal did not cover.
+    kernels = param_of("DistancePull", "kernel").choices
+    check("the vocabulary offers three kernels and every one of them is checked",
+          set(kernels) == set(_PEAKED_KERNELS) and len(kernels) == 3)
+    for kernel in kernels:
+        # ONE refusal per kernel, so dropping any single one from `_PEAKED_KERNELS` turns this red —
+        # which the previous "is it in the set" style of check could not do.
+        refuses(f"a {kernel} DistancePull peaking at the seat surface",
+                row_edited(2, kernel=kernel, setpoint=0.0),
+                "16/16", "setpoint", kernel, horizon=HORIZON)
+    check("...and each of them still compiles at descend's real hover setpoint, 0.015",
+          all(error_from(plan_of, row_edited(2, kernel=k, setpoint=0.015), horizon=HORIZON) is None
+              for k in kernels))
+    check("...and over a measure whose zero is not a surface, at any kernel",
+          all(error_from(plan_of, row_edited(2, kernel=k, measure="gripper_qpos", setpoint=0.0),
+                         horizon=HORIZON) is None for k in kernels))
+    check("every legal kernel is either checked or excluded with a stated reason",
+          set(kernels) == set(_PEAKED_KERNELS) | set(_KERNEL_PEAK_IS_NOT_AT_SETPOINT)
+          and set(_KERNEL_PEAK_IS_NOT_AT_SETPOINT) <= set(kernels)
+          and all(_KERNEL_PEAK_IS_NOT_AT_SETPOINT.values()))
+    kgrown = _derive_peaked_kernels(set(kernels) | {"cauchy"})
+    check("a kernel the vocabulary gains tomorrow lands in the check with no edit here",
+          "cauchy" in kgrown and kgrown - {"cauchy"} == set(_PEAKED_KERNELS))
+    check("the document advertises the rule over exactly the kernels the compiler applies it to",
+          {k for k in kernels if k in bullet} == set(_PEAKED_KERNELS))
 
     # ── the fold over a BATCH, not a scalar ─────────────────────────────────────────────────────
     # Vectorisation is this phase's binding constraint: one fold runs over up to 4096 environments at
@@ -804,6 +996,54 @@ def run_checks():
         check(f"{label} folds element-wise over a 3-element batch", close_all(got, want))
     check("...and a Python `if` on a batch is a failure here, not a silent one-branch",
           isinstance(error_from(bool, Vec([0.0, 1.0, 0.0])), AssertionError))
+
+    # ── ...over a batch whose COMPARISONS ARE BOOLEAN, which is the shape torch actually has ─────
+    # `Vec` cannot see this: its `__gt__` returns floats, so it is a batch that happens to be
+    # pre-numeric — the one kind the helpers worked for. A torch comparison yields a BOOL tensor and
+    # `1 - bool_tensor` is a RuntimeError, so `compile._relu(torch.tensor([-1., 2.]))` raised and
+    # `HingePenalty`/`Ramp` could not fold a raw tensor AT ALL, while the module docstring promised
+    # one fold for a CPU float and a batched CUDA tensor alike. Task 5's adapter worked around it
+    # from outside with a wrapper whose comparisons return floats; that fixed one caller and left
+    # the stdlib path broken for everyone who believed the docstring.
+    check("a boolean batch refuses `1 - c` the way a torch bool tensor does",
+          isinstance(error_from(operator.sub, 1, BoolMask([True, False, True])), AssertionError)
+          and isinstance(error_from(operator.sub, BoolMask([True, False, True]), 1), AssertionError))
+    check("...and BoolVec's comparisons really do produce one, or none of this bites",
+          isinstance(BoolVec([1.0, 2.0, 3.0]) > 2.0, BoolMask)
+          and isinstance(BoolVec([1.0, 2.0, 3.0]) < 2.0, BoolMask))
+
+    def result_of(fn, *a):
+        """The value, or whatever it raised — one broken helper is one failed check, not an aborted
+        run (same reason as `folded`)."""
+        try:
+            return fn(*a)
+        except BaseException as exc:      # noqa: BLE001 — see docstring
+            return exc
+
+    for label, fn, args, want in (
+            ("_relu", _relu, (BoolVec([-1.0, 0.0, 2.0]),), [0.0, 0.0, 2.0]),
+            ("_max", _max, (BoolVec([-1.0, 0.0, 2.0]), 0.5), [0.5, 0.5, 2.0]),
+            ("_min", _min, (BoolVec([-1.0, 0.0, 2.0]), 0.5), [-1.0, 0.0, 0.5]),
+            ("_clamp", _clamp, (BoolVec([-1.0, 0.5, 2.0]), 0.0, 1.0), [0.0, 0.5, 1.0]),
+            ("_where", _where, (BoolMask([True, False, True]), BoolVec([1.0, 2.0, 3.0]),
+                                BoolVec([10.0, 20.0, 30.0])), [1.0, 20.0, 3.0]),
+    ):
+        check(f"compile.{label} folds a boolean-conditioned batch element-wise",
+              close_all(result_of(fn, *args), want))
+
+    # ...and the whole fold, not only the helpers: HingePenalty (`_relu`) and Ramp (`_clamp`) are
+    # the two rows that could not run at all, so both go through a boolean-conditioned batch here.
+    bool_batch = {k: BoolVec([v] * 3) for k, v in values().items()}
+    bool_batch["height_above_seat_live"] = BoolVec([0.012, -0.004, 0.03])
+    bool_scalar = [values(height_above_seat_live=h) for h in (0.012, -0.004, 0.03)]
+    check("the descend fold (HingePenalty/_relu) runs over a boolean-conditioned batch",
+          close_all(folded(plan, bool_batch), [folded(plan, s) for s in bool_scalar]))
+    rplan = plan_of(ramp_doc(1.0, 0.04, True), horizon=HORIZON)
+    rbatch = {k: BoolVec([v] * 3) for k, v in values().items()}
+    rbatch["object_z"] = BoolVec([-0.01, 0.02, 0.09])
+    check("a normalized Ramp (_clamp) runs over one too",
+          close_all(folded(rplan, rbatch),
+                    [folded(rplan, values(object_z=z)) for z in (-0.01, 0.02, 0.09)]))
 
     # ── the evaluator's own contract ────────────────────────────────────────────────────────────
     missing = values()

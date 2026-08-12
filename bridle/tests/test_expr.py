@@ -7,9 +7,12 @@ be TOTAL over its declared names — the compiler asks for `Expr.names` to check
 resolves to a real measure, so an author's typo fails at compile time instead of at step 0 of a
 multi-hour run.
 
-Evaluation here is plain arithmetic and is tested with Python floats. In production the same
+Evaluation here is plain arithmetic and is mostly tested with Python floats. In production the same
 expression evaluates over batched GPU tensors: the operators are identical, which is exactly why the
-language is restricted to operators that mean the same thing for both.
+language is restricted to operators that mean the same thing for both — but "identical" was a claim
+no check here made, and it was FALSE for `clamp`/`min`/`max` over a raw tensor until 2026-08-13 (a
+torch comparison is a bool tensor and `1 - bool_tensor` raises). The batch section at the end folds
+those calls over a boolean-conditioned batch so the docstring's claim is a tested one.
 
 Run: python -m pytest bridle/tests/test_expr.py
      PYTHONPATH=. python bridle/tests/test_expr.py
@@ -17,7 +20,12 @@ Run: python -m pytest bridle/tests/test_expr.py
 import math
 import sys
 
-from bridle.skill.expr import ExprError, parse
+from bridle.skill.expr import ExprError, parse, _clamp, _max2, _min2, _where
+# The batch stand-ins live next to `Vec` in test_skillcompile, which documents why they exist. One
+# copy, imported, for the same reason that file imports `descend_doc` instead of re-deriving it: two
+# duck-typed models of the same torch behaviour would drift, and the drifting one would be the one
+# whose module was not being edited.
+from bridle.tests.test_skillcompile import BoolMask, BoolVec, close_all
 
 FAILS = []
 
@@ -129,6 +137,43 @@ def run_checks():
     check("missing name is an ExprError", raises(ExprError, parse("a + b").evaluate, {"a": 1}))
     check("syntax error is an ExprError", raises(ExprError, parse, "2 * (1 +"))
     check("empty source is an ExprError", raises(ExprError, parse, "   "))
+
+    # ── BATCH: the branch-free helpers over a boolean-conditioned batch ──
+    # The module docstring's whole justification for `c*a + (1-c)*b` is that one expression means
+    # one thing for a CPU float and a batched CUDA tensor. It did not: `_min2`/`_max2`/`_clamp` build
+    # their condition as `a < b`, a torch comparison yields a BOOL tensor, and `1 - bool_tensor` is a
+    # RuntimeError — so `parse("clamp(x, 0, 1)").evaluate({"x": <tensor>})` raised (measured
+    # 2026-08-13). It went unseen because `_eval_compare` normalises a COMPARISON to a number, so an
+    # expression whose condition was written out (`where(x > 0, ...)`) worked while the identical
+    # condition handed to `clamp`/`min`/`max` did not. `BoolVec` is a batch shaped like torch:
+    # comparisons yield a `BoolMask` that refuses subtraction.
+    def value_of(fn, *a):
+        try:
+            return fn(*a)
+        except BaseException as exc:      # noqa: BLE001 — a raise here is the defect, report it
+            return exc
+
+    for label, fn, args, want in (
+        ("_max2", _max2, (BoolVec([-1.0, 0.0, 2.0]), 0.5), [0.5, 0.5, 2.0]),
+        ("_min2", _min2, (BoolVec([-1.0, 0.0, 2.0]), 0.5), [-1.0, 0.0, 0.5]),
+        ("_clamp", _clamp, (BoolVec([-1.0, 0.5, 2.0]), 0.0, 1.0), [0.0, 0.5, 1.0]),
+        ("_where", _where, (BoolMask([True, False, True]), BoolVec([1.0, 2.0, 3.0]),
+                            BoolVec([10.0, 20.0, 30.0])), [1.0, 20.0, 3.0]),
+    ):
+        check(f"{label} folds a boolean-conditioned batch element-wise",
+              close_all(value_of(fn, *args), want))
+
+    for src, env, want in (
+        ("clamp(x, 0, 1)", {"x": BoolVec([-1.0, 0.5, 2.0])}, [0.0, 0.5, 1.0]),
+        ("min(x, 0.5)", {"x": BoolVec([-1.0, 0.0, 2.0])}, [-1.0, 0.0, 0.5]),
+        ("max(x, 0.5)", {"x": BoolVec([-1.0, 0.0, 2.0])}, [0.5, 0.5, 2.0]),
+        ("where(x > 0, 1, 2)", {"x": BoolVec([-1.0, 0.5, 2.0])}, [2.0, 1.0, 1.0]),
+        ("2.5 * (1 - tanh(6 * abs(h - 0.015))) * clamp(g, 0, 1)",
+         {"h": BoolVec([0.015, 0.115, 0.015]), "g": BoolVec([1.0, 1.0, 0.0])},
+         [2.5, 2.5 * (1 - math.tanh(6 * 0.1)), 0.0]),
+    ):
+        check(f"an expr evaluates over that batch: {src}",
+              close_all(value_of(parse(src).evaluate, env), want))
 
 
 def test_bridle():

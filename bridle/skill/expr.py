@@ -16,7 +16,10 @@ module exists instead of just calling `eval()`:
   envs — during PPO training. The two consequences that follow, and that a naive port from Python
   gets wrong:
     - `where(c, a, b)` is written branch-free as `c * a + (1 - c) * b`. A Python `if c: a else: b`
-      would call `bool()` on the whole batch and silently take ONE branch for all 4096 envs.
+      would call `bool()` on the whole batch and silently take ONE branch for all 4096 envs. The
+      condition is made NUMERIC first (`_numeric`), because a torch comparison yields a bool tensor
+      and `1 - bool_tensor` raises — without that step the claim in this paragraph was false for
+      `clamp`/`min`/`max` on a raw tensor (measured 2026-08-13).
     - `tanh`/`exp`/`log`/`sqrt` dispatch to the value's own method first (`x.tanh()` — torch tensors
       have these) and fall back to `math.*` only when that method is absent (plain floats/ints).
       That is the one piece of code that makes "the same expression string means the same thing for
@@ -234,13 +237,31 @@ _log = _method_or_math("log", math.log)
 _sqrt = _method_or_math("sqrt", math.sqrt)
 
 
+def _numeric(c):
+    """A condition as a NUMBER, whatever it arrived as, so `1 - c` below is arithmetic rather than a
+    type error.
+
+    A comparison on a torch tensor yields a BOOL tensor, and `1 - bool_tensor` is a RuntimeError
+    ("Subtraction, the `-` operator, with a bool tensor is not supported"), so `_min2`/`_max2`/
+    `_clamp` — which all build their condition as `a < b` — could not evaluate a raw tensor at all
+    (measured 2026-08-13), while the module docstring above promised the same expression means the
+    same thing for a CPU float and a batched CUDA tensor. `c * 1` is the one operation that fixes it
+    without changing any value: exact for a float, identity for an int, `True/False -> 1/0` for a
+    Python bool, bool -> int64 for a tensor. `_eval_compare` already normalises this way (`result =
+    1; result = result * ok`), which is why an `expr:` whose condition is a COMPARISON worked while
+    the same condition handed straight to `clamp`/`min`/`max` did not.
+    """
+    return c * 1
+
+
 def _where(c, a, b):
     """Branch-free select. `if c: a else: b` would call `bool(c)` on the WHOLE batch and take one
     branch for all 4096 parallel envs at once; `c*a + (1-c)*b` selects elementwise instead, which is
     the only form that means the same thing for a scalar and a tensor. `c` may be a Python bool, a
-    0/1 float, or a bool/float tensor — arithmetic treats True/nonzero as 1 and False/zero as 0 in
-    all three cases.
+    0/1 float, or a bool/float tensor — `_numeric` is what makes the last of those true rather than
+    merely intended.
     """
+    c = _numeric(c)
     return c * a + (1 - c) * b
 
 

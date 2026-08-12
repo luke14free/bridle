@@ -742,8 +742,11 @@ def vocab_document() -> str:
         "steps at 0% success.")
     add("- `attractor_setpoint_not_at: contact` — a DistancePull setpoint over a SIGNED measure "
         "whose zero IS a resting surface must not peak at that zero (descend's hover, 0.015, never "
-        "0) — peaking at contact is the 16/16 grasp-loss failure mode. Two signed measures are "
-        "outside this rule because their zero is not a surface and a setpoint of 0 over them is a "
+        "0) — peaking at contact is the 16/16 grasp-loss failure mode. It holds for EVERY kernel, "
+        "because all three are maximised at the setpoint: `one_minus_tanh` and `gaussian` at 1.0, "
+        "`neg_linear` (`-|measure - setpoint|`) at 0.0 — a shallower peak, not the absence of one. "
+        "Two signed measures are outside this rule because their zero is not a surface and a "
+        "setpoint of 0 over them is a "
         "legal thing to ask for: `gripper_qpos` (0 is a fully open jaw; closed is ~-0.73) and "
         "`joint_qpos` (0 is a joint's zero angle, held in free space).")
 

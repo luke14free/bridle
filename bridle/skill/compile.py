@@ -65,7 +65,7 @@ from bridle.skill.spec import ROW_TERMS, SkillSpec
 from bridle.skill.vocab import MEASURES, TERMS, Sign
 
 __all__ = [
-    "CompileError", "FloodingError", "Op", "RewardPlan", "UNBOUNDED",
+    "CompileError", "FloodingError", "Note", "Op", "RewardPlan", "UNBOUNDED",
     "compile_spec", "evaluate_plan",
 ]
 
@@ -116,7 +116,32 @@ def _num(x):
 # is a different reward. Same reason `tanh`/`exp` dispatch to the value's own method first: a torch
 # tensor has `.tanh()`, a float does not, and one expression must mean one thing for both.
 
+def _numeric(c):
+    """A condition as a NUMBER, whatever it arrived as, so `1 - c` below is arithmetic rather than a
+    type error.
+
+    THIS LINE IS THE DIFFERENCE BETWEEN THE DOCSTRING AND THE TRUTH. Every helper here builds its
+    condition from a comparison (`a > b`), and a torch comparison yields a BOOL tensor:
+
+        >>> 1 - torch.tensor([True, False])
+        RuntimeError: Subtraction, the `-` operator, with a bool tensor is not supported.
+
+    so `_relu(torch.tensor([-1., 2.]))` raised, and `HingePenalty` and `Ramp` could not fold a raw
+    tensor AT ALL (measured 2026-08-13), while this module's docstring promised one fold for a CPU
+    float and a batched CUDA tensor alike. Normalising HERE and not at the call sites is what makes
+    that promise true for every caller, including the ones that hand over a bare tensor rather than
+    a wrapper whose comparisons already return floats.
+
+    `c * 1` is the one operation that works for all four cases and changes no value in any of them:
+    exact for a float (IEEE multiply by 1), identity for an int, `True/False -> 1/0` for a Python
+    bool, and bool -> int64 for a tensor. Same idiom `expr._eval_compare` already uses to keep a
+    bare comparison numeric (`result = 1; result = result * ok`).
+    """
+    return c * 1
+
+
 def _where(c, a, b):
+    c = _numeric(c)
     return c * a + (1 - c) * b
 
 
@@ -285,6 +310,27 @@ class Op:
     params: MappingProxyType
     stateful: bool
 
+    def __hash__(self):
+        """Written out because the generated one does not work. `eq=True, frozen=True` makes the
+        dataclass synthesise a `__hash__` over the field tuple, which invites `hash(op)`,
+        `op in {...}` and `set(plan.ops)` — and every one of them raised `TypeError: unhashable
+        type: 'mappingproxy'`, because `params` is a `MappingProxyType`. Hashed over a canonical
+        form of exactly the fields `__eq__` compares, so equal Ops hash equal.
+        """
+        return hash((self.kind, self.scope, self.fn_key, self.stateful, _hashable(self.params)))
+
+
+def _hashable(value):
+    """A hashable stand-in for a parameter value, mirroring what `Op.__eq__` compares: a mapping
+    becomes its sorted key/value pairs, a sequence becomes a tuple, and anything else is already
+    hashable — an `Expr` by identity, which is also how `__eq__` sees it."""
+    if isinstance(value, (MappingProxyType, dict)):
+        return tuple(sorted(((str(k), _hashable(v)) for k, v in value.items()),
+                            key=lambda item: item[0]))
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable(v) for v in value)
+    return value
+
 
 # ── per-step maxima ─────────────────────────────────────────────────────────────────────────────
 
@@ -385,27 +431,44 @@ assert set(_PER_STEP_MAXIMUM) == set(ROW_TERMS) | {"expr", "custom"}, (
 
 # ── lowering ────────────────────────────────────────────────────────────────────────────────────
 
-#: 0 on any of these measures IS the surface the object rests on, so a peaked attractor at setpoint=0
-#: pulls a GRASPED object into it. That is not a hypothetical: descend's pre-2026-06-04 hover was
+def _choices_of(term, name):
+    """The vocabulary's legal set for one parameter. READ, never restated: both sets below are the
+    compiler's half of a rule `vocab_document()` advertises to the authoring model, and a hand-copied
+    set stops matching that promise the day the vocabulary grows — silently, and in the direction
+    that ACCEPTS what the document says is refused."""
+    param = next(p for p in TERMS[term].params if p.name == name)
+    return frozenset(param.choices or ())
+
+
+# THE 16/16-GRASP RULE HAS TWO AXES — the measure and the kernel — and it has now been narrower than
+# advertised on each of them in turn. Both sets below are therefore DERIVED from the vocabulary with
+# a written exclusion dict, so the default for anything the vocabulary gains is to be CHECKED, and
+# taking something out costs one line with its reason.
+
+#: AXIS 1, THE MEASURE. 0 on any of these IS the surface the object rests on, so a pull peaked at
+#: setpoint=0 drags a GRASPED object into it. Not a hypothetical: descend's pre-2026-06-04 hover was
 #: `2.5*(1-tanh(6*dz))`, peaking at dz=0, and broke 16/16 grasps while low; the fix was to peak at
-#: _HOVER=0.015 instead.
-#:
-#: DERIVED FROM THE VOCABULARY, not hand-listed. `vocab_document()` hands the authoring model this
-#: rule over SIGNED measures, and a hand-listed set silently stops matching that promise the day a
-#: signed measure is added — the same drift `_PER_STEP_MAXIMUM`'s assert exists to stop for terms. So
-#: a new SIGNED measure is IN the check by default and taking it out costs one line below, with its
-#: reason. (The list this replaced named three of the five signed measures and justified the gap by
-#: citing `object_to_goal_z`, which is MAGNITUDE and was never a candidate, while `joint_qpos` — a
-#: real and correct exclusion — went unmentioned.)
+#: _HOVER=0.015 instead. (The hand-list this replaced named three of the five signed measures and
+#: justified the gap by citing `object_to_goal_z`, which is MAGNITUDE and was never a candidate,
+#: while `joint_qpos` — a real and correct exclusion — went unmentioned.)
 _ZERO_IS_NOT_A_CONTACT_SURFACE = {
     "gripper_qpos": "0 is a fully OPEN jaw, not a surface: closed is ~-0.73 and the jaw-creep hinge "
                     "sits at -0.6, so a pull peaked at 0 asks the gripper to open — a legal request",
     "joint_qpos": "0 is a joint's zero angle, a pose the arm holds in free space; nothing is "
                   "resting on anything",
 }
-_CONTACT_SURFACE_MEASURES = frozenset(
-    name for name, measure in MEASURES.items()
-    if measure.sign is Sign.SIGNED and name not in _ZERO_IS_NOT_A_CONTACT_SURFACE)
+
+
+def _derive_contact_surfaces(measures):
+    """Every SIGNED measure the vocabulary has, minus the written exclusions. A FUNCTION so the
+    derivation itself is testable: asserting the two sets partition the signed measures is satisfied
+    by ANY partition, including the hand-list this replaced, and cannot see whether a measure added
+    tomorrow lands in the check."""
+    return frozenset(name for name, measure in measures.items()
+                     if measure.sign is Sign.SIGNED and name not in _ZERO_IS_NOT_A_CONTACT_SURFACE)
+
+
+_CONTACT_SURFACE_MEASURES = _derive_contact_surfaces(MEASURES)
 
 assert set(_ZERO_IS_NOT_A_CONTACT_SURFACE) <= set(MEASURES), (
     "an exclusion naming a measure the vocabulary does not have is a line that stopped meaning "
@@ -418,7 +481,34 @@ assert {"height_above_seat_live", "height_above_seat_static_goal",
     "the three measures whose 0 is a seat or resting surface must stay checked: this is the "
     "16/16-grasp rule, and `height_above_seat` -> `height_above_seat_live` already renamed once "
     "(phase2-decisions §2), so a rename must fail loudly here rather than delete the check")
-_PEAKED_KERNELS = frozenset({"one_minus_tanh", "gaussian"})
+
+#: AXIS 2, THE KERNEL. Kernels whose maximum is NOT at the setpoint — EMPTY, and that is the finding:
+#: all three the vocabulary offers peak there. `one_minus_tanh` is `1 - tanh(k|d|)` and `gaussian` is
+#: `exp(-k d^2)`, both maximal at 1.0 when d=0; `neg_linear` is `-|d|`, maximal at 0.0 when d=0 — a
+#: shallower peak, not the absence of one, and `vocab.py`'s `setpoint` param calls itself "the
+#: kernel's peak" for all three with a default of 0.0. Naming only the first two left
+#: `DistancePull{measure: height_above_seat_live, kernel: neg_linear}` compiling clean ON DEFAULT
+#: PARAMETERS while pulling a grasped object down onto the seat — the same 16/16-grasp failure the
+#: refusal above exists to stop, reached through the kernel it did not cover. The row's WEIGHT sign
+#: is deliberately not part of the rule (a negative weight inverts any of the three into a repeller);
+#: that has always been true of the two kernels already here, and one uniform rule is the one the
+#: document can state.
+_KERNEL_PEAK_IS_NOT_AT_SETPOINT = {}
+
+
+def _derive_peaked_kernels(kernels):
+    """Same shape, same reason, as `_derive_contact_surfaces` — see it."""
+    return frozenset(k for k in kernels if k not in _KERNEL_PEAK_IS_NOT_AT_SETPOINT)
+
+
+_PEAKED_KERNELS = _derive_peaked_kernels(_choices_of("DistancePull", "kernel"))
+
+assert set(_KERNEL_PEAK_IS_NOT_AT_SETPOINT) <= _choices_of("DistancePull", "kernel"), (
+    "an exclusion naming a kernel the vocabulary does not offer excludes nothing and hides that it "
+    "excludes nothing")
+assert "one_minus_tanh" in _PEAKED_KERNELS, (
+    "the kernel of the recorded incident must stay checked: descend's `2.5*(1-tanh(6*dz))` peaked "
+    "at dz=0 and broke 16/16 grasps (2026-06-04)")
 
 
 def _check_row_semantics(path, term, values):
@@ -429,7 +519,8 @@ def _check_row_semantics(path, term, values):
             raise CompileError(
                 f"{path}.setpoint",
                 f"this DistancePull peaks AT the contact surface: setpoint=0.0 over "
-                f"{values['measure']!r}, where 0 means the object is resting on the seat. Peaking at "
+                f"{values['measure']!r} with kernel={values['kernel']!r}, which is maximised at the "
+                f"setpoint, and 0 there means the object is resting on the seat. Peaking at "
                 f"contact is a recorded failure, not a free parameter — descend's "
                 f"`2.5*(1-tanh(6*dz))` pulled the held cube INTO the platform and broke 16/16 grasps "
                 f"(2026-06-04); the fix was a setpoint of 0.015, a hover ABOVE the seat. Set a "
@@ -547,17 +638,43 @@ def _row_maximum(op):
     return _PER_STEP_MAXIMUM[op.fn_key](op.params)
 
 
-#: A note's two levels. `_ACT` also goes out through the `warnings` module — the caller has something
-#: to DO (pass a horizon, bound a row, lower a weight). `_FYI` is stored in `plan.warnings` only.
-#: The split exists because emitting on EVERY successful compile made `python -W error` unable to
-#: compile any document at all, which turns a channel meant to carry signal into one a careful caller
-#: must switch off wholesale.
-_FYI, _ACT = "note", "act"
+class Note(str):
+    """One compile-time note: its text, and the LEVEL saying whether a caller can act on it.
+
+    A `str` SUBCLASS rather than a `(level, text)` pair because `plan.warnings` is the authoritative
+    channel and already has consumers that treat an entry as text — the plan report runs
+    `textwrap.fill(note, ...)` over each one (`report.format_warnings`) and the tests join them.
+    A pair would have broken both for a field this module does not own the printing of. Everything a
+    string does, a Note does; `.level` is the part that used to be dropped at the `RewardPlan`
+    boundary, where "flooding check INCOMPLETE ... this is not a pass" and a clean integrated ratio
+    arrived indistinguishable and the distinction survived only in whether `warn()` had already
+    fired — i.e. in a channel the stdlib dedupes per (message, location) and `bridle skill` silences.
+
+    `Note.ACT` also goes out through the `warnings` module: the caller has something to DO (pass a
+    horizon, bound a row, lower a weight). `Note.FYI` is recorded only. The split exists because
+    emitting on EVERY successful compile made `python -W error` unable to compile any document at
+    all, which turns a channel meant to carry signal into one a careful caller must switch off
+    wholesale.
+    """
+
+    FYI = "note"
+    ACT = "act"
+
+    def __new__(cls, level, text):
+        note = super().__new__(cls, text)
+        note.level = level
+        return note
+
+    def __repr__(self):
+        return f"Note({self.level!r}, {str.__repr__(self)})"
+
+
+_FYI, _ACT = Note.FYI, Note.ACT
 
 
 def _check_flooding(ops, *, horizon, terminate_on_success):
     """Refuse when per-step shaping can out-earn completing the task. Warn — never refuse — on the
-    horizon-integrated number. Returns `(level, text)` notes; raises `FloodingError`.
+    horizon-integrated number. Returns a list of `Note`s; raises `FloodingError`.
 
     WHY THE REFUSAL IS PER-STEP AND THE HORIZON IS ONLY A WARNING (user decision, 2026-08-12; the
     original amendment proposed refusing on the integrated ratio):
@@ -601,7 +718,7 @@ def _check_flooding(ops, *, horizon, terminate_on_success):
     total = sum(m for _, _, m in bounded)
 
     if unbounded:
-        notes.append((_ACT,
+        notes.append(Note(_ACT,
             f"flooding check INCOMPLETE: {len(unbounded)} reward row(s) state no per-step maximum "
             f"this document can bound — "
             f"{'; '.join(f'reward[{i}] {op.fn_key} UNBOUNDED' for i, op, _ in unbounded)}. The "
@@ -611,7 +728,7 @@ def _check_flooding(ops, *, horizon, terminate_on_success):
     if overriding:
         # Stated in the note, not only in a code comment: a reader of the output has no way to know
         # which rows the sum above left out, and the omission is large enough to invert the verdict.
-        notes.append((_ACT,
+        notes.append(Note(_ACT,
             f"KNOWN GAP, this check does not cover "
             f"{'; '.join(f'reward[{i}] {op.fn_key} mode={op.kind}' for i, op in overriding)}: a "
             f"`replace` or `floor` row does not ACCUMULATE, so it is outside the per-step sum by "
@@ -621,7 +738,7 @@ def _check_flooding(ops, *, horizon, terminate_on_success):
             f"those rows' levels against the success value by hand."))
 
     if not bonuses:
-        notes.append((_ACT,
+        notes.append(Note(_ACT,
             "flooding check INCOMPLETE: this reward has no SuccessBonus row, so there is no "
             f"completion value for the {_num(total)}/step of shaping to be compared against. That "
             "is not a pass — it is a reward whose ceiling this compiler cannot locate."))
@@ -663,7 +780,7 @@ def _integrated_note(total, value, *, ops, horizon, terminate_on_success, partia
               "above are not in it, so the real total is higher by an amount this document does not "
               "state." if partial else "")
     if horizon is None:
-        return [(_ACT,
+        return [Note(_ACT,
             "the horizon-integrated shaping check could NOT be computed: no `horizon=` was passed to "
             "compile_spec, and this compiler does not substitute a default. NOT VERIFIED is not the "
             "same as verified — `bridle lineage` once printed `0 violation(s)` and exited 0 on a "
@@ -691,7 +808,7 @@ def _integrated_note(total, value, *, ops, horizon, terminate_on_success, partia
     exceeds = earned >= paid
     head = ("WARNING (not a refusal): shaping out-earns completion over the episode — "
             if exceeds else "note: ")
-    return [(_ACT if (exceeds or partial) else _FYI,
+    return [Note(_ACT if (exceeds or partial) else _FYI,
         f"{head}integrated over the episode, shaping pays {at_least}{_num(earned)} "
         f"({_num(total)}/step x {horizon} steps) against {_num(paid)} for completing it "
         f"({_num(value)} x {steps} step(s) — {why}).{caveat} Printed, never refused: the deployed "
@@ -719,6 +836,12 @@ class RewardPlan:
     a second identical compile in one process prints nothing. This field is the record that neither
     limitation touches. (Field named `warnings` while the module is imported as `warn` — see the
     import.)
+
+    Its entries are `Note`s: strings, so every existing consumer keeps working unchanged, that also
+    carry `.level` (`Note.ACT` / `Note.FYI`). Without it a reader of the authoritative channel could
+    not tell "flooding check INCOMPLETE ... this is not a pass" from a clean integrated ratio, and
+    the distinction survived only in whether `warn()` had already fired — which is precisely the
+    channel this field exists because one cannot rely on.
     """
 
     ops: tuple
@@ -800,12 +923,14 @@ def compile_spec(spec: SkillSpec, *, horizon=None, terminate_on_success=None) ->
                                                    "at scale")
 
     notes = _check_flooding(ops, horizon=horizon, terminate_on_success=terminate_on_success)
-    for level, note in notes:
+    for note in notes:
         # Stored unconditionally, emitted selectively. A clean integrated ratio is a fact about the
         # document, not a request: raising it made every successful compile a `UserWarning` and made
         # `-W error` refuse legal specs, so a careful caller's only option was to silence the channel
-        # — and then the notes that DO need action go with it.
-        if level == _ACT:
+        # — and then the notes that DO need action go with it. The level travels ON the note into
+        # `plan.warnings`, so this decision is legible to a consumer of that field and not only to
+        # whoever was listening to the `warnings` module at the time.
+        if note.level == _ACT:
             warn(note, stacklevel=2)
 
     measures = set()
@@ -814,7 +939,7 @@ def compile_spec(spec: SkillSpec, *, horizon=None, terminate_on_success=None) ->
     return RewardPlan(
         ops=ops, scale=scale, measures_needed=frozenset(measures),
         state_slots=tuple(op.params["slot"] for op in ops if op.stateful),
-        warnings=tuple(note for _, note in notes))
+        warnings=tuple(notes))
 
 
 # ── the stdlib evaluator ────────────────────────────────────────────────────────────────────────
