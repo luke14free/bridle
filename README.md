@@ -149,6 +149,13 @@ for it.
 - **Retraining costs hours-to-days of GPU per skill.** That has to be visible in the UX or the
   product feels broken.
 
+## For agents and LLMs
+
+If you are an LLM writing code against bridle — or a coding agent working in this repo — read
+**[AGENTS.md](AGENTS.md)**. It carries the invariants that are easy to get wrong (never copy a number
+out of a Contract; never add a second rollout loop; unknown fields mean retrain), the reasoning
+behind the severity table, and runnable patterns for each object.
+
 ## Install
 
 ```bash

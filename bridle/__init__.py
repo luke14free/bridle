@@ -1,25 +1,50 @@
-"""bridle — one rollout loop and one declared contract, so training and deployment cannot disagree.
+"""bridle — a harness for robot skills. Bring your own LLM, simulator and robot.
 
-For grasping robot arms. v0.1 scope: single-arm grasp-and-place on a parallel-jaw gripper.
+Skills carry the contract they were trained under, so running one on a rig it does not fit is a
+startup error with a field-level diff, not a silent failure discovered days later.
 
-    from bridle import Contract, Runner, Trace
-    contract = Contract.grab()
-    Runner(contract, Trace("grab")).run_grasp(policy_fn, step_fn, grasp_fn, gripper_zero_fn)
+    from bridle import Contract, Rig, Runner, Store, Trace
+    from bridle.runner import Rollout
 
-Core (contract, runner, trace, signals, geometry, calibrate, checkpoint) is stdlib-only: no torch, no
-simulator, testable on any machine. Backends live in `bridle.adapters` and are optional extras.
+    rig  = Rig.so101(cameras=("base",))
+    plan = Store("~/.bridle/apps").plan(app, rig)     # run / adapt / retrain / blocked
 
-Design: the design notes
-Origin:  the design notes
+Core (contract, rig, resolve, runner, trace, signals, geometry, calibrate, checkpoint, app, store,
+foundry, llm, orchestrator) is stdlib-only: no torch, no simulator, testable on any machine.
+Backends live in `bridle.adapters` and are optional extras.
+
+For agents and LLMs writing code against this library: read AGENTS.md — it carries the invariants
+that are easy to get wrong and the reasons behind them.
 """
+from bridle.app import App, Artifact, EnvSpec, EvalSpec, Recipe, Stage
 from bridle.checkpoint import ContractMismatch, stamp, verify
-from bridle.contract import Actuation, Contract, Grasp, GraspSignal, Release
-from bridle.runner import Runner, RunResult
+from bridle.contract import Actuation, Contract, Execution, Grasp, GraspSignal, Release
+from bridle.foundry import Foundry, Job, ShellStageRunner, StageError, StageResult
+from bridle.llm import OpenAICompatProvider, Provider, ScriptedProvider
+from bridle.orchestrator import Orchestrator, build_tools
+from bridle.resolve import ADAPT, RETRAIN, RUN, Resolution, resolve, resolve_contracts
+from bridle.rig import Camera, Gripper, Rig
+from bridle.runner import Rollout, Runner, RunResult
+from bridle.store import BLOCKED, Plan, Store
 from bridle.trace import Trace
 
 __version__ = "0.1.0"
 
 __all__ = [
-    "Actuation", "Contract", "ContractMismatch", "Grasp", "GraspSignal", "Release",
-    "RunResult", "Runner", "Trace", "stamp", "verify", "__version__",
+    # contract & rig — what a skill assumes
+    "Actuation", "Contract", "Execution", "Grasp", "GraspSignal", "Release",
+    "Camera", "Gripper", "Rig",
+    # does this skill fit this rig?
+    "Resolution", "resolve", "resolve_contracts", "RUN", "ADAPT", "RETRAIN", "BLOCKED",
+    # skills on disk
+    "App", "Artifact", "EnvSpec", "EvalSpec", "Recipe", "Stage", "Store", "Plan",
+    # building them
+    "Foundry", "Job", "ShellStageRunner", "StageError", "StageResult",
+    # running them
+    "Rollout", "Runner", "RunResult", "Trace",
+    # checkpoints that know what they are
+    "ContractMismatch", "stamp", "verify",
+    # bring your own LLM
+    "Orchestrator", "Provider", "OpenAICompatProvider", "ScriptedProvider", "build_tools",
+    "__version__",
 ]
