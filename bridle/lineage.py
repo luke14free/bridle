@@ -16,6 +16,7 @@ first thing anybody sees.
 
 Stdlib only, deliberately: everything here must be testable in seconds with no simulator.
 """
+import os
 from dataclasses import dataclass
 
 #: Environment prefixes that constitute a lineage. Drawn from the 47 variables measured across
@@ -47,10 +48,11 @@ class Change:
 @dataclass(frozen=True)
 class Mismatch:
     """Two records of one fact, disagreeing. `effective` is what the system actually resolves to;
-    `claimed` is what `record` says it is."""
+    `claimed` is what `record` says it is. `effective=None` means the live env does not set this
+    key AT ALL — the record's claim that it does is itself the disagreement (see `compare_records`)."""
 
     key: str
-    effective: str
+    effective: str | None
     claimed: str
     record: str
 
@@ -161,10 +163,72 @@ def compare_records(effective: dict, claimed: dict, record: str, prefix: str = "
     a check for contradiction, not for completeness. `prefix` scopes what the record is taken to be
     describing (e.g. "COORD_CKPT_" for scripts/_pgenv.sh, which mirrors only the checkpoint pins).
 
+    A key the record DOES claim, that the live env does not set AT ALL, is also a disagreement —
+    `effective=None` in that Mismatch — not a silent pass: "this record's claim is unverifiable" is
+    not the same fact as "this record's claim is true", and collapsing them would let a record
+    describe a variable the live process never even touches without ever being told so.
+
     THE LIVE CASE (2026-08-12): scripts/_pgenv.sh says in its own header that it mirrors
     playground-coord.service, and carries COORD_CKPT_grab=grab-coordv2-seed20/ckpt_GOOD_0p78.pt
     while the service effectively loads grab-coord-wide-disp4-seed20/final_ckpt.pt. Every offline
     test run through _pgenv.sh was loading a different grab policy than the live service."""
-    return [Mismatch(k, effective[k], v, record)
-            for k, v in sorted(claimed.items())
-            if k.startswith(prefix) and k in effective and effective[k] != v]
+    out = []
+    for k, v in sorted(claimed.items()):
+        if not k.startswith(prefix):
+            continue
+        if k not in effective:
+            out.append(Mismatch(k, None, v, record))
+        elif effective[k] != v:
+            out.append(Mismatch(k, effective[k], v, record))
+    return out
+
+
+@dataclass(frozen=True)
+class CkptPinViolation:
+    """A `COORD_CKPT_<prim>` the live env pins that no app manifest agrees with.
+
+    `kind="mismatch"`: some manifest names a DIFFERENT file under the SAME `runs/<lineage>/`
+    directory as the one actually loaded — a stale ckpt selection within a lineage everyone agrees
+    is the right one.
+    `kind="unregistered"`: no manifest names this file, under this lineage or any other — nothing
+    in the store documents what is actually running."""
+
+    key: str
+    effective: str
+    kind: str
+    note: str = ""
+
+
+def check_ckpt_pins(effective: dict, manifest_ckpts, prefix: str = "COORD_CKPT_") -> list:
+    """Where a checkpoint the live env pins is not agreed to by any app manifest.
+
+    `manifest_ckpts` is `[(app_name, absolute_ckpt_path), ...]` — every app's resolved `ckpt:`
+    field. Gathering that list means walking the store's files, which is I/O this stdlib-only
+    module does not do; the caller (bridle.cli) collects it and hands it in, the same split as
+    `resolve_env`/`compare_records` above.
+
+    THE LIVE CASE (2026-08-12/13, `bridle lineage`'s own step-3 comment claimed this check existed
+    and it did not): the resolved service loads
+    `grab/runs/grab-coord-wide-disp4-seed20/final_ckpt.pt`. Production app `grab_coord_v2` still
+    names `grab/runs/grab-coordv2-seed20/ckpt_GOOD_0p78.pt` — an entirely DIFFERENT lineage
+    directory, not a same-lineage typo — so this is UNREGISTERED: the one manifest that claims to
+    document "the" grab checkpoint disagrees with what the service actually loads, and no manifest
+    at all documents the checkpoint that is actually running."""
+    out = []
+    for key, live in sorted(effective.items()):
+        if not key.startswith(prefix):
+            continue
+        live = os.path.normpath(live)
+        live_dir = os.path.basename(os.path.dirname(live))
+        if any(os.path.normpath(p) == live for _, p in manifest_ckpts):
+            continue  # some manifest names exactly this file — agreement
+        same_lineage = [(n, p) for n, p in manifest_ckpts
+                        if os.path.basename(os.path.dirname(os.path.normpath(p))) == live_dir]
+        if same_lineage:
+            for n, p in same_lineage:
+                out.append(CkptPinViolation(
+                    key, live, "mismatch",
+                    f"app {n!r} names {os.path.basename(p)} under the same runs/{live_dir}/"))
+        else:
+            out.append(CkptPinViolation(key, live, "unregistered", "no app manifest names it"))
+    return out

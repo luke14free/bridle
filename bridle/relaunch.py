@@ -81,6 +81,23 @@ def build_plan(manifest: dict, preflight_doc: dict, overrides: dict, exp: str,
     return RelaunchPlan(manifest["name"], exp, env, changes, asserts, t["launcher"])
 
 
+def run_dir_for(module: str, exp: str, cwd: str):
+    """`primitives/<PRIM>/runs/<exp>` — the directory every launcher (train_coord_prim.sh,
+    teacher_train.sh, ...) writes checkpoints into and resumes from by picking whichever ckpt
+    sorts highest by number.
+
+    Derived from the preflight MODULE path (`primitives.<PRIM>.<file>`), never from the app name:
+    apps are not named after the primitive they train (`place_coord_v3` trains `descend_to_target`),
+    and guessing the run directory from `--app` is the exact C1-class mistake this module exists to
+    not repeat. Returns None if `module` is not shaped like `primitives.<name>...` — the caller
+    should refuse rather than silently skip whatever check needed this directory.
+    """
+    parts = module.split(".")
+    if len(parts) < 2 or parts[0] != "primitives" or not parts[1]:
+        return None
+    return os.path.join(cwd, "primitives", parts[1], "runs", exp)
+
+
 def systemd_unit(name: str, cmd: str, env: dict, cwd: str) -> str:
     """Long jobs are systemd --user units, never bare nohup (CLAUDE.md): reboot-resumable, and
     `systemctl --user status` is the one place to look."""

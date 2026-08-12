@@ -9,6 +9,7 @@ import importlib
 import os
 
 from bridle.preflight import DYNAMIC, STATIC
+from bridle.preflight import evaluate as _evaluate
 
 
 def _resolve(path: str):
@@ -195,10 +196,23 @@ def dynamic_metrics(env_id: str, module: str, ckpt=None, envs: int = 64, steps: 
     return out
 
 
-def collect(asserts, env_id: str, module: str, ckpt=None, envs: int = 64, steps: int = 64) -> dict:
+def collect(asserts, env_id: str, module: str, ckpt=None, envs: int = 64, steps: int = 64,
+           from_scratch: bool = False, evaluate=_evaluate) -> dict:
     """Observed values for every assert. Static first: if static fails there is no point paying for
-    the simulator, and the caller stops on the first non-empty failure list."""
-    values = static_values([a.path for a in asserts if a.tier == STATIC])
+    the simulator, so a failing static tier short-circuits before `dynamic_metrics` ever builds one.
+
+    This module MEASURES; `bridle.preflight` DECIDES (module docstring). Judging "did static fail"
+    is a decision, so it is not reimplemented here — `evaluate` is injected (defaulting to the real
+    `bridle.preflight.evaluate`, already imported) and `collect` only calls it, the same seam
+    `bridle.cli.cmd_relaunch` uses for the final pass/fail call. A callback was the other option
+    considered; a plain function reference was simpler because `evaluate`'s signature already is
+    the callback this needs (`asserts, values, from_scratch=` -> failures), so there was nothing
+    left to wrap.
+    """
+    static_asserts = [a for a in asserts if a.tier == STATIC]
+    values = static_values([a.path for a in static_asserts])
     if any(a.tier == DYNAMIC for a in asserts):
+        if static_asserts and evaluate(static_asserts, values, from_scratch=from_scratch):
+            return values
         values.update(dynamic_metrics(env_id, module, ckpt, envs, steps))
     return values

@@ -12,8 +12,8 @@ Run: python -m pytest bridle/tests/test_lineage.py
 import sys
 
 from bridle.lineage import (
-    Change, EmptyDiff, UnknownOverride, apply_overrides, capture_env,
-    compare_records, format_diff, require_change, require_known, resolve_env,
+    Change, CkptPinViolation, EmptyDiff, UnknownOverride, apply_overrides, capture_env,
+    check_ckpt_pins, compare_records, format_diff, require_change, require_known, resolve_env,
 )
 
 FAILS = []
@@ -121,6 +121,54 @@ def run_checks():
     # the prefix scopes what a record is taken to be claiming
     check("prefix scopes the comparison",
           compare_records(eff, {"PRIM_COORD_OBS": "0"}, "x", prefix="COORD_CKPT_") == [])
+
+    # a record claiming a key the live env does NOT set at all is also a disagreement — its claim
+    # that the live process sets this key is itself false, not merely unverifiable
+    absent = compare_records(eff, {"COORD_CKPT_move_to_target": "/x/move-v1/ckpt.pt"}, "x",
+                             prefix="COORD_CKPT_")
+    check("a claim about a key the live env never sets is flagged", len(absent) == 1)
+    check("the absent-key mismatch reports effective=None", absent[0].effective is None)
+    check("the absent-key mismatch still reports what was claimed",
+          absent[0].claimed == "/x/move-v1/ckpt.pt")
+
+    # ── C2: the live env pinning a ckpt no manifest agrees with ──
+    effective_ckpts = {
+        "COORD_CKPT_grab": "/lego/primitives/grab/runs/grab-coord-wide-disp4-seed20/final_ckpt.pt",
+        "COORD_CKPT_reach": "/lego/primitives/reach/runs/reach-coord-seed20/ckpt_GOOD_0p97.pt",
+    }
+    manifests = [
+        ("grab_coord_v2", "/lego/primitives/grab/runs/grab-coordv2-seed20/ckpt_GOOD_0p78.pt"),
+        ("reach_coord", "/lego/primitives/reach/runs/reach-coord-seed20/ckpt_GOOD_0p97.pt"),
+    ]
+    viol = check_ckpt_pins(effective_ckpts, manifests)
+    check("an exact-match ckpt is silent — no violation for reach",
+          not any(v.key == "COORD_CKPT_reach" for v in viol))
+    check("THE LIVE DEFECT is caught: no manifest names the loaded grab ckpt",
+          any(v.key == "COORD_CKPT_grab" for v in viol))
+    grab_v = [v for v in viol if v.key == "COORD_CKPT_grab"][0]
+    check("grab_coord_v2 names an entirely DIFFERENT lineage dir, so this is UNREGISTERED, "
+          "not a same-lineage MISMATCH", grab_v.kind == "unregistered")
+    check("the violation is a CkptPinViolation carrying the live path",
+          grab_v.effective.endswith("final_ckpt.pt"))
+
+    # a manifest naming a DIFFERENT file under the SAME lineage dir the live env loads IS a mismatch
+    manifests_same_lineage = manifests + [
+        ("grab_stale_pin", "/lego/primitives/grab/runs/grab-coord-wide-disp4-seed20/ckpt_5.pt"),
+    ]
+    viol2 = check_ckpt_pins(effective_ckpts, manifests_same_lineage)
+    grab_v2 = [v for v in viol2 if v.key == "COORD_CKPT_grab"]
+    check("a same-lineage different-file manifest is a MISMATCH",
+          any(v.kind == "mismatch" for v in grab_v2))
+    check("the mismatch note names the conflicting app", any("grab_stale_pin" in v.note
+          for v in grab_v2 if v.kind == "mismatch"))
+
+    # exact agreement anywhere clears the violation, even alongside a same-lineage decoy
+    manifests_agree = manifests + [("grab_correct", effective_ckpts["COORD_CKPT_grab"])]
+    check("an exact match anywhere silences the check",
+          not any(v.key == "COORD_CKPT_grab" for v in check_ckpt_pins(effective_ckpts, manifests_agree)))
+    check("check_ckpt_pins only looks at the given prefix",
+          check_ckpt_pins({"UNRELATED_VAR": "/x"}, []) == [])
+    check("returns CkptPinViolation instances", isinstance(viol[0], CkptPinViolation))
 
     # ── the relaunch plan: the whole of today's mistake #2, prevented ──
     from bridle.relaunch import build_plan, systemd_unit
