@@ -27,6 +27,7 @@ from bridle.rig import Camera, Gripper, Rig
 from bridle.runner import Rollout, Runner, RunResult
 from bridle.store import BLOCKED, Plan, Store
 from bridle.trace import Trace
+from bridle.ui import Viewer
 
 __version__ = "0.1.0"
 
@@ -46,5 +47,7 @@ __all__ = [
     "ContractMismatch", "stamp", "verify",
     # bring your own LLM
     "Orchestrator", "Provider", "OpenAICompatProvider", "ScriptedProvider", "build_tools",
+    # the simulator window
+    "Viewer",
     "__version__",
 ]

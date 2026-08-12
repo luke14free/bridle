@@ -149,6 +149,29 @@ for it.
 - **Retraining costs hours-to-days of GPU per skill.** That has to be visible in the UX or the
   product feels broken.
 
+## The window
+
+A terminal agent cannot show you a robot. You can read that a skill returned `ok` and still not
+notice it dragged the cube 20 cm across the table on the way — the failure that cost days here, and
+was only ever caught by watching.
+
+```python
+from bridle import Rig, Store
+from bridle.ui import Viewer
+
+viewer = Viewer(Store("~/.bridle/apps"), Rig.so101()).start()   # http://127.0.0.1:8799
+viewer.push_frame(jpeg_bytes)
+```
+
+The window shows your rig, the live simulator, running jobs, and every skill annotated with whether
+it **runs / needs re-distil / needs a rebuild / can't run on this rig** — from the same `plan()` call
+that filters the agent's tool list, so the two cannot disagree.
+
+bridle deliberately does **not** ship a coding agent. [Pi](https://pi.dev) already is one, MIT and
+built to be extended; forking it would mean maintaining a coding agent forever as a tax on the
+robotics work. Pi owns the conversation, bridle owns the robot —
+see **[docs/pi-extension.md](docs/pi-extension.md)**.
+
 ## For agents and LLMs
 
 If you are an LLM writing code against bridle — or a coding agent working in this repo — read
