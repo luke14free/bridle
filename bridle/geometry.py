@@ -42,9 +42,14 @@ def resting_center_z(top_z, held_half) -> float:
 def release_center_z(release, top_z, held_half) -> float:
     """World z the held object's CENTRE should be at when the jaws open.
 
-    `resting + release.height_above_resting`. With the deployed 0.015 that is a 1.5cm drop, which is
-    harmless onto an 8cm platform and fatal onto a 2.4cm cube (measured: released at +1.44cm, the
-    cube bounced off and came to rest on the table 4.6cm away).
+    `resting + release.height_above_resting`. With the deployed 0.015 that is a 1.5cm drop.
+
+    ⚠ THE DROP ITSELF IS HARMLESS, including onto a 2.4cm cube. Swept 2026-08-12 (lego-arm
+    scripts/probe_stack_basin.py, 176 cells): a zero-velocity release stacks or tips on the static
+    tipping condition alone, and the basin is FLAT in gap from 0mm to 22mm — restitution is 0 and the
+    cube masses ~2.8g. The episode once cited here (released at +1.44cm, cube 4.6cm away on the
+    table) had a lateral error of 0.73cm, i.e. WELL INSIDE the basin: what moved that cube was the
+    release action, not the height. `is_supported` below is the function that matters for a stack.
     """
     return resting_center_z(top_z, held_half) + float(release.height_above_resting)
 

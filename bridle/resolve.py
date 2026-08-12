@@ -19,9 +19,17 @@ EVERY SEVERITY BELOW IS AN EMPIRICAL CLAIM, and the ones that matter were paid f
                               The policy is not wrong, the requirement moved -> ADAPT.
     release.height_above_resting
                               the descend reward is an ATTRACTOR at this height; moving it changes
-                              what the policy is optimising -> RETRAIN. Getting this wrong is
-                              precisely the 0/20 stack failure: a policy trained for platform tops,
-                              executed against cube tops, with nothing objecting.
+                              what the policy is optimising -> RETRAIN. The verdict stands; the
+                              justification once written here — "precisely the 0/20 stack failure" —
+                              does NOT, and was withdrawn 2026-08-12 after it was measured. A cube
+                              released with zero velocity onto a 2.4cm cube stacks or tips on the
+                              STATIC TIPPING condition alone (10-12mm of lateral error along a cube
+                              axis, 14-18mm along the diagonal), and that basin is FLAT in release
+                              gap from 0mm to 22mm — restitution is 0 and the cube masses ~2.8g, so
+                              there is no bounce to have (176-cell sweep, lego-arm
+                              scripts/probe_stack_basin.py). Release HEIGHT was not a cause of the
+                              0/20; lateral error was. Keep RETRAIN because the reward moves, not
+                              because of this number's effect on a stack.
     release.centering_tolerance
                               a DEPLOY-side gate, evaluated after the rollout. The policy never saw
                               it -> RUN. (Its training-side twin, success_tolerance, is RETRAIN.)
