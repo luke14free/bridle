@@ -197,7 +197,16 @@ class Store:
             return Plan(RUN, app.name, checkpoint=best_art.path, resolution=best,
                         reason="the trained contract matches this rig")
         if best.verdict == ADAPT:
-            stages = tuple(s for s in recipe_stages if s in ADAPT_STAGES) or ADAPT_STAGES
+            # Only stages the recipe ACTUALLY defines. The previous fallback returned ADAPT_STAGES
+            # regardless, so a recipe defining neither of them produced a plan naming stages that do
+            # not exist — which Foundry then rejects, turning a recoverable skill into an error the
+            # caller cannot act on. If there is nothing to re-run, the honest answer is a full
+            # rebuild, not an adaptation that cannot be executed.
+            stages = tuple(s for s in recipe_stages if s in ADAPT_STAGES)
+            if not stages:
+                return Plan(RETRAIN, app.name, stages=recipe_stages, resolution=best,
+                            reason="recoverable in principle, but the recipe defines none of the "
+                                   f"adaptation stages {ADAPT_STAGES} — rebuilding instead")
             return Plan(ADAPT, app.name, stages=stages, checkpoint=best_art.path, resolution=best,
                         reason="the policy is recoverable by re-running the perception stages")
         return Plan(RETRAIN, app.name, stages=recipe_stages, resolution=best,

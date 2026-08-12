@@ -1,266 +1,259 @@
 # bridle
 
-**A harness for robot skills — bring your own LLM, your own simulator, and your own robot.**
+**A harness for robot skills. Bring your own LLM, your own simulator, and your own robot.**
 
-Think of it as a coding agent for robotics. You describe your rig; bridle gives your LLM a library of
-robot skills that actually work *on that rig*, retraining them when they don't, and lets you compose
-new capabilities out of the ones you have.
+You describe your rig — arm, gripper, control mode, cameras, sensors. bridle gives your LLM a library
+of robot skills that are known to work *on that rig*. When a skill does not fit your setup, bridle
+says exactly which assumption broke, and can rebuild the skill from its recipe.
 
-> **Status: early.** The execution substrate below is built, tested, and running a real robot. The
-> rest of this page is the design it is being built toward. Sections are marked ✅ **built** or
-> 🚧 **designed** — nothing here is aspirationally described as finished.
+It is for people running manipulation policies who are tired of a skill that "runs" on their setup
+and quietly underperforms because it was trained for a different one.
 
 ---
 
-## The problem
+## The core idea: contracts
 
-Robot skills do not transfer. A grasp policy trained on someone else's arm, camera and control loop
-is not a grasp policy on yours — and worse, it usually *runs anyway* and silently underperforms.
+A trained policy assumes things. An embodiment and an action space. A rollout loop that stops at a
+particular moment. Physical tolerances it was graded against. Those assumptions are normally
+implicit, spread across a training script and a deploy path, with nothing comparing them.
 
-That is not a theoretical worry. Two measurements from the codebase bridle was extracted from:
+In bridle they are one object: a **`Contract`**. Every skill carries the contract it was trained
+under; your setup declares its own. Comparing the two mechanically answers *does this skill work on
+my robot?*
 
-- A policy trained to hold a grasp for **16** steps, deployed in a loop that let go after **6**:
-  success **0.40 vs 0.83** on identical seeds (p=0.00012).
-- A policy trained to release above a flat **platform**, deployed above a 2.4 cm **cube**: it released
-  1.4 cm too high and the cube bounced off. Stacking scored **0/20 for two days** while the search
-  looked for a bug in the policy. There wasn't one — it was executing a contract it had never been
-  trained under.
+A contract has a stable 12-character **fingerprint** — sha256 over its canonical form, so it survives
+across processes and machines. Checkpoints are stamped with it, and loading one under a different
+contract is a startup error with a field-level diff rather than a silent bad run.
 
-Neither was visible to any benchmark, because **benchmarks run inside the training contract**.
+Equality alone would be too blunt: a longer step budget cannot hurt a policy, a different action
+range certainly can. So differences are resolved **per field** into one of four answers:
 
-So the first thing a robotics harness needs is not an agent loop. It is a way to state what a skill
-assumes, and to notice — mechanically — when those assumptions do not hold on your machine.
-
-## The idea
-
-Every skill carries the **contract** it was trained under: the rig it assumed, the loop that executed
-it, the physical tolerances it was graded on. Your setup declares its own contract. Then:
-
-| | |
+| verdict | meaning |
 |---|---|
-| fingerprints **match** | run the pretrained weights |
-| fingerprints **differ** | the diff says *which* assumptions broke → fine-tune, re-distil, or retrain |
-| no weights for your rig | regenerate the skill from its **recipe** |
+| `run` | every difference is inert for the policy — load the weights |
+| `adapt` | the policy is recoverable — re-run the perception stages |
+| `retrain` | it was trained for a different problem — regenerate from the recipe |
+| `blocked` | your rig cannot run this skill at all (no camera, wrong gripper) |
 
-That last row is why an app in bridle is a **recipe first, weights second** — a reproducible training
-procedure (environment, teacher, reward, pipeline, evaluation), with pretrained checkpoints as a fast
-path guarded by the fingerprint. Given how contract-sensitive these policies measurably are, the
-honest promise is *reproducible skills*, not *portable weights*.
+The severity of each field lives in `bridle/resolve.py`: `execution.budget` is `run`, `rig.cameras`
+is `adapt` (a vision student memorises the view; the teacher is unaffected), `rig.control_mode` is
+`retrain`. A field with no entry resolves to `retrain` — an unrecognised difference is not evidence
+of safety.
 
-## What's built today ✅
-
-The execution substrate: the contract, the loop, and the arithmetic. Stdlib-only — no torch, no
-simulator, testable anywhere.
-
-```python
-from bridle import Contract, Runner, Trace
-from bridle.runner import Rollout
-
-contract = Contract.grab()               # the single definition of the numbers
-
-# TRAINING and DEPLOY both read the same object — neither keeps its own literal.
-hold = contract.execution.hold_steps     # not a copy of 16
-
-result = Runner(contract, Trace("grab")).run(Rollout(
-    policy=policy_fn, step=step_fn, grasped=grasp_fn, gripper_zero=zero_fn))
-```
-
-**`Contract`** — frozen, validated, fingerprinted:
-
-- `Actuation` — action shaping (`gripper_dim`, clamp)
-- `Execution` — **how the loop runs**: budget, a gripper rule, an ORDERED tuple of termination rules
-- `Grasp` — what a grasp *is*: the latch rule and the sensor
-- `Release` — placement geometry: release height, centring tolerance, destination-top rule, ramp
-
-Three gripper rules and five termination rules turned out to describe **every** rollout in a real
-robotics codebase:
-
-| gripper | | terminate | |
-|---|---|---|---|
-| `free` | policy owns the gripper | `sustained_grasp` | grasp survived N steps |
-| `zero_always` | carry: never re-open | `linger_after_latch` | N steps after the first latch |
-| `zero_after_latch` | grab | `on_goal` | TCP within tolerance of the commanded point |
-| | | `on_force` | finger force over threshold |
-| | | `sustained_settled` | centred at release height for N steps |
-
-Rule ORDER is part of the contract, and `terminate_pre_step` vs `terminate` says whether a rule is
-evaluated before the policy or after the step. Not gratuitous: two rungs of the same codebase
-implemented "linger N steps after latch" with an off-by-one between them, and modelling both timings
-is what let each convert as a *provable* no-op.
-
-**`Runner`** — the only place a step is taken. `Runner.run(Rollout(...))` executes the contract; the
-app supplies callbacks (`policy`, `step`, `grasped`, `at_goal`, `force`, `gripper_zero`, `on_latch`,
-`before_step`, `after_step`, `observe`). Adding a phase must never mean adding a loop.
-
-**Checkpoints carry their contract** — the mechanism the rest of the design is built on:
-
-```python
-from bridle.checkpoint import stamp, verify
-
-stamp(state_dict, contract)     # at training time
-verify(state_dict, contract)    # at load time -> ContractMismatch, with a field-level diff
-```
-
-```
-ContractMismatch: checkpoint was trained under stack@d05265e578c1 but is being run under stack@a91f...
-  Differing fields:
-    release.height_above_resting: checkpoint=0.015  runtime=0.002
-```
-
-A silent 0/20 found by trace three days later becomes a startup error naming the field.
-
-## Zero privilege ✅
-
-The only grasp signal bridle ships is **proprioceptive** — fingertip contact force and jaw position,
-both of which a real arm has. A simulator's `is_grasping` is object-aware, convenient, and *privileged
-state*; standardising it would bake a sim-only oracle into every contract written against this
-library.
-
-Two gates are required, because each fails alone and in opposite directions: an **open** jaw pressing
-the table reads 150–240 N, and a **closed empty** gripper looks exactly like a closed loaded one.
-
-The honest consequence: proprioception cannot say *which* object is held, so `latch_on="target"` is
-unimplementable and `validate()` rejects it. Thresholds are **fitted** from recorded traces
-(`bridle.calibrate`), never guessed.
-
-## The rest of it ✅🚧
-
-| | component | what it does | |
-|---|---|---|---|
-| **M1** | `Rig` + `resolve()` | your setup as data; per-field **run / adapt / retrain** with reasons | ✅ |
-| **M2** | App store as **recipes** | manifest + recipe + stamped artifacts; `plan(app, rig)` also answers **blocked** | ✅ |
-| **M3** | `Foundry` | executes a recipe on your rig, injecting the contract; stamps what comes out | ✅ |
-| **M4** | Orchestrator | BYO LLM; tools built from the store, filtered to what your rig can run | ✅ |
-| **M5** | Real bridge | sim → real → sim, calibration and deployment to hardware | 🚧 |
-
-Also planned: composing novel capabilities by mixing existing skills, and LLM-authored IK for
-motions no skill covers.
-
-**One backend, by choice.** ManiSkill only. A second engine would validate abstractions we do not
-yet need validated; the cost is that `EnvSpec` is ManiSkill-shaped today and the first port will pay
-for it.
-
-### Risks worth naming up front
-
-- **Transferability is the whole bet.** If a hold-step difference is worth 0.43 success, most skills
-  will hit the retrain path and "download an app" means "download a training job".
-- **Backend-agnostic environment specs are a research project.** Contact models and solvers differ;
-  a recipe that converges in one simulator may not in another. To be measured, not assumed.
-- **Retraining costs hours-to-days of GPU per skill.** That has to be visible in the UX or the
-  product feels broken.
-
-## The TUI
-
-```bash
-pip install -e . && bridle tui --model local:qwen3-32b
-```
-
-```
- bridle · so101-default · local:qwen3-32b ···························· acting
- ⋯ I'll pick the red cube first.        │ skills (16 ready / 27)
- → pick(obj='red cube')                 │ ● reach              ready
- ✓ picked the red cube (14.2 N)         │ ● descend_to_target  ready
- → place(dest='green cube')             │ ▲ grab_rgb_wrist     needs re-distil
-                                        │ ✕ pick_place         needs rebuild
-                                        │ · sphere_grab        rig can't run it
-                                        ├─────────────────────────────────────
-                                        │ jobs
-                                        │ descend_to_target  training  ep 413
- ─────────────────────────────────────────────────────────────────────────────
- › _        http://127.0.0.1:8799 · enter send · esc interrupt · ^N model · ^C quit
-```
-
-**Steering is the point.** A coding agent that goes wrong writes a bad file. A robot agent that goes
-wrong *moves a real arm*, and noticing three tool calls later means a scattered scene. So typing
-while the agent runs queues guidance it sees before choosing its next skill, and `esc` stops it
-**after the current skill returns** — never mid-skill, because a half-executed grasp leaves the
-gripper in a state no policy was trained from.
-
-The skills pane is the contract spine made visible: every skill, and whether it *runs* on your rig,
-needs *re-distilling*, needs a *rebuild*, or *can't run here at all*. The agent's tool list is
-filtered by the same call, so the model is never offered a skill your robot cannot do.
-
-Bring any model — `local:` / `vllm:` / `ollama:` / `openai:` / `openrouter:` / `anthropic:`, with
-`^N` to switch mid-session. `--executor module:function` wires it to your simulator; without one it
-runs in dry mode and says so, because silently doing nothing while looking like it worked is the
-failure this project exists to prevent.
-
-```bash
-bridle skills                 # what runs on this rig, and what doesn't
-bridle plan descend_to_target # why a skill needs adapting or rebuilding
-```
-
-## The window
-
-A terminal agent cannot show you a robot. You can read that a skill returned `ok` and still not
-notice it dragged the cube 20 cm across the table on the way — the failure that cost days here, and
-was only ever caught by watching.
-
-```python
-from bridle import Rig, Store
-from bridle.ui import Viewer
-
-viewer = Viewer(Store("~/.bridle/apps"), Rig.so101()).start()   # http://127.0.0.1:8799
-viewer.push_frame(jpeg_bytes)
-```
-
-The window shows your rig, the live simulator, running jobs, and every skill annotated with whether
-it **runs / needs re-distil / needs a rebuild / can't run on this rig** — from the same `plan()` call
-that filters the agent's tool list, so the two cannot disagree.
-
-The TUI and the window are complements, not alternatives: the terminal is where you *talk to* the
-agent, the browser is where you *watch* the robot. Video does not belong in a terminal.
-
-bridle has no third-party dependencies, including for its UI — `curses` and `http.server` ship with
-Python. Any external harness can still drive it by reading `/api/state`; see
-**[docs/pi-extension.md](docs/pi-extension.md)**.
-
-## For agents and LLMs
-
-If you are an LLM writing code against bridle — or a coding agent working in this repo — read
-**[AGENTS.md](AGENTS.md)**. It carries the invariants that are easy to get wrong (never copy a number
-out of a Contract; never add a second rollout loop; unknown fields mean retrain), the reasoning
-behind the severity table, and runnable patterns for each object.
+This is why a skill here is a **recipe first, weights second**. A recipe is a reproducible training
+procedure — environment, reward, stages, evaluation. Pretrained weights are a fast path guarded by
+the fingerprint. When the fingerprint does not match, there is still something to run.
 
 ## Install
 
 ```bash
-pip install -e .                 # core has no dependencies
-pip install -e '.[maniskill]'    # adds the torch-backed adapter
+pip install -e .                 # core: stdlib only, Python >= 3.11
+pip install -e '.[maniskill]'    # + torch, for the ManiSkill adapter
+pip install -e '.[dev]'          # + pytest
 ```
 
-## Testing
+Core — `Contract`, `Rig`, `Runner`, `Trace`, `Store`, `Foundry`, the LLM loop, the TUI, the viewer —
+has **no dependencies at all** and imports on a machine with no GPU and no simulator. PyYAML is
+optional: the store falls back to JSON without it.
+
+## Declare your setup
+
+A `Rig` is deliberately not a URDF. It carries only what can invalidate a policy: what the robot
+commands, what it grips with, what it observes.
+
+```python
+from bridle import Camera, Gripper, Rig
+
+rig = Rig(
+    name="bench-arm",
+    embodiment="so101",
+    dof=5,                                  # arm DOF, excluding the gripper
+    control_mode="pd_joint_delta_pos",
+    control_hz=20.0,
+    gripper=Gripper(kind="parallel_jaw", dim=5, stroke_m=0.035),
+    cameras=(Camera(name="base", width=128, height=128,
+                    pos=(-0.5, -0.15, 0.5), target=(0.25, 0.05, 0.08), fov_deg=30.0),),
+    sensors=("proprio", "rgb", "force"),
+)
+rig.validate()
+rig.fingerprint()          # '69fd2ade8be6'
+```
+
+`Rig.so101(cameras=("base", "wrist"))` is a ready-made one. A contract adds the task: how actions are
+shaped, how the rollout loop runs, what counts as a grasp, and where the gripper lets go.
+
+```python
+from bridle import Actuation, Contract, Execution, Grasp, GraspSignal
+
+contract = Contract(
+    name="grab",
+    rig=rig,
+    actuation=Actuation(gripper_dim=5, action_lo=-1.0, action_hi=1.0),
+    execution=Execution(budget=28, gripper="zero_after_latch",
+                        terminate=("sustained_grasp",), hold_steps=16),
+    grasp=Grasp(latch_on="any",
+                signal=GraspSignal(kind="proprio", force_threshold_n=1.5,
+                                   jaw_closed_below=-0.60)),
+)
+contract.validate()        # raises ValueError on an incoherent contract
+```
+
+`validate()` rejects contracts that cannot mean anything: a termination rule with no parameter, a
+negative release height, a success criterion the deploy gate would then refuse to act on. It also
+rejects `latch_on="target"` with a proprioceptive signal — force and jaw aperture say *something* is
+between the jaws, never *which* object. `Contract.grab()` and `Contract.stack()` are worked examples.
+
+## Run a rollout
+
+There is exactly one rollout loop. `Execution` describes it as data — a step budget, a gripper rule,
+and an ordered tuple of termination rules — so every skill runs through the same `Runner`.
+
+```python
+from bridle import Runner, Trace
+from bridle.runner import Rollout
+
+trace  = Trace("grab")
+result = Runner(contract, trace).run(Rollout(
+    policy=policy_fn,          # ()       -> action
+    step=step_fn,              # (action) -> advance the world one control step
+    grasped=grasp_fn,          # ()       -> bool
+    gripper_zero=zero_fn,      # (action) -> action with the gripper dim zeroed
+))
+
+result.succeeded, result.steps, result.reason   # reason names the rule that ended the rollout
+trace.to_jsonl("grab.jsonl")                    # per-step record
+```
+
+`Runner` takes plain callables, so it imports no simulator and no tensor library. Binding those
+callables to a live simulator is the adapter's job (`bridle.adapters.maniskill`).
+
+## Ask whether a skill fits
+
+A skill on disk is an `App`: a manifest the LLM reads, a `Recipe` that regenerates it, and stamped
+`Artifact`s. `Store.plan(app, rig)` is the product's verb.
+
+```python
+from bridle import Store
+
+store = Store("~/.bridle/apps")
+plan  = store.plan(store.get("descend_to_target"), rig)
+
+plan.action        # 'run' | 'adapt' | 'retrain' | 'blocked'
+print(plan.explain())
+# RETRAIN  descend_to_target
+#     stages: teacher, round_robin, distill, student
+#     RETRAIN — trained for a different problem.
+#         [retrain] release.height_above_resting: trained=0.015 target=0.002
+```
+
+## Rebuild what does not fit
+
+`Foundry` executes a recipe's stages against your rig. bridle does not own the taxonomy of training:
+a recipe *names* stages, and you register a runner per kind. The target contract reaches each stage
+as environment, so training reads the numbers instead of repeating them.
+
+```python
+from bridle import Foundry, ShellStageRunner
+
+foundry = Foundry({k: ShellStageRunner(k, cwd=".", dry_run=True)
+                   for k in ("teacher", "round_robin", "distill", "student")})
+job = foundry.build(app, rig, plan)
+print(job.explain())
+```
+
+A stage with no registered runner is an error before anything launches, not three GPU-hours in.
+`dry_run=True` prints the exact command and environment without executing. Whatever a build produces
+gets stamped — `stamp(state_dict, contract)` at save time, `verify(state_dict, contract)` at load
+time, which raises `ContractMismatch` with a field diff.
+
+## Give an LLM only the skills that work
+
+An LLM offered a tool will call it. So the tool list contains only skills that resolve to `run` on
+your rig; everything else comes back separately, with its verdict and the reason.
+
+```python
+from bridle import Orchestrator, build_tools, from_spec
+
+provider = from_spec("local:qwen3-32b")     # or "anthropic:...", "openai:...", "ollama:..."
+tools, unavailable = build_tools(store, rig)
+# unavailable -> [('sphere_grab', 'blocked',
+#                  "the rig does not meet this skill's hard requirements: "
+#                  "camera 'wrist' (rig has ['base'])")]
+
+def executor(app_name, arguments):
+    ...                                      # you drive your simulator here
+    return True, "picked the red cube"
+
+session = Orchestrator(provider, store, rig, executor).run("stack the red cube on the green one")
+```
+
+`Provider` is one method: `complete(messages, tools) -> {"text": ..., "tool_calls": [...]}`. An
+OpenAI-compatible HTTP client, an Anthropic Messages client and a scripted fake ship with it, all
+over `urllib`, no SDK.
+
+## The CLI
 
 ```bash
-python -m pytest bridle/tests
+bridle skills                              # what runs on this rig, and what doesn't
+bridle plan descend_to_target              # why a skill needs adapting or rebuilding
+bridle tui --model local:qwen3-32b         # agent TUI + simulator window
 ```
 
-Each test also runs standalone and exits non-zero on failure, so it works without pytest installed.
+`bridle tui` opens two things, because they answer different questions. The terminal is where you
+talk to the agent: typing while it runs queues guidance it sees before choosing its next skill, and
+ESC stops it cleanly *after* the current skill returns, never mid-grasp. The browser window
+(`bridle.ui.Viewer`, default `http://127.0.0.1:8799`) is where you watch — the skill list with live
+verdicts, running jobs, and simulator frames you push with `viewer.push_frame(jpeg_bytes)`. Without
+`--executor module:function` the TUI runs in **dry mode**: skill calls are reported, nothing moves.
 
-## What it has already caught
+## Status
 
-Real defects found by adopting it, in one codebase, in two days:
+Built and covered by tests, stdlib-only, no GPU required: `Rig` and `Contract` with validation and
+fingerprints; `resolve`; `checkpoint` stamp / verify / diff; `Runner`, `Rollout` and `Trace`;
+`App` / `Recipe` / `Artifact` / `Store` on disk with `plan()`; `Foundry` stage planning, dry runs and
+result stamping; the provider interface, `Orchestrator` and the steerable `AgentSession`; the TUI and
+the viewer; the placement geometry, the proprioceptive grasp signal and the routine that fits its
+thresholds from recorded traces; and a ManiSkill adapter binding a live session to `Runner`.
 
-- Training required a grasp to survive 16 steps; deploy exited after 6. **0.40 vs 0.83** (p=0.00012).
-- A descend policy hovered 1.5 cm above resting exactly as trained; deploy released it there onto a
-  2.4 cm cube. **Stacking 0/20** for two days.
-- Two grab rungs implementing the same "linger" rule with an off-by-one between them.
-- One release tolerance existing as *three* different numbers (0.045 training, 0.035 deploy, ~0.012
-  physics).
-- Training and deploy disagreeing on what "survived N steps" means — accumulating vs consecutive.
+Known limits:
 
-Every one was invisible to benchmarks, because benchmarks run inside the training contract.
+- **One simulator backend.** ManiSkill. `EnvSpec` is ManiSkill-shaped today, and the first port to
+  another backend will pay for it.
+- **You supply the execution.** bridle knows which skills are valid, not how to drive your
+  simulator: the adapter takes a duck-typed session, and the CLI needs an `--executor`.
+- **No skills ship with the library.** The store starts empty; you author or import apps. The CLI
+  subcommands construct an SO-101 rig, with only the camera list configurable — other rigs work
+  through the Python API.
+- **`ShellStageRunner` needs a launcher callable** for real runs; without one it refuses rather than
+  block on a multi-hour job.
+- **Unstamped checkpoints warn rather than fail** (`verify(..., on_missing="warn")`), for migration.
+  Flip to `"error"` once everything you load is stamped.
+- **`Runner` is a scalar loop.** Training environments are usually vectorised, so "held N steps" can
+  be a weaker claim in training than at deploy.
+- **`resolve` compares contracts, not behaviour.** A `run` verdict says nothing contradicts; it does
+  not promise the skill is good. That is what the eval is for.
+- **Parallel-jaw grippers only** in v0.1; suction and multi-finger are not modelled.
 
-## A note on the tests you don't see here
+Planned, not built: composing new capabilities out of existing skills (an LLM chains them at run
+time today, but nothing composes and stores the result), and a real-hardware backend to carry a skill
+from sim to a physical arm. The proprioception-only grasp signal exists for that second goal.
 
-bridle was extracted from a working robot codebase, and the tests that prove it *there* —
-step-for-step parity against the loops it replaced, a guard that fails if a rollout loop reappears
-outside `Runner`, and a pin on a train/deploy semantic divergence — depend on that codebase's
-simulator and live service. They are that project's **adoption** suite, not the library's, so they
-stay with it.
+## Tests
 
-What ships here is what runs anywhere: the contract, the loop, and the arithmetic.
+Twelve test modules, no simulator, no GPU, a few seconds. Both entry points work:
 
----
+```bash
+python -m pytest bridle/tests                       # everything
+PYTHONPATH=. python3 bridle/tests/test_resolve.py   # any module standalone, non-zero on failure
+```
 
-Licensed under Apache-2.0.
+Around 220 named checks cover contract validation and fingerprinting, every severity verdict, the
+rollout loop's rule ordering, checkpoint mismatch diffs, store round-trips, foundry planning, the
+agent's interrupt guarantee, and both interfaces' rendering.
+
+`AGENTS.md` is the working guide for the library's invariants — never copy a number out of a
+contract, never add a second rollout loop, stamp everything, classify every new field's severity.
+
+## Licence
+
+Apache 2.0. See [LICENSE](LICENSE).

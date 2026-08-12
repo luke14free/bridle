@@ -77,6 +77,15 @@ def run_checks():
     check("ADAPT re-runs only the perception stages", p.stages == ("distill", "student"))
     check("ADAPT still offers the checkpoint to start from", p.checkpoint is not None)
 
+    # ── an ADAPT plan must never name stages the recipe does not define ───────────────────────
+    # Otherwise the Foundry rejects the plan and a recoverable skill becomes an unactionable error.
+    teacher_only = dataclasses.replace(app, recipe=dataclasses.replace(
+        app.recipe, stages=(Stage("teacher", {"algo": "ppo"}),)))
+    p = store.plan(teacher_only, moved)
+    check("an adaptable skill whose recipe has no adapt stages falls back to RETRAIN",
+          p.action == RETRAIN and p.stages == ("teacher",))
+    check("...and says why", "defines none of the adaptation stages" in p.reason)
+
     # ── BLOCKED: the rig physically cannot ────────────────────────────────────────────────────
     # Distinct from RETRAIN on purpose: "you need GPU hours" and "your robot has no camera" are
     # different sentences, and collapsing them sends someone to train vision on a blind rig.
