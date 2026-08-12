@@ -54,10 +54,12 @@ Run: python -m pytest bridle/tests/test_skillcompile.py
 The descend fixture is imported from test_skillspec rather than re-derived: it is the deployed
 document, every weight is a trained number, and two copies would drift.
 """
+import copy
 import json
 import math
 import operator
 import os
+import pickle
 import re
 import subprocess
 import sys
@@ -329,6 +331,16 @@ def error_from(fn, *a, **kw):
     return None
 
 
+def result_of(fn, *a):
+    """The value, or whatever it raised — one broken helper is one failed check, not an aborted run
+    (same reason as `folded`). Module scope because two blocks need it: the boolean-batch helpers
+    below, and the `Note` copy/pickle round trip, whose pre-fix behaviour is a `TypeError`."""
+    try:
+        return fn(*a)
+    except BaseException as exc:      # noqa: BLE001 — see docstring
+        return exc
+
+
 def refuses(label, doc, *fragments, kind=CompileError, **kw):
     """A COMPILE-TIER refusal: the value is legal in the vocabulary and this fold does not implement
     it. `kind` stays pinned to a single exception type on purpose — widening it to "SpecError or
@@ -412,6 +424,54 @@ def probe(seed):
     `hash()`-based digest and a sha256 one look different."""
     env = dict(os.environ, PYTHONHASHSEED=str(seed), PYTHONPATH=str(REPO))
     out = subprocess.run([sys.executable, "-W", "ignore", "-c", _PROBE],
+                         capture_output=True, text=True, env=env, cwd=str(REPO))
+    if out.returncode != 0:
+        return None, out.stderr.strip().splitlines()[-1:] or ["<no stderr>"]
+    return json.loads(out.stdout), None
+
+
+# ── the GROWN-VOCABULARY probe: is the compiler's 16/16-grasp rule DERIVED, or hand-listed? ──────
+# THE CHECK THE ROUND-3 REVIEW FOUND MISSING, and the reason it needs a subprocess. `compile.py`
+# derives `_CONTACT_SURFACE_MEASURES` and `_PEAKED_KERNELS` from the vocabulary AT IMPORT. The
+# reviewer replaced both with literal frozensets, left both helpers defined, and all nine
+# derivation-related predicates in this file stayed green: each of them applies the HELPER to a
+# vocabulary the fixture controls and compares that against itself, so none of them looks at what
+# the compiler uses. A same-process `_CONTACT_SURFACE_MEASURES == _derive_contact_surfaces(MEASURES)`
+# does not close it either — a copy-pasted literal is value-EQUAL today, and that mutation passes
+# such an assert (measured 2026-08-13). The property is "a measure/kernel the vocabulary gains
+# tomorrow is IN the check by default", which only a run against a DIFFERENT vocabulary can see; and
+# the vocabulary has to be grown BEFORE `compile` is imported, i.e. in another interpreter.
+#: The synthetic entries every derivation check grows the vocabulary with. Names the vocabulary can
+#: never legitimately gain, on purpose: an earlier draft used `seat_clearance`/`seat_span`/`cauchy`,
+#: and adding a real fourth kernel named `cauchy` (a Cauchy kernel is a normal thing to want) turned
+#: three checks red for the wrong reason — the same defect as a hardcoded `len(kernels) == 3`.
+NEW_SIGNED = "signed_measure_added_tomorrow"
+NEW_MAGNITUDE = "magnitude_measure_added_tomorrow"
+NEW_KERNEL = "kernel_added_tomorrow"
+
+_GROWN_PROBE = (
+    "import json;"
+    "from bridle.skill import vocab;"
+    "from bridle.skill.vocab import Frame, Measure, Sign;"
+    f"vocab.MEASURES.__setitem__({NEW_SIGNED!r},"
+    f" Measure({NEW_SIGNED!r}, Sign.SIGNED, Frame.LIVE, 'm', 'a signed measure added tomorrow'));"
+    f"vocab.MEASURES.__setitem__({NEW_MAGNITUDE!r},"
+    f" Measure({NEW_MAGNITUDE!r}, Sign.MAGNITUDE, Frame.LIVE, 'm', 'an unsigned one'));"
+    "k = next(p for p in vocab.TERMS['DistancePull'].params if p.name == 'kernel');"
+    # `Param` is a frozen dataclass, so growing its `choices` needs the base setter. Growing the
+    # vocabulary's OWN object is the point: patching a copy would be the same self-comparison the
+    # in-file checks already make.
+    f"object.__setattr__(k, 'choices', tuple(k.choices) + ({NEW_KERNEL!r},));"
+    "import bridle.skill.compile as c;"
+    "print(json.dumps([sorted(c._CONTACT_SURFACE_MEASURES), sorted(c._PEAKED_KERNELS)]))"
+)
+
+
+def grown_probe():
+    """`(contact_surface_measures, peaked_kernels)` as `compile.py` derives them in a fresh
+    interpreter whose vocabulary gained one SIGNED measure, one MAGNITUDE measure and one kernel."""
+    env = dict(os.environ, PYTHONPATH=str(REPO))
+    out = subprocess.run([sys.executable, "-W", "ignore", "-c", _GROWN_PROBE],
                          capture_output=True, text=True, env=env, cwd=str(REPO))
     if out.returncode != 0:
         return None, out.stderr.strip().splitlines()[-1:] or ["<no stderr>"]
@@ -638,18 +698,47 @@ def run_checks():
     with warnings.catch_warnings(record=True) as emitted:
         warnings.simplefilter("always")
         lplan = compile_spec(parse_spec(potential_doc()), horizon=HORIZON)
+    # `getattr(n, "level", None)`, not `n.level`: a note that regressed to a plain `str` raises
+    # `AttributeError` here, and this file's own `folded`/`result_of` convention is that ONE broken
+    # thing is ONE FAILED CHECK, not an aborted run with a traceback and every check after it
+    # unreported. Round-3 review; `None` is in neither level so the check still goes red.
     check("every note on the plan carries a level",
-          bool(lplan.warnings) and all(n.level in (Note.ACT, Note.FYI) for n in lplan.warnings))
+          bool(lplan.warnings)
+          and all(getattr(n, "level", None) in (Note.ACT, Note.FYI) for n in lplan.warnings))
     check("...and is still a plain string, so every existing consumer is untouched",
           all(isinstance(n, str) for n in lplan.warnings)
           and clean.warnings[0] == str(clean.warnings[0])
           and "320.0" in "\n".join(clean.warnings))
+    # Same `getattr` guard as above, and for the same reason: these three read `.level` too, so a
+    # plain-`str` regression used to take the whole run down at the first of them.
+    def level_of(n):
+        return getattr(n, "level", None)
+
     check("the notes emitted through the `warnings` module are EXACTLY the ACT ones",
           [str(w.message) for w in emitted]
-          == [str(n) for n in lplan.warnings if n.level == Note.ACT])
+          == [str(n) for n in lplan.warnings if level_of(n) == Note.ACT])
     check("an INCOMPLETE note is ACT; a clean integrated ratio is FYI",
-          any(n.level == Note.ACT and "INCOMPLETE" in n for n in lplan.warnings)
-          and [n.level for n in clean.warnings] == [Note.FYI])
+          any(level_of(n) == Note.ACT and "INCOMPLETE" in n for n in lplan.warnings)
+          and [level_of(n) for n in clean.warnings] == [Note.FYI])
+
+    # A `Note` IS A STRING IN EVERY WAY THE DOCSTRING CLAIMS — including the three that were broken.
+    # `str.__getnewargs__` returns the 1-tuple `(text,)`, which `copy`, `deepcopy` and `pickle` all
+    # splat into `Note.__new__(cls, text)`: `TypeError: Note.__new__() missing 1 required positional
+    # argument: 'text'`, for all three. Latent (nothing in `bridle/` copies or pickles a note) until
+    # a `RewardPlan` crosses a process boundary, which is what a training launcher or a cached
+    # compile does. `.level` must survive the round trip, or the copy is the pre-Note bare string
+    # again — the exact loss the class exists to prevent.
+    note = Note(Note.ACT, "flooding check INCOMPLETE: this is not a pass")
+    # `result_of`, not a bare call: the pre-fix behaviour RAISES, and one broken round trip is one
+    # failed check, not an aborted run (the `folded`/`result_of` convention this file states).
+    unpickle = lambda n: pickle.loads(pickle.dumps(n))      # noqa: E731
+    round_trips = [result_of(copy.copy, note), result_of(copy.deepcopy, note),
+                   result_of(unpickle, note)]
+    check("a Note survives copy, deepcopy and pickle, carrying its level",
+          all(isinstance(r, Note) and str(r) == str(note) and getattr(r, "level", None) == Note.ACT
+              for r in round_trips))
+    check("...and the FYI level round-trips too, so the level is carried and not defaulted",
+          getattr(result_of(unpickle, Note(Note.FYI, "x")), "level", None) == Note.FYI)
 
     none_text = warning_text(plan_of(descend_doc()))
     check("with no horizon the integrated check says it could NOT be computed",
@@ -730,6 +819,39 @@ def run_checks():
     fp = plan.fingerprint()
     check("fingerprint is 12 lowercase hex chars", bool(re.fullmatch(r"[0-9a-f]{12}", fp)))
     check("fingerprint is stable in-process", plan_of(descend_doc()).fingerprint() == fp)
+
+    # ── THE TWO ABSOLUTE PINS. Everything else about the digest and the fold in this file is
+    # RELATIVE — reorder != original, batch == scalar, weight-changed != unchanged — and not one of
+    # those can see a UNIFORM shift. A change that moved every computed value by the same factor, or
+    # that changed what goes into the canonical JSON for every plan alike, would leave the whole
+    # suite green while meaning that a reward trained under this compiler no longer reproduces:
+    # the checkpoint's stamp would not match a recompile of its own document, and the numerical
+    # parity sweep against `descend_env.py`'s `compute_dense_reward` would be comparing against a
+    # different function than the one it was written for. So two numbers are pinned outright.
+    #
+    # IF EITHER OF THESE CHANGES, that is the finding — do not re-pin to make the suite green. Find
+    # what moved, and state whether the rewards already trained under this compiler still hold.
+    #
+    #   28f4a705d261  the deployed descend document's plan fingerprint (`skills/descend.yaml` as
+    #                 `test_skillspec.descend_doc()` builds it). sha256 over the plan's canonical
+    #                 JSON, truncated to 12 hex. It is the same digest a stamped checkpoint carries.
+    #   4.79826020570353  the UNSCALED fold of that plan over `values()` — one non-success step of
+    #                 descend: grasped, 3mm below the 0.015 hover setpoint, 2cm off centre, jaw at
+    #                 -0.70, nothing crushed, ||a|| = 2.0. Unscaled because parity is against
+    #                 `compute_dense_reward`, not the /12.0 normalized path (phase2-decisions §4).
+    #                 Nine rows fold into it, so the digits are load-bearing: a term dropped, a
+    #                 kernel changed, or a weight rebound moves them.
+    check("the descend plan's ABSOLUTE fingerprint is unchanged (a reward trained under this "
+          f"compiler is no longer reproducible if this moves) — got {fp}", fp == "28f4a705d261")
+    check("the descend plan's ABSOLUTE unscaled fold over one non-success step is unchanged — got "
+          f"{off!r}", close(off, 4.79826020570353))
+    # ...and the two pins are not each other's alias: the fold is pinned to 1e-12, so a change too
+    # small to move the digest's input still moves the number, and a `why`-only edit moves neither.
+    check("...and a weight edit moves BOTH, so neither pin is a constant this file could satisfy "
+          "by accident",
+          plan_of(row_edited(1, weight=1.6), horizon=HORIZON).fingerprint() != "28f4a705d261"
+          and not close(folded(plan_of(row_edited(1, weight=1.6), horizon=HORIZON), v_off),
+                        4.79826020570353))
 
     a, err_a = probe(0)
     b, err_b = probe(12345)
@@ -824,10 +946,19 @@ def run_checks():
     # way kernel/mode/side/norm's did, and the suite would not have noticed.
     refuses("a VelocityPenalty body the fold does not implement", row_edited(5, body="tcp"),
             "reward[5].body", "tcp", "held", horizon=HORIZON)
-    check("...and those three really are open in the vocabulary, which is why the compiler owns them",
+    # ALL FOUR `_HONOURED` KEYS, not three. `("PredicateBonus", "scope")` is the fourth
+    # (`compile.py`'s `_HONOURED`); its table VALUE is pinned further down (the `_SCOPE_REACH`
+    # block), but its openness was not, so that entry could go dead exactly the way
+    # kernel/mode/side/norm's did — `choices` arriving on it would move the refusal a tier without
+    # anything here noticing.
+    check("...and all four really are open in the vocabulary, which is why the compiler owns them",
           not param_of("SuccessBonus", "scope").choices
+          and not param_of("PredicateBonus", "scope").choices
           and not param_of("DistancePull", "axes").choices
           and not param_of("VelocityPenalty", "body").choices)
+    check("...and the openness check covers every key the table has, so a fifth cannot go unpinned",
+          set(_HONOURED) == {("VelocityPenalty", "body"), ("SuccessBonus", "scope"),
+                             ("PredicateBonus", "scope")})
 
     # THE `_UNIMPLEMENTED` TABLE, ALL FOUR ENTRIES. Only `DistancePull.axes` above was exercised;
     # the other three were a table nothing read. `gamma` is the one whose own comment says the two
@@ -902,6 +1033,23 @@ def run_checks():
     refuses("...and over height_above_resting, which the hardcoded set only happened to include",
             row_edited(2, measure="height_above_resting", setpoint=0.0), "16/16", horizon=HORIZON)
 
+    # THE REFUSAL IS RIGHT FOR A NEGATIVE WEIGHT AND THE PROSE WAS NOT. The rule ignores the weight's
+    # sign on purpose (one uniform rule is the one `vocab_document()` can state), but the message
+    # told that author their row "is maximised at the setpoint" — false, as `_max_distance_pull`
+    # says in the same file: a negative weight inverts the kernel into a repeller. The error messages
+    # ARE the API for a model that cannot read the source, so a refusal that misdescribes the row is
+    # a refusal the author cannot act on.
+    refuses("a NEGATIVE-weight pull centred on the seat surface is still refused",
+            row_edited(2, weight=-2.5, setpoint=0.0), "16/16", "setpoint", horizon=HORIZON)
+    neg = str(error_from(plan_of, row_edited(2, weight=-2.5, setpoint=0.0), horizon=HORIZON))
+    pos = str(error_from(plan_of, row_edited(2, weight=2.5, setpoint=0.0), horizon=HORIZON))
+    check("...and the message says MINIMISED, names the weight, and calls it a repeller",
+          "MINIMISED at the setpoint" in neg and "-2.5" in neg and "repeller" in neg)
+    check("...and does NOT tell that author the row is maximised there",
+          "maximised at the setpoint" not in neg)
+    check("...while a positive weight still reads `maximised at the setpoint`",
+          "maximised at the setpoint" in pos and "MINIMISED" not in pos)
+
     # THE SET IS DERIVED FROM THE VOCABULARY, and the vocabulary's prose has to describe the same
     # rule: `vocab_document()` is where this refusal is ADVERTISED to the authoring model. Code,
     # comment and document used to state three different rules — the code checked 3 of the 5 SIGNED
@@ -914,14 +1062,14 @@ def run_checks():
     # THE PARTITION ABOVE IS SATISFIED BY ANY PARTITION, including the hand-list that was replaced —
     # it cannot see the headline property, which is that a SIGNED measure added tomorrow is IN the
     # check by DEFAULT. That needs the derivation run over a vocabulary the fixture controls.
-    grown = dict(MEASURES, seat_clearance=Measure(
-        "seat_clearance", Sign.SIGNED, Frame.LIVE, "m", "a signed measure the vocabulary gains"))
+    grown = dict(MEASURES, **{NEW_SIGNED: Measure(
+        NEW_SIGNED, Sign.SIGNED, Frame.LIVE, "m", "a signed measure the vocabulary gains")})
     derived = _derive_contact_surfaces(grown)
     check("a SIGNED measure the vocabulary gains tomorrow lands in the check with no edit here",
-          "seat_clearance" in derived and derived - {"seat_clearance"} == _CONTACT_SURFACE_MEASURES)
+          NEW_SIGNED in derived and derived - {NEW_SIGNED} == _CONTACT_SURFACE_MEASURES)
     check("...while a MAGNITUDE one does not — the derivation reads `sign`, not the name",
-          "seat_span" not in _derive_contact_surfaces(dict(MEASURES, seat_span=Measure(
-              "seat_span", Sign.MAGNITUDE, Frame.LIVE, "m", "an unsigned measure"))))
+          NEW_MAGNITUDE not in _derive_contact_surfaces(dict(MEASURES, **{NEW_MAGNITUDE: Measure(
+              NEW_MAGNITUDE, Sign.MAGNITUDE, Frame.LIVE, "m", "an unsigned measure")})))
     check("...and an EXCLUDED name is still excluded after the vocabulary grows",
           set(_ZERO_IS_NOT_A_CONTACT_SURFACE) & derived == set())
     check("no MAGNITUDE measure is in the set — move_to_3d peaks at object_to_goal_z == 0 on purpose",
@@ -934,6 +1082,22 @@ def run_checks():
     check("the document advertises the rule over exactly the measures the compiler applies it to",
           {n for n in signed if n in bullet} == set(_ZERO_IS_NOT_A_CONTACT_SURFACE))
 
+    # ── ...AND THE SET THE COMPILER USES IS THAT DERIVATION, not a hand-list that happens to match.
+    # Everything above this line is satisfied by a literal frozenset (see `_GROWN_PROBE`, which
+    # documents the mutation and why the obvious same-process assert does not catch it). These are
+    # the checks that go red for it, on BOTH axes at once.
+    grown_sets, gerr = grown_probe()
+    check(f"the grown-vocabulary subprocess ran (stderr: {gerr})", grown_sets is not None)
+    gmeasures, gkernels = grown_sets if grown_sets else ([], [])
+    check("a SIGNED measure the vocabulary gains is in the set THE COMPILER USES, not merely in "
+          "the helper's output",
+          NEW_SIGNED in gmeasures
+          and set(gmeasures) - {NEW_SIGNED} == set(_CONTACT_SURFACE_MEASURES))
+    check("...and a MAGNITUDE one is not, so the probe's vocabulary really did grow both ways",
+          bool(gmeasures) and NEW_MAGNITUDE not in gmeasures)
+    check("a kernel the vocabulary gains is in the set THE COMPILER USES",
+          NEW_KERNEL in gkernels and set(gkernels) - {NEW_KERNEL} == set(_PEAKED_KERNELS))
+
     # ── THE SAME RULE ON THE KERNEL AXIS ────────────────────────────────────────────────────────
     # Round 1 closed the measure axis and left this one open: `_PEAKED_KERNELS` named two of the
     # three kernels and omitted `neg_linear`, which is `-|measure - setpoint|` — maximised AT the
@@ -942,8 +1106,15 @@ def run_checks():
     # (`setpoint` defaults to 0.0) compiled clean while pulling a grasped object onto the seat: the
     # 16/16-grasp failure of 2026-06-04, reached through the kernel the refusal did not cover.
     kernels = param_of("DistancePull", "kernel").choices
-    check("the vocabulary offers three kernels and every one of them is checked",
-          set(kernels) == set(_PEAKED_KERNELS) and len(kernels) == 3)
+    # NOT `len(kernels) == 3`: a legitimately added fourth kernel would turn that red for the wrong
+    # reason, and the doc-bullet check at the end of this block already forces the document to be
+    # updated when the set changes. What must hold is that the three kernels the bullet DESCRIBES
+    # are still offered (so the prose is not describing a vocabulary that moved on) and that every
+    # kernel offered is checked.
+    check("every kernel the vocabulary offers is checked, and the three the document describes are "
+          "still among them",
+          set(kernels) == set(_PEAKED_KERNELS)
+          and {"one_minus_tanh", "gaussian", "neg_linear"} <= set(kernels))
     for kernel in kernels:
         # ONE refusal per kernel, so dropping any single one from `_PEAKED_KERNELS` turns this red —
         # which the previous "is it in the set" style of check could not do.
@@ -956,13 +1127,28 @@ def run_checks():
     check("...and over a measure whose zero is not a surface, at any kernel",
           all(error_from(plan_of, row_edited(2, kernel=k, measure="gripper_qpos", setpoint=0.0),
                          horizon=HORIZON) is None for k in kernels))
+    # THE "WITH A STATED REASON" HALF WAS VACUOUS ON THIS AXIS. `_KERNEL_PEAK_IS_NOT_AT_SETPOINT` is
+    # empty — that emptiness IS the finding on the kernel axis — so `all({}.values())` and
+    # `set({}) <= set(kernels)` are trivially true and exercised nothing at all. Lifting the two
+    # halves into a predicate and testing the PREDICATE on a populated dict is what makes the label
+    # true today, rather than true only on the day someone excludes a kernel.
+    def excluded_with_a_stated_reason(excluded, legal):
+        """Every exclusion names something the vocabulary actually offers, and gives a reason."""
+        return set(excluded) <= set(legal) and all(excluded.values())
+
     check("every legal kernel is either checked or excluded with a stated reason",
           set(kernels) == set(_PEAKED_KERNELS) | set(_KERNEL_PEAK_IS_NOT_AT_SETPOINT)
-          and set(_KERNEL_PEAK_IS_NOT_AT_SETPOINT) <= set(kernels)
-          and all(_KERNEL_PEAK_IS_NOT_AT_SETPOINT.values()))
-    kgrown = _derive_peaked_kernels(set(kernels) | {"cauchy"})
+          and excluded_with_a_stated_reason(_KERNEL_PEAK_IS_NOT_AT_SETPOINT, kernels))
+    check("...and that rule is not vacuous: it refuses a blank reason and an exclusion naming a "
+          "kernel the vocabulary does not offer",
+          excluded_with_a_stated_reason({"neg_linear": "a stated reason"}, kernels)
+          and not excluded_with_a_stated_reason({"neg_linear": ""}, kernels)
+          and not excluded_with_a_stated_reason({NEW_KERNEL: "a stated reason"}, kernels))
+    check("...and the same rule holds on the MEASURE axis, where the dict is non-empty",
+          excluded_with_a_stated_reason(_ZERO_IS_NOT_A_CONTACT_SURFACE, MEASURES))
+    kgrown = _derive_peaked_kernels(set(kernels) | {NEW_KERNEL})
     check("a kernel the vocabulary gains tomorrow lands in the check with no edit here",
-          "cauchy" in kgrown and kgrown - {"cauchy"} == set(_PEAKED_KERNELS))
+          NEW_KERNEL in kgrown and kgrown - {NEW_KERNEL} == set(_PEAKED_KERNELS))
     check("the document advertises the rule over exactly the kernels the compiler applies it to",
           {k for k in kernels if k in bullet} == set(_PEAKED_KERNELS))
 
@@ -1012,14 +1198,8 @@ def run_checks():
           isinstance(BoolVec([1.0, 2.0, 3.0]) > 2.0, BoolMask)
           and isinstance(BoolVec([1.0, 2.0, 3.0]) < 2.0, BoolMask))
 
-    def result_of(fn, *a):
-        """The value, or whatever it raised — one broken helper is one failed check, not an aborted
-        run (same reason as `folded`)."""
-        try:
-            return fn(*a)
-        except BaseException as exc:      # noqa: BLE001 — see docstring
-            return exc
-
+    # `result_of` (module scope, beside `error_from`) is what keeps a raising helper a reported
+    # check rather than an aborted run.
     for label, fn, args, want in (
             ("_relu", _relu, (BoolVec([-1.0, 0.0, 2.0]),), [0.0, 0.0, 2.0]),
             ("_max", _max, (BoolVec([-1.0, 0.0, 2.0]), 0.5), [0.5, 0.5, 2.0]),
@@ -1044,6 +1224,34 @@ def run_checks():
     check("a normalized Ramp (_clamp) runs over one too",
           close_all(folded(rplan, rbatch),
                     [folded(rplan, values(object_z=z)) for z in (-0.01, 0.02, 0.09)]))
+
+    # ── ...and a boolean batch arriving as a VALUE, not only as a comparison's output ────────────
+    # `bool_batch` above makes `success` a BoolVec — a NUMBER — so `SuccessBonus{mode: replace}`'s
+    # `_where(success, level, reached)` only ever saw a condition that some comparison had already
+    # produced. The real adapter reads `info["success"]`, which is a torch BOOL tensor, and hands it
+    # straight to `_where`: the condition arrives as a bool and nothing in the fold has compared
+    # anything yet. That path lived only in the deleted torch script, so nothing in the suite
+    # covered it — `_numeric`'s `c * 1` is exactly what has to fire here, and a `_where` written as
+    # `c * a + (1 - c) * b` WITHOUT it raises on this input the way torch does.
+    sbatch = {k: BoolVec([v] * 3) for k, v in values().items()}
+    sbatch["success"] = BoolMask([False, True, False])
+    check("the replace row folds a boolean `success` handed in as a VALUE, not as a comparison",
+          close_all(folded(plan, sbatch),
+                    [folded(plan, values(success=s)) for s in (0.0, 1.0, 0.0)]))
+    check("...and the success environment really is the 12.0 branch, so the mask was READ",
+          close_all(folded(plan, sbatch),
+                    [descend_reward_by_hand(values(), success=False),
+                     12.0 - 0.001 * ACTION_NORM,
+                     descend_reward_by_hand(values(), success=False)]))
+    # A `floor` row takes the same condition through `_where(c, _max(reached, level), acc)`, so the
+    # PredicateBonus predicate is the second place a raw bool can arrive as a value.
+    pbatch = {k: BoolVec([v] * 3) for k, v in values().items()}
+    pbatch["grasped"] = BoolMask([True, False, True])
+    pbatch["not_grasped"] = BoolMask([False, True, False])
+    check("...and so does a `floor` row whose PREDICATE arrives as a boolean batch",
+          close_all(folded(fplan, pbatch),
+                    [folded(fplan, values(grasped=g, not_grasped=1.0 - g))
+                     for g in (1.0, 0.0, 1.0)]))
 
     # ── the evaluator's own contract ────────────────────────────────────────────────────────────
     missing = values()

@@ -248,8 +248,22 @@ PREDICATES = dict([
        "stack-intact checks."),
 
     _p("height_above_resting_in", [Param("band", "float", None, "upper bound, meters", True)],
-       "height_above_resting in [0, band]. descend uses this INSTEAD OF an at-rest gate for "
-       "success — a held cube being positioned is never stationary, at-rest never latches."),
+       "height_above_resting in [0, band] — a BAND, bounded below at 0 as well as above, so a "
+       "reading below the resting surface is FALSE. descend uses a band INSTEAD OF an at-rest gate "
+       "for success — a held cube being positioned is never stationary, at-rest never latches. If "
+       "'pressed into the surface' should still count as low, you want `below_resting_height`; the "
+       "two disagree on 37 of 64 forced full-criterion descend states (measured 2026-08-12)."),
+
+    _p("below_resting_height", [Param("band", "float", None, "upper bound, meters", True)],
+       "height_above_resting < `band`, UNBOUNDED BELOW. The state 'the object is low', not 'the "
+       "object is inside a band' — a cube pressed BELOW its resting height is still low, and it is "
+       "the crush penalty, not the success gate, that handles pressing. This is how "
+       "`descend_env.py`'s `low` is written, and it was not expressible before: routing that "
+       "criterion through `height_above_resting_in` disagreed on 37 of 4456 sampled states on this "
+       "component alone, on 64/64 of the states below the seat, and on 37 of 64 at FULL criterion "
+       "level once `centered` is forced true (measured 2026-08-12). Choose between the two by "
+       "asking whether below-the-surface is a FAILURE (use `height_above_resting_in`) or merely "
+       "low (use this)."),
 
     _p("and_", [Param("terms", "list[predicate]", None, "predicates to conjoin", True)],
        "true iff every listed predicate is true. Required by 5 primitives."),
@@ -724,6 +738,12 @@ def vocab_document() -> str:
     add("Composing predicates: `predicate`/`gate` accept a bare name above, or a nested call over "
         "EXISTING names — never invent a compound name. Example: `and_(grasped, above_z(z=0.06), "
         "within_radius(anchor=target_pos, radius_expr=0.05))`.")
+    # The `success:` grammar was documented NOWHERE the author can see it: `spec.py` leaves it to
+    # the evaluator on purpose, the evaluator's `_desugar_brackets` documents it in a Python
+    # docstring, and the design doc §4 example and the acceptance fixture both WRITE the bracket
+    # form. So the model was expected to produce grammar it had never been shown.
+    add("The `success:` field takes that same grammar plus bracket sugar: `all[a, b]` means "
+        "`and_(a, b)` and `any[a, b]` means `or_(a, b)`. Nothing else uses brackets.")
     add("")
 
     add("## Chassis (weight presets — start here)")

@@ -14,6 +14,13 @@ no check here made, and it was FALSE for `clamp`/`min`/`max` over a raw tensor u
 torch comparison is a bool tensor and `1 - bool_tensor` raises). The batch section at the end folds
 those calls over a boolean-conditioned batch so the docstring's claim is a tested one.
 
+COUPLING, STATED SO IT IS A CHOICE AND NOT A SURPRISE: the batch stand-ins (`BoolMask`, `BoolVec`,
+`close_all`) are imported from `test_skillcompile` rather than copied, so THIS FILE FAILS TO IMPORT
+if `test_skillcompile`'s import block breaks — a red here can mean a defect in the module that file
+tests, not in `expr.py`. That is the accepted cost of one model of torch's bool-tensor behaviour
+instead of two: two copies would drift, and the drifting one would be whichever module was not
+being edited. Check `test_skillcompile.py` first when this file fails at import.
+
 Run: python -m pytest bridle/tests/test_expr.py
      PYTHONPATH=. python bridle/tests/test_expr.py
 """

@@ -470,6 +470,24 @@ def _derive_contact_surfaces(measures):
 
 _CONTACT_SURFACE_MEASURES = _derive_contact_surfaces(MEASURES)
 
+# A hand-listed set here is checked by NOTHING ELSE, and the check that catches it is not this one.
+# The round-3 review replaced this global with a literal frozenset, left the helper defined, and all
+# nine derivation-related predicates in `test_skillcompile.py` stayed green — every one of them
+# applies the HELPER to a synthetic vocabulary and compares the result to itself, so none of them
+# can see what the compiler actually uses. This assert is the cheap half of the fix and it is
+# honestly weaker than it looks: a hand-list that is still value-EQUAL today (which is what a
+# copy-paste produces) passes it. It fires only once the two have already diverged — after a rename,
+# or after a vocabulary addition someone hand-merged wrong — which is worth one line but is not the
+# property.
+#
+# THE PROPERTY IS THAT A MEASURE ADDED TOMORROW LANDS IN THE CHECK, and only a run over a DIFFERENT
+# vocabulary can see it: `test_skillcompile.py` grows `vocab.MEASURES` (and DistancePull's `kernel`
+# choices) in a SUBPROCESS before importing this module and asserts both sets below grew with it.
+# That is the check that goes red for a value-equal hand-list; keep the two together.
+assert _CONTACT_SURFACE_MEASURES == _derive_contact_surfaces(MEASURES), (
+    "the contact-surface set the compiler uses has diverged from `_derive_contact_surfaces("
+    "MEASURES)` — a hand-listed set here stops growing the day the vocabulary does")
+
 assert set(_ZERO_IS_NOT_A_CONTACT_SURFACE) <= set(MEASURES), (
     "an exclusion naming a measure the vocabulary does not have is a line that stopped meaning "
     "anything at a rename and now silently excludes nothing")
@@ -503,6 +521,15 @@ def _derive_peaked_kernels(kernels):
 
 _PEAKED_KERNELS = _derive_peaked_kernels(_choices_of("DistancePull", "kernel"))
 
+#: The kernel axis of the same divergence guard — read the comment above the measure axis' assert
+#: for what it does and does not catch. Weaker still here, because `_KERNEL_PEAK_IS_NOT_AT_SETPOINT`
+#: is empty, so the derivation IS the vocabulary's `choices` and a hand-list of the three is equal
+#: to it in every respect except that it stops growing. The subprocess probe named above is what
+#: covers that on this axis too.
+assert _PEAKED_KERNELS == _derive_peaked_kernels(_choices_of("DistancePull", "kernel")), (
+    "the peaked-kernel set the compiler uses has diverged from `_derive_peaked_kernels` over the "
+    "vocabulary's own `choices` — a hand-list here silently stops covering a kernel it gains")
+
 assert set(_KERNEL_PEAK_IS_NOT_AT_SETPOINT) <= _choices_of("DistancePull", "kernel"), (
     "an exclusion naming a kernel the vocabulary does not offer excludes nothing and hides that it "
     "excludes nothing")
@@ -516,15 +543,27 @@ def _check_row_semantics(path, term, values):
         if (values["kernel"] in _PEAKED_KERNELS
                 and values["measure"] in _CONTACT_SURFACE_MEASURES
                 and values["setpoint"] == 0.0):
+            # THE RULE IGNORES THE WEIGHT'S SIGN; THE MESSAGE MUST NOT. Refusing a negative-weight
+            # row here is deliberate (see `_KERNEL_PEAK_IS_NOT_AT_SETPOINT`: one uniform rule is the
+            # one the document can state), but telling that author the row "is maximised at the
+            # setpoint" is false — `_max_distance_pull` in this same file says a negative weight
+            # inverts the kernel — and the error messages ARE the API for a model that cannot read
+            # this source. So the sentence describes the row that was actually written.
+            extremum = ("maximised at the setpoint"
+                        if values["weight"] >= 0.0 else
+                        f"MINIMISED at the setpoint, because weight={_num(values['weight'])} "
+                        f"inverts the kernel into a repeller centred on that same surface")
             raise CompileError(
                 f"{path}.setpoint",
-                f"this DistancePull peaks AT the contact surface: setpoint=0.0 over "
-                f"{values['measure']!r} with kernel={values['kernel']!r}, which is maximised at the "
-                f"setpoint, and 0 there means the object is resting on the seat. Peaking at "
+                f"this DistancePull is extremal AT the contact surface: setpoint=0.0 over "
+                f"{values['measure']!r} with kernel={values['kernel']!r}, which is {extremum}, "
+                f"and 0 there means the object is resting on the seat. Concentrating a row on "
                 f"contact is a recorded failure, not a free parameter — descend's "
                 f"`2.5*(1-tanh(6*dz))` pulled the held cube INTO the platform and broke 16/16 grasps "
-                f"(2026-06-04); the fix was a setpoint of 0.015, a hover ABOVE the seat. Set a "
-                f"positive setpoint, or use HingePenalty if you meant to bound the height")
+                f"(2026-06-04); the fix was a setpoint of 0.015, a hover ABOVE the seat. The rule "
+                f"does not read the weight's sign, because either sign makes contact the one height "
+                f"this row is about. Set a positive setpoint, or use HingePenalty if you meant to "
+                f"bound the height")
     if term == "Ramp" and values["cap"] <= values["floor"]:
         raise CompileError(
             f"{path}.cap",
@@ -645,7 +684,11 @@ class Note(str):
     channel and already has consumers that treat an entry as text — the plan report runs
     `textwrap.fill(note, ...)` over each one (`report.format_warnings`) and the tests join them.
     A pair would have broken both for a field this module does not own the printing of. Everything a
-    string does, a Note does; `.level` is the part that used to be dropped at the `RewardPlan`
+    string does, a Note does — including `copy`, `deepcopy` and `pickle`, which needed the
+    `__getnewargs__` below and raised `TypeError` for as long as this class existed without it, so
+    the claim was false when it was first written (round-3 review).
+
+    `.level` is the part that used to be dropped at the `RewardPlan`
     boundary, where "flooding check INCOMPLETE ... this is not a pass" and a clean integrated ratio
     arrived indistinguishable and the distinction survived only in whether `warn()` had already
     fired — i.e. in a channel the stdlib dedupes per (message, location) and `bridle skill` silences.
@@ -664,6 +707,17 @@ class Note(str):
         note = super().__new__(cls, text)
         note.level = level
         return note
+
+    def __getnewargs__(self):
+        """`copy`, `deepcopy` and `pickle` all rebuild a `str` subclass as
+        `cls.__new__(cls, *obj.__getnewargs__())`, and `str`'s own returns the 1-TUPLE `(text,)` —
+        which calls `Note.__new__(cls, text)` and raises
+        `TypeError: Note.__new__() missing 1 required positional argument: 'text'`. All three were
+        broken; nothing in `bridle/` copies or pickles a note today, so it was latent rather than
+        live, but a `RewardPlan` crossing a process boundary (a training launcher, a cached compile)
+        is the obvious way it stops being latent. Returning `(level, text)` is the whole fix, and it
+        is what makes the docstring's "everything a string does, a Note does" true."""
+        return (self.level, str(self))
 
     def __repr__(self):
         return f"Note({self.level!r}, {str.__repr__(self)})"

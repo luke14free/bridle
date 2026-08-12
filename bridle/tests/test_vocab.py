@@ -210,10 +210,50 @@ def run_checks():
     check("ActionPenalty defaults to action_norm, not the delta",
           ap.get("measure", "action_norm") == "action_norm")
 
+    # ── descend's success criterion, which was NOT EXPRESSIBLE before 2026-08-13 ─────────────────
+    # `height_above_resting_in(band)` is `0 <= h <= band`. `descend_env.py`'s `low` is `h < band`
+    # with NO LOWER BOUND, on purpose: a cube pressed below its resting height is still low, and it
+    # is the crush penalty, not the success gate, that handles pressing. Task 6 measured the gap —
+    # 37 of 4456 sampled states on this component alone, 64/64 of the states below the seat, and 37
+    # of 64 at FULL criterion level once `centered` is forced true. A NEW predicate rather than an
+    # optional `floor` param on the old one: the schema now treats an authored `null` as "not
+    # supplied" (a deliberate Task 3 fix), so `floor: null` would fall back to the default and
+    # reintroduce exactly this bug.
+    check("below_resting_height exists — descend's `low` gate is now expressible",
+          "below_resting_height" in PREDICATES)
+    below = PREDICATES.get("below_resting_height")
+    band = PREDICATES.get("height_above_resting_in")
+    check("...taking the same single `band` parameter as the bounded predicate it sits beside",
+          below is not None and band is not None
+          and [p.name for p in below.params] == [p.name for p in band.params] == ["band"]
+          and all(p.required for p in below.params))
+    # The docs are the ONLY thing that makes the choice between the two visible to the author — the
+    # whole point of a second predicate rather than a parameter. Both directions, so neither doc can
+    # be rewritten into a version that no longer names its sibling.
+    check("...and each of the two names the other, so an author can tell which one they want",
+          below is not None and band is not None
+          and "height_above_resting_in" in below.doc
+          and "below_resting_height" in band.doc)
+    check("...and the new one carries the measurement that forced it, not just an assertion",
+          below is not None and "4456" in below.doc and "37" in below.doc and "64" in below.doc
+          and "UNBOUNDED BELOW" in below.doc)
+    check("...while the bounded one still says it IS bounded below",
+          band is not None and "[0, band]" in band.doc)
+
     # ── the document a 30B model reads ──
     doc = vocab_document()
     check("document names every term", all(t in doc for t in TERMS))
     check("document names every measure", all(m in doc for m in MEASURES))
+    # Nothing asserted this, and a predicate the vocabulary defines but the PAYLOAD omits is a
+    # predicate the author is never told about — which is the whole defect 2b closes for the
+    # `success:` grammar, one level up.
+    check("document names every predicate", all(p in doc for p in PREDICATES))
+    # THE `success:` GRAMMAR WAS DOCUMENTED NOWHERE THE AUTHOR CAN SEE IT. `spec.py` leaves that
+    # grammar to the evaluator on purpose; the evaluator's `_desugar_brackets` documents the bracket
+    # sugar in a Python docstring; the design doc §4 example and the acceptance fixture both WRITE
+    # the bracket form. So the model was expected to produce grammar it had never been shown.
+    check("the payload documents the `success:` bracket sugar it expects the author to write",
+          "all[a, b]" in doc and "any[a, b]" in doc and "and_(a, b)" in doc and "or_(a, b)" in doc)
     check("document states each default's rationale", doc.count("why") >= 6 or "because" in doc)
     check("document marks which measures are signed", "signed" in doc.lower())
     # ── SIZE: a derived token budget, not a round char count (2026-08-12 re-review, Important 2) ──
@@ -231,13 +271,17 @@ def run_checks():
     # not the constraint." 8,000 tokens is therefore the ceiling: the largest payload the audit
     # costed and still called comfortable, applied to its largest single component.
     #
-    # WHY THE MARGIN IS WHAT IT IS. The document measures ~6,000 estimated tokens today — above the
-    # audit's 3,400-4,600 vocabulary line because that table prices no chassis at all (the 6 presets
-    # with their `why` rationales are the audit's own §6 recommendation, costed nowhere in its §5),
-    # plus amendment 1's added measures and terms. Against 8,000 that leaves ~2,000 tokens (~8,000
-    # chars) of headroom — room to add a rationale to every chassis row without touching this test,
-    # which is the point of the margin. A document that DOUBLED would estimate ~12,000 tokens and
-    # still fail, which is the point of there being a ceiling at all.
+    # WHY THE MARGIN IS WHAT IT IS. The document measures ~6,470 estimated tokens today (25,875
+    # chars) — above the audit's 3,400-4,600 vocabulary line because that table prices no chassis at
+    # all (the 6 presets with their `why` rationales are the audit's own §6 recommendation, costed
+    # nowhere in its §5), plus amendment 1's added measures and terms, plus the 17th predicate and
+    # the `success:` grammar line added 2026-08-13 (+1,179 chars, +295 est. tokens over the 24,696 /
+    # ~6,174 measured before them). Against 8,000 that leaves ~1,530 tokens (~6,100 chars) of
+    # headroom — still room to add a rationale to every chassis row without touching this test,
+    # which is the point of the margin. A document that DOUBLED would estimate ~12,900 tokens and
+    # still fail, which is the point of there being a ceiling at all. If a future addition does not
+    # fit, say so — do not buy the space by deleting rationale prose, which is the evidence the
+    # "comments carry their measurement" rule exists to protect.
     #
     # ~4 chars/token is the working conversion this repo already uses. It is an estimate, and the
     # ceiling is sized so that being 30% wrong about it does not change the verdict.
