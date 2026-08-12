@@ -49,6 +49,14 @@ def run_checks():
     check("expect=0 holds on 0", Assert("p", STATIC, expect=0).holds(0))
     check("a None observation never holds", not Assert("m", DYNAMIC, min=0.5).holds(None))
 
+    # ── a boundless assert cannot be constructed — it is a check that can never fail ──
+    check("a boundless assert is REFUSED at construction", raises(ValueError, Assert, "p", STATIC))
+    check("expect alone is still constructible", Assert("p", STATIC, expect=True) is not None)
+    check("min alone is still constructible", Assert("p", DYNAMIC, min=0.5) is not None)
+    check("max alone is still constructible", Assert("p", DYNAMIC, max=0.99) is not None)
+    check("min=0.0 is still constructible (zero is a real bound)",
+          Assert("p", DYNAMIC, min=0.0) is not None)
+
     # ── kind supplies the carry gotchas; the author does not have to know them ──
     eff = merge("carry", ())
     paths = {a.path for a in eff}

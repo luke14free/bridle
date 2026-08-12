@@ -55,6 +55,12 @@ class Assert:
     needs: str | None = None
     source: str = "authored"
 
+    def __post_init__(self):
+        if self.expect is None and self.min is None and self.max is None:
+            raise ValueError(
+                f"Assert(`{self.path}`) has no bound (no expect/min/max) — an assert with no "
+                f"bound is not a claim, it is a check that can never fail.")
+
     def holds(self, value) -> bool:
         if value is None:                       # missing is a failure, never a pass
             return False
@@ -74,7 +80,7 @@ class Assert:
             parts.append(f">= {self.min}")
         if self.max is not None:
             parts.append(f"<= {self.max}")
-        return f"{self.path} {' and '.join(parts) if parts else '(no bound)'}"
+        return f"{self.path} {' and '.join(parts)}"
 
 
 #: What a KIND means, physically. These are floors, not defaults: the author never states them and
