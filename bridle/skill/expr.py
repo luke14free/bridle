@@ -1,0 +1,292 @@
+"""bridle.skill.expr — the tier-2 reward expression language.
+
+A skill's reward is normally assembled from the fixed 9-term vocabulary (`vocab.py`). A row that
+vocabulary cannot express falls back to a raw expression string — `expr: "2 * (1 - tanh(6 * abs(h
+- 0.015)))"` — authored by a local 27-30B LLM, not a human. That authorship is exactly why this
+module exists instead of just calling `eval()`:
+
+  SAFETY. The string is parsed against an `ast` node whitelist and NEVER passed to `eval`/`exec`.
+  `ast.Attribute` and `ast.Subscript` are refused outright (not merely "not in the grammar we
+  generate") — that is what makes `().__class__.__bases__[0].__subclasses__()` a parse-time refusal
+  instead of a possibility that depends on the model never trying it. See the adversarial checks
+  driven from `bridle/tests/test_expr.py` and `docs/` for the attacks this closes.
+
+  BATCH SEMANTICS. The exact same parsed `Expr` is evaluated once with plain Python floats (unit
+  tests, `Expr.names` compile-time checks) and later with batched CUDA tensors — 4096 parallel
+  envs — during PPO training. The two consequences that follow, and that a naive port from Python
+  gets wrong:
+    - `where(c, a, b)` is written branch-free as `c * a + (1 - c) * b`. A Python `if c: a else: b`
+      would call `bool()` on the whole batch and silently take ONE branch for all 4096 envs.
+    - `tanh`/`exp`/`log`/`sqrt` dispatch to the value's own method first (`x.tanh()` — torch tensors
+      have these) and fall back to `math.*` only when that method is absent (plain floats/ints).
+      That is the one piece of code that makes "the same expression string means the same thing for
+      a CPU float and a CUDA tensor" true, rather than merely intended.
+"""
+import ast
+import math
+import operator
+
+__all__ = ["ExprError", "ALLOWED_CALLS", "parse", "Expr"]
+
+
+class ExprError(Exception):
+    """Raised for anything wrong with an expression string: parse-time whitelist violations,
+    syntax errors, and evaluation-time failures (undefined name, div-by-zero, ...). Callers — the
+    skill compiler, the training loop — only ever need to catch this one type; a raw `SyntaxError`
+    or `KeyError` escaping from a sandboxed evaluator would be a bug in this module, not a legitimate
+    outcome.
+    """
+
+
+# The only functions an expression may call. Deliberately small: every entry has both a Python-float
+# and a torch-tensor-shaped meaning (see module docstring). Extending this set is a design decision,
+# not a bug fix — anything else belongs in the fixed 9-term vocabulary or a new primitive.
+ALLOWED_CALLS = frozenset({"abs", "tanh", "exp", "log", "sqrt", "clamp", "min", "max", "where"})
+
+# ast node types a reward expression may contain. Everything not listed here is refused at parse
+# time, before an Expr object is ever constructed — in particular ast.Attribute and ast.Subscript
+# are absent ON PURPOSE, which is what turns dunder-chain escapes (`x.__class__`, `x[0]`) into a
+# parse-time ExprError rather than something that merely doesn't appear in the grammar we intended.
+_ALLOWED_NODE_TYPES = frozenset({
+    ast.Expression,
+    ast.BinOp, ast.UnaryOp, ast.Compare, ast.Call, ast.Name, ast.Constant,
+    ast.Load,
+    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.USub, ast.UAdd,
+    ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+})
+
+# Human-readable labels for common rejected constructs, so the error names what was actually typed
+# instead of a bare Python class name like "ListComp". Anything not in this table falls back to
+# type(node).__name__, which is still informative (e.g. "Global", "Yield").
+_NODE_LABELS = {
+    ast.Attribute: "attribute access (e.g. x.attr)",
+    ast.Subscript: "subscript (e.g. x[0])",
+    ast.ListComp: "list comprehension",
+    ast.SetComp: "set comprehension",
+    ast.DictComp: "dict comprehension",
+    ast.GeneratorExp: "generator expression",
+    ast.Lambda: "lambda",
+    ast.IfExp: "conditional expression (x if y else z)",
+    ast.JoinedStr: "f-string",
+    ast.FormattedValue: "f-string interpolation",
+    ast.Dict: "dict literal",
+    ast.Set: "set literal",
+    ast.List: "list literal",
+    ast.Tuple: "tuple literal",
+    ast.Starred: "starred expression (*args)",
+    ast.keyword: "keyword argument",
+    ast.BoolOp: "boolean 'and'/'or' (use multiplication/where instead — see module docstring)",
+}
+
+
+def _allowed_calls_clause() -> str:
+    return f"allowed calls are: {', '.join(sorted(ALLOWED_CALLS))}"
+
+
+def _reject(node: ast.AST) -> None:
+    label = _NODE_LABELS.get(type(node), type(node).__name__)
+    raise ExprError(
+        f"'{label}' is not allowed in a reward expression; "
+        f"allowed constructs are arithmetic (+ - * / **), comparisons, and calls to "
+        f"one of the whitelisted functions ({_allowed_calls_clause()})"
+    )
+
+
+def _validate_call(node: ast.Call) -> None:
+    if not isinstance(node.func, ast.Name):
+        # e.g. `__import__('os').system(...)` or `obj.method()` — the callee is an Attribute/
+        # Subscript/other expression, not a bare name. Refuse before even looking at args.
+        raise ExprError(
+            "a call's target must be a plain function name, not an attribute or expression "
+            f"({_allowed_calls_clause()})"
+        )
+    if node.func.id not in ALLOWED_CALLS:
+        raise ExprError(f"'{node.func.id}' is not a whitelisted call ({_allowed_calls_clause()})")
+
+
+def _validate_constant(node: ast.Constant) -> None:
+    # bool is a subclass of int in Python, so `type(x) in (int, float)` (not isinstance) is what
+    # excludes True/False/None/strings/bytes while still admitting plain numeric literals.
+    if type(node.value) not in (int, float):
+        raise ExprError(
+            f"only numeric constants are allowed in a reward expression, got {node.value!r}"
+        )
+
+
+def _validate(tree: ast.AST) -> None:
+    for node in ast.walk(tree):
+        node_type = type(node)
+        if node_type not in _ALLOWED_NODE_TYPES:
+            _reject(node)
+        elif node_type is ast.Call:
+            _validate_call(node)
+        elif node_type is ast.Constant:
+            _validate_constant(node)
+
+
+def parse(src: str) -> "Expr":
+    """Parse a reward-expression string into an `Expr`, or raise `ExprError` naming the offending
+    construct. Never calls `eval`/`exec`/`compile` in exec/eval-execution mode on the source — only
+    `ast.parse(..., mode="eval")` to get a tree, which is then walked and validated, never executed
+    by the Python interpreter.
+    """
+    if not isinstance(src, str):
+        raise ExprError(f"expression source must be a string, got {type(src).__name__}")
+    if not src.strip():
+        raise ExprError("expression source is empty")
+    try:
+        tree = ast.parse(src, mode="eval")
+    except SyntaxError as exc:
+        raise ExprError(f"syntax error in expression {src!r}: {exc}") from exc
+
+    _validate(tree)
+
+    # Free variables = every Name node that isn't itself a whitelisted call target. Because a Call's
+    # func name is validated above to be a bare Name already in ALLOWED_CALLS, this simple filter is
+    # sufficient — no need to track "am I in call-target position" separately.
+    names = frozenset(
+        node.id for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id not in ALLOWED_CALLS
+    )
+    return Expr(tree, src, names)
+
+
+# ── evaluation ────────────────────────────────────────────────────────────────────────────────
+# Every helper below is written using only +, -, *, /, **, comparisons, and generic dispatch — never
+# a Python `if`/`and`/`or` on the *value* being evaluated — because those short-circuit to a single
+# Python bool and would silently pick one branch for an entire batched tensor. See module docstring.
+
+_BIN_OPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+    ast.Div: operator.truediv, ast.Pow: operator.pow,
+}
+_UNARY_OPS = {ast.USub: operator.neg, ast.UAdd: operator.pos}
+_COMPARE_OPS = {
+    ast.Eq: operator.eq, ast.NotEq: operator.ne,
+    ast.Lt: operator.lt, ast.LtE: operator.le,
+    ast.Gt: operator.gt, ast.GtE: operator.ge,
+}
+
+
+def _method_or_math(method_name, math_fn):
+    """Build a unary call (tanh/exp/log/sqrt) that dispatches to the operand's own method first,
+    falling back to `math.<fn>` when that method doesn't exist. Plain floats/ints have no `.tanh()`
+    etc., so they always fall through to `math`; a torch tensor has `.tanh()` etc., so it takes that
+    path and the operation stays batched/on-device instead of being forced through a Python float.
+    This is the one piece of code that makes one expression string mean the same thing for a CPU
+    float in a unit test and a CUDA tensor of 4096 envs in training.
+    """
+    def call(x):
+        method = getattr(x, method_name, None)
+        if callable(method):
+            return method()
+        return math_fn(x)
+    return call
+
+
+_tanh = _method_or_math("tanh", math.tanh)
+_exp = _method_or_math("exp", math.exp)
+_log = _method_or_math("log", math.log)
+_sqrt = _method_or_math("sqrt", math.sqrt)
+
+
+def _where(c, a, b):
+    """Branch-free select. `if c: a else: b` would call `bool(c)` on the WHOLE batch and take one
+    branch for all 4096 parallel envs at once; `c*a + (1-c)*b` selects elementwise instead, which is
+    the only form that means the same thing for a scalar and a tensor. `c` may be a Python bool, a
+    0/1 float, or a bool/float tensor — arithmetic treats True/nonzero as 1 and False/zero as 0 in
+    all three cases.
+    """
+    return c * a + (1 - c) * b
+
+
+def _min2(a, b):
+    return _where(a < b, a, b)
+
+
+def _max2(a, b):
+    return _where(a > b, a, b)
+
+
+def _clamp(x, lo, hi):
+    return _min2(_max2(x, lo), hi)
+
+
+_CALL_IMPLS = {
+    "abs": abs,   # builtin abs() already dispatches via __abs__ — the same protocol tanh/exp/log/
+                  # sqrt implement by hand above, since Python has no __tanh__/__exp__/__log__.
+    "tanh": _tanh,
+    "exp": _exp,
+    "log": _log,
+    "sqrt": _sqrt,
+    "clamp": _clamp,
+    "min": _min2,
+    "max": _max2,
+    "where": _where,
+}
+assert set(_CALL_IMPLS) == ALLOWED_CALLS, "ALLOWED_CALLS and _CALL_IMPLS have drifted apart"
+
+
+def _eval_compare(node: ast.Compare, env: dict):
+    # Chained comparisons (`0 < x < 1`) combine pairwise results with multiplication, not `and`, for
+    # the same batch reason `_where` is branch-free: `and` forces a single Python bool out of a
+    # tensor with more than one element ("ambiguous truth value"), but multiplying elementwise
+    # bool/float results reduces correctly across a whole batch.
+    left = _eval(node.left, env)
+    result = None
+    for op, comparator in zip(node.ops, node.comparators):
+        right = _eval(comparator, env)
+        ok = _COMPARE_OPS[type(op)](left, right)
+        result = ok if result is None else result * ok
+        left = right
+    return result
+
+
+def _eval(node: ast.AST, env: dict):
+    node_type = type(node)
+    if node_type is ast.Expression:
+        return _eval(node.body, env)
+    if node_type is ast.Constant:
+        return node.value
+    if node_type is ast.Name:
+        if node.id in env:
+            return env[node.id]
+        raise ExprError(f"undefined name '{node.id}' — declared measures are: {sorted(env)}")
+    if node_type is ast.BinOp:
+        return _BIN_OPS[type(node.op)](_eval(node.left, env), _eval(node.right, env))
+    if node_type is ast.UnaryOp:
+        return _UNARY_OPS[type(node.op)](_eval(node.operand, env))
+    if node_type is ast.Compare:
+        return _eval_compare(node, env)
+    if node_type is ast.Call:
+        # node.func is guaranteed a bare Name with .id in ALLOWED_CALLS by parse()'s validation —
+        # nothing else could have survived _validate_call above.
+        args = [_eval(a, env) for a in node.args]
+        return _CALL_IMPLS[node.func.id](*args)
+    # Unreachable: parse() walks and rejects every other node type before an Expr is constructed.
+    raise ExprError(f"internal: unhandled node type {node_type.__name__}")
+
+
+class Expr:
+    """A parsed, validated reward expression. Construct via `parse()`, never directly."""
+
+    def __init__(self, tree: ast.Expression, source: str, names: frozenset):
+        self._tree = tree
+        self.source = source
+        self.names = names
+
+    def evaluate(self, env: dict):
+        """Evaluate against `env` (name -> float or tensor). Raises `ExprError` — never `KeyError`
+        or a raw arithmetic exception — on any failure, so a caller only needs to catch one type.
+        """
+        try:
+            return _eval(self._tree, env)
+        except ExprError:
+            raise
+        except ZeroDivisionError as exc:
+            raise ExprError(f"division by zero evaluating {self.source!r}: {exc}") from exc
+        except Exception as exc:  # defensive: a sandboxed evaluator should never leak a raw exception
+            raise ExprError(f"error evaluating {self.source!r}: {exc}") from exc
+
+    def __repr__(self):
+        return f"Expr({self.source!r})"
