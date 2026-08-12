@@ -36,6 +36,13 @@ class Loosened(Exception):
     (a carry primitive that is not holding anything is not carrying), so it is a floor."""
 
 
+class DuplicateFloor(Exception):
+    """KIND_ASSERTS[kind] has two floors on the same path.
+
+    A kind's floors are what the kind MEANS. A kind cannot mean two different things about one
+    path, so this is a malformed kind table, not an input to reconcile — it is raised, not merged."""
+
+
 @dataclass(frozen=True)
 class Assert:
     """One checkable claim. `path` is a dotted module attribute (STATIC) or a metric name (DYNAMIC)."""
@@ -97,7 +104,13 @@ def _tightens(authored: Assert, floor: Assert) -> bool:
 def merge(kind, authored) -> tuple:
     """Kind floors plus authored asserts. An authored assert on the same path may only tighten."""
     floors = KIND_ASSERTS.get(kind or "", ())
-    by_path = {a.path: i for i, a in enumerate(floors)}
+    by_path = {}
+    for i, a in enumerate(floors):
+        if a.path in by_path:
+            raise DuplicateFloor(
+                f"kind={kind} has two floors on `{a.path}` — a kind's floors are what the kind "
+                f"MEANS, and it cannot mean two different things about one path.")
+        by_path[a.path] = i
     out = list(floors)
     for a in authored:
         idx = by_path.get(a.path)

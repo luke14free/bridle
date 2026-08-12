@@ -9,8 +9,10 @@ Run: python -m pytest bridle/tests/test_preflight.py
 """
 import sys
 
+import bridle.preflight as preflight
 from bridle.preflight import (
-    DYNAMIC, STATIC, Assert, Loosened, evaluate, format_effective, format_failures, merge,
+    DYNAMIC, STATIC, Assert, DuplicateFloor, Loosened, evaluate, format_effective, format_failures,
+    merge,
 )
 
 FAILS = []
@@ -69,6 +71,21 @@ def run_checks():
     looser = (Assert("is_grasped_at_end", DYNAMIC, min=0.0),)
     check("loosening a kind assert is REFUSED", raises(Loosened, merge, "carry", looser))
     check("an unknown kind is allowed with no extra asserts", merge(None, authored) == authored)
+
+    # ── two floors on the same path in KIND_ASSERTS is a malformed kind table, not an input to
+    # reconcile — merge must refuse it rather than silently checking one path against two bounds ──
+    real_kind_asserts = preflight.KIND_ASSERTS
+    preflight.KIND_ASSERTS = dict(real_kind_asserts, dup=(
+        Assert("dup.path", DYNAMIC, min=0.5, source="kind=dup"),
+        Assert("dup.path", DYNAMIC, min=0.5, source="kind=dup"),
+    ))
+    try:
+        check("two kind floors on the same path is REFUSED, not merged",
+              raises(DuplicateFloor, merge, "dup", (Assert("dup.path", DYNAMIC, min=0.8),)))
+    finally:
+        preflight.KIND_ASSERTS = real_kind_asserts
+    check("single-floor-per-path merge still works after the restore",
+          any(a.min == 0.8 for a in merge("carry", tighter) if a.path == "is_grasped_at_end"))
 
     # ── evaluation ──
     ok = {"is_grasped_at_end": 0.859, "descend_low_once": 1.0,
