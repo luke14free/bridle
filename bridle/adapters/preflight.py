@@ -26,14 +26,63 @@ def _resolve(path: str):
     raise ImportError(f"could not import any prefix of {path!r}")
 
 
+class _Unresolved:
+    """Sentinel for a path that could not be resolved at all (bad module or missing attribute —
+    a SPEC error), as distinct from a path that resolved fine to a real value of `None` (an
+    INVARIANT violation — e.g. a derived config attribute that is genuinely unset). Collapsing
+    both to `None` makes a typo'd `path=` in an authored assert indistinguishable from the
+    real bug preflight exists to catch.
+
+    `bridle.preflight.Assert.holds` is core and intentionally untouched here: it fails on
+    `value is None` before ever looking at `expect`/`min`/`max`. This sentinel is not `None`, so
+    it does not hit that branch — instead it implements `==`/`<`/`>`/`<=`/`>=` to force every
+    shape of `holds()` (expect-equality, min-floor, max-ceiling) to also come out False, so an
+    unresolved path still fails every assert. `format_failures` then prints this sentinel's repr
+    instead of `missing`/`None`, so the failure reads as a spec error, not a regressed invariant.
+    """
+
+    def __repr__(self):
+        return "<unresolved path>"
+
+    __str__ = __repr__
+
+    def __eq__(self, other):
+        return False
+
+    def __hash__(self):
+        return id(self)
+
+    def __lt__(self, other):
+        return True
+
+    def __gt__(self, other):
+        return True
+
+    def __le__(self, other):
+        return True
+
+    def __ge__(self, other):
+        return True
+
+
+#: Returned by `static_values` for a path that failed to resolve. Never returned for a path that
+#: resolved successfully to a real `None` — see `_Unresolved`'s docstring for why that matters.
+UNRESOLVED = _Unresolved()
+
+
 def static_values(paths) -> dict:
-    """Read each dotted path AFTER import, so the value reflects what the env actually derived."""
+    """Read each dotted path AFTER import, so the value reflects what the env actually derived.
+
+    A path that fails to import or has no such attribute maps to `UNRESOLVED`, not `None` — that
+    distinction is the whole point, see `UNRESOLVED`'s docstring. A path that resolves and the
+    attribute really is `None` keeps that `None` unchanged.
+    """
     out = {}
     for p in paths:
         try:
             out[p] = _resolve(p)
         except (ImportError, AttributeError):
-            out[p] = None            # missing resolves to None, which fails every assert
+            out[p] = UNRESOLVED
     return out
 
 
@@ -55,7 +104,14 @@ def readable_env(module: str) -> set:
             continue
         if spec is None or not spec.origin or not spec.origin.endswith(".py"):
             continue
-        tree = ast.parse(open(spec.origin).read())
+        try:
+            with open(spec.origin) as fh:
+                tree = ast.parse(fh.read())
+        except (SyntaxError, ValueError):
+            # One module reachable via a `primitives.` import chain being unparseable (a WIP
+            # file, a syntax error mid-edit) must not sink the whole scan — skip it and keep
+            # walking the rest of the import graph.
+            continue
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 continue
@@ -86,10 +142,43 @@ def dynamic_metrics(env_id: str, module: str, ckpt=None, envs: int = 64, steps: 
     import gymnasium as gym
     import torch
     import mani_skill.envs  # noqa: F401  — registers the task envs
+    from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
     importlib.import_module(module)          # registers THIS primitive's env id
 
-    env = gym.make(env_id, num_envs=envs, obs_mode="state", sim_backend="physx_cuda",
-                   control_mode="pd_joint_target_delta_pos", max_episode_steps=400)
+    raw = gym.make(env_id, num_envs=envs, obs_mode="state", sim_backend="physx_cuda",
+                    control_mode="pd_joint_target_delta_pos", max_episode_steps=400)
+    # MUST explicitly wrap with ManiSkillVectorEnv(..., auto_reset=False, ignore_terminations=True)
+    # rather than trust any `gym.make*` call to do it safely — there is no kwarg-passthrough route.
+    # `mani_skill/utils/registration.py`'s own vector constructor is
+    #     def make_vec(env_id, **kwargs):
+    #         env = gym.make(env_id, **kwargs)
+    #         env = ManiSkillVectorEnv(env)
+    #         return env
+    # which forwards NOTHING to `ManiSkillVectorEnv(env)` — so it always takes the class defaults
+    # (`mani_skill/vector/wrappers/gymnasium.py`, `ManiSkillVectorEnv.__init__`):
+    #     auto_reset: bool = True,
+    #     ignore_terminations: bool = False,
+    # Under those defaults, `ManiSkillVectorEnv.step()` does:
+    #     if dones.any() and self.auto_reset:
+    #         final_info = torch_clone_dict(infos)
+    #         obs, infos = self.reset(options=dict(env_idx=env_idx))
+    #         infos["final_info"] = final_info
+    # and `dones = terminations | truncations` where `terminations` comes straight from
+    # `BaseEnv.step` (`mani_skill/envs/sapien_env.py`): `terminated = info["success"].clone()`
+    # whenever `evaluate()` returns a `"success"` key — which `descend_env.py` does. So the instant
+    # a sub-env succeeds, that index is reset within the SAME `.step()` call and its `info` is
+    # overwritten with fresh post-reset (False) values; the real terminal values only survive under
+    # `infos["final_info"]`, which a probe that scans `info` directly (as this one does) never reads.
+    # `lerobot_sim2real/rl/ppo_state.py` hits this exact trap and avoids it the only way available —
+    # building `ManiSkillVectorEnv` itself, not through any `gym.make*` kwarg:
+    #     envs = gym.make(args.env_id, num_envs=args.num_envs, ...)
+    #     envs = ManiSkillVectorEnv(envs, args.num_envs, ignore_terminations=not args.partial_reset, ...)
+    # Measured cost of getting this wrong (bridle/preflight.py's own worked example, 2026-08-12): a
+    # descend policy with real `is_grasped_at_end` 0.859 reads far lower once the successful steps'
+    # info gets silently replaced by the post-reset frame. `auto_reset=False` here goes one step
+    # further than ppo_state.py's `ignore_terminations` (which still auto-resets on truncation) —
+    # this probe wants a fixed-length window with NO reset at all, ever, mid-rollout or otherwise.
+    env = ManiSkillVectorEnv(raw, envs, auto_reset=False, ignore_terminations=True)
     obs, _ = env.reset(seed=0)
     dev = env.unwrapped.device
     act_fn = None
