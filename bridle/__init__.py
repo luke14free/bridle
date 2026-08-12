@@ -16,11 +16,13 @@ Backends live in `bridle.adapters` and are optional extras.
 For agents and LLMs writing code against this library: read AGENTS.md — it carries the invariants
 that are easy to get wrong and the reasons behind them.
 """
+from bridle.agent import AgentSession, Event
 from bridle.app import App, Artifact, EnvSpec, EvalSpec, Recipe, Stage
 from bridle.checkpoint import ContractMismatch, stamp, verify
 from bridle.contract import Actuation, Contract, Execution, Grasp, GraspSignal, Release
 from bridle.foundry import Foundry, Job, ShellStageRunner, StageError, StageResult
-from bridle.llm import OpenAICompatProvider, Provider, ScriptedProvider
+from bridle.llm import (AnthropicProvider, OpenAICompatProvider, Provider,
+                        ScriptedProvider, from_spec)
 from bridle.orchestrator import Orchestrator, build_tools
 from bridle.resolve import ADAPT, RETRAIN, RUN, Resolution, resolve, resolve_contracts
 from bridle.rig import Camera, Gripper, Rig
@@ -46,7 +48,10 @@ __all__ = [
     # checkpoints that know what they are
     "ContractMismatch", "stamp", "verify",
     # bring your own LLM
-    "Orchestrator", "Provider", "OpenAICompatProvider", "ScriptedProvider", "build_tools",
+    "Orchestrator", "Provider", "OpenAICompatProvider", "AnthropicProvider",
+    "ScriptedProvider", "from_spec", "build_tools",
+    # the agentic TUI
+    "AgentSession", "Event",
     # the simulator window
     "Viewer",
     "__version__",

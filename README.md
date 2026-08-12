@@ -149,6 +149,47 @@ for it.
 - **Retraining costs hours-to-days of GPU per skill.** That has to be visible in the UX or the
   product feels broken.
 
+## The TUI
+
+```bash
+pip install -e . && bridle tui --model local:qwen3-32b
+```
+
+```
+ bridle · so101-default · local:qwen3-32b ···························· acting
+ ⋯ I'll pick the red cube first.        │ skills (16 ready / 27)
+ → pick(obj='red cube')                 │ ● reach              ready
+ ✓ picked the red cube (14.2 N)         │ ● descend_to_target  ready
+ → place(dest='green cube')             │ ▲ grab_rgb_wrist     needs re-distil
+                                        │ ✕ pick_place         needs rebuild
+                                        │ · sphere_grab        rig can't run it
+                                        ├─────────────────────────────────────
+                                        │ jobs
+                                        │ descend_to_target  training  ep 413
+ ─────────────────────────────────────────────────────────────────────────────
+ › _        http://127.0.0.1:8799 · enter send · esc interrupt · ^N model · ^C quit
+```
+
+**Steering is the point.** A coding agent that goes wrong writes a bad file. A robot agent that goes
+wrong *moves a real arm*, and noticing three tool calls later means a scattered scene. So typing
+while the agent runs queues guidance it sees before choosing its next skill, and `esc` stops it
+**after the current skill returns** — never mid-skill, because a half-executed grasp leaves the
+gripper in a state no policy was trained from.
+
+The skills pane is the contract spine made visible: every skill, and whether it *runs* on your rig,
+needs *re-distilling*, needs a *rebuild*, or *can't run here at all*. The agent's tool list is
+filtered by the same call, so the model is never offered a skill your robot cannot do.
+
+Bring any model — `local:` / `vllm:` / `ollama:` / `openai:` / `openrouter:` / `anthropic:`, with
+`^N` to switch mid-session. `--executor module:function` wires it to your simulator; without one it
+runs in dry mode and says so, because silently doing nothing while looking like it worked is the
+failure this project exists to prevent.
+
+```bash
+bridle skills                 # what runs on this rig, and what doesn't
+bridle plan descend_to_target # why a skill needs adapting or rebuilding
+```
+
 ## The window
 
 A terminal agent cannot show you a robot. You can read that a skill returned `ok` and still not
@@ -167,10 +208,12 @@ The window shows your rig, the live simulator, running jobs, and every skill ann
 it **runs / needs re-distil / needs a rebuild / can't run on this rig** — from the same `plan()` call
 that filters the agent's tool list, so the two cannot disagree.
 
-bridle deliberately does **not** ship a coding agent. [Pi](https://pi.dev) already is one, MIT and
-built to be extended; forking it would mean maintaining a coding agent forever as a tax on the
-robotics work. Pi owns the conversation, bridle owns the robot —
-see **[docs/pi-extension.md](docs/pi-extension.md)**.
+The TUI and the window are complements, not alternatives: the terminal is where you *talk to* the
+agent, the browser is where you *watch* the robot. Video does not belong in a terminal.
+
+bridle has no third-party dependencies, including for its UI — `curses` and `http.server` ship with
+Python. Any external harness can still drive it by reading `/api/state`; see
+**[docs/pi-extension.md](docs/pi-extension.md)**.
 
 ## For agents and LLMs
 

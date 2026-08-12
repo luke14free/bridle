@@ -30,6 +30,9 @@ dependencies = []
 maniskill = ["torch"]
 dev = ["pytest>=8"]
 
+[project.scripts]
+bridle = "bridle.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/luke14free/bridle"
 
