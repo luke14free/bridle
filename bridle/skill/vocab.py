@@ -38,7 +38,7 @@ from enum import Enum
 
 __all__ = [
     "Sign", "Frame", "Measure", "MEASURES", "Param", "Predicate", "PREDICATES",
-    "Term", "TERMS", "Chassis", "CHASSIS", "vocab_document",
+    "Term", "TERMS", "Chassis", "CHASSIS", "vocab_document", "base_term",
 ]
 
 
@@ -79,8 +79,8 @@ def _m(name, sign, frame, unit, doc):
 
 MEASURES = dict([
     _m("tcp_to_object", Sign.MAGNITUDE, Frame.LIVE, "m",
-       "distance, gripper TCP to the held/target object, read live. Always >= 0. reach's entire "
-       "dense signal is this measure at weight 1.0 (reach_env.py:96)."),
+       "distance, gripper TCP to the held/target object, read live. reach's entire dense signal is "
+       "this measure at weight 1.0."),
 
     _m("object_to_goal_xy", Sign.MAGNITUDE, Frame.LIVE, "m",
        "xy-plane distance, held object to its goal (target_pos), read live. Feeds the carry "
@@ -149,14 +149,13 @@ MEASURES = dict([
 
     _m("action_delta_norm", Sign.MAGNITUDE, Frame.LIVE, "-",
        "L2 norm of (action_t - action_t-1) — the jerk-LIKE variant nine files describe but none "
-       "compute. Requires a new previous-action buffer, not built for anything else on the roadmap. "
-       "Ships as ActionPenalty's `measure` at chassis weight 0.0 — enabling it is a sweep, not a "
-       "silent parity break."),
+       "compute. Requires a new previous-action buffer. Ships as ActionPenalty's `measure` at "
+       "chassis weight 0.0 — enabling it is a sweep, not a silent parity break."),
 
     _m("yaw_diff_mod_symmetry", Sign.MAGNITUDE, Frame.LIVE, "rad",
-       "symmetry-reduced angular diff, held-object yaw vs target yaw (compact_grasp_env.py:136 "
-       "`_shape_aware_yaw`). NOT wired as a DistancePull target: the arm is 5-DoF, so a full-pose "
-       "target is generally unreachable — a reward-hacking generator, not shaping."),
+       "symmetry-reduced angular diff, held-object yaw vs target yaw (`_shape_aware_yaw`). NOT wired "
+       "as a DistancePull target: the arm is 5-DoF, so a full-pose target is generally unreachable "
+       "— a reward-hacking generator, not shaping."),
 
     _m("joint_pos_margin_to_limit", Sign.MAGNITUDE, Frame.LIVE, "rad",
        "distance from current joint position to its nearest hardware limit. Amendment-A addition "
@@ -177,6 +176,8 @@ class Param:
     default: object = None
     doc: str = ""
     required: bool = False
+    choices: tuple = ()  # explicit legal values for a str param, e.g. mode's ("add","replace","floor")
+    # — schema-level, so a check can assert against it instead of grepping free-text doc.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -299,10 +300,10 @@ TERMS = dict([
                   "which measure to penalize; jerk-like variant is `action_delta_norm`"),
         ],
        "`reward -= weight * norm(measure)`. NOT a jerk penalty, despite NINE source files calling it "
-       "one (reach_env.py:100, grab_env.py:134, lift_env.py:92, +6 more) — no env has ever stored a "
-       "previous action. `measure` defaults to `action_norm` (identical everywhere: weight=0.001, "
-       "norm=l2); `action_delta_norm` is the jerk-LIKE variant those comments describe, and ships at "
-       "chassis weight 0.0 so enabling it is a deliberate sweep, not a silent parity break."),
+       "one — no env has ever stored a previous action. `measure` defaults to `action_norm` "
+       "(identical everywhere: weight=0.001, norm=l2); `action_delta_norm` is the jerk-LIKE variant "
+       "those comments describe, and ships at chassis weight 0.0 so enabling it is a deliberate "
+       "sweep, not a silent parity break."),
 
     _t("SuccessBonus", [
             Param("value", "float", 9.0, "terminal bonus paid on success"),
@@ -323,7 +324,7 @@ TERMS = dict([
             Param("predicate", "str", None, "name of a PREDICATES entry, may be a conjunction", True),
             Param("mode", "str", "add",
                   "add | replace | floor — amendment A: any gated row may need this, not only "
-                  "SuccessBonus"),
+                  "SuccessBonus", choices=("add", "replace", "floor")),
             Param("scope", "str", "preceding", "rows `mode` operates over"),
         ],
        "`reward += weight * predicate`. The largest merge in the corpus (13/15 primitives, 23 "
@@ -368,10 +369,10 @@ TERMS = dict([
             Param("linear_weight", "float", 0.3, "linear-speed penalty weight"),
             Param("angular_weight", "float", 0.05, "angular-speed penalty weight"),
         ],
-       "`-linear_weight*norm(v) - angular_weight*norm(omega)`. Identical in all 4 instances "
-       "(move_to_3d, descend_to_target, descend_stack, place_into_bin): 0.3/0.05. CLAUDE.md gotcha "
-       "(2): a grasped cube's angular velocity is ~98% contact-solver noise (reads ~22 rad/s while "
-       "the cube visibly rotates ~0.45 rad/s) — this term faithfully reproduces that mistake."),
+       "`-linear_weight*norm(v) - angular_weight*norm(omega)`. Identical across the 4 carry chassis "
+       "instances: 0.3/0.05. CLAUDE.md gotcha (2): a grasped cube's angular velocity is ~98% "
+       "contact-solver noise (reads ~22 rad/s while the cube visibly rotates ~0.45 rad/s) — this "
+       "term faithfully reproduces that mistake."),
 
     _t("Ramp", [
             Param("weight", "float", 8.0, "peak reward at cap"),
@@ -401,10 +402,10 @@ TERMS = dict([
         ],
        "`weight * (prev_measure - measure) * gate`, then `prev_measure <- measure`. The ONLY "
        "genuinely stateful term in the corpus: move_to_target (weight 5.0) and move_over_bin "
-       "(weight 10.0, over `object_to_goal_xy_plus_z` — an L1 composite, not a 3D norm; a norm "
-       "substitute changes the gradient). Partial-reset rule the framework must own: seed ONLY the "
-       "resetting rows' buffer entries — seeding all rows erases in-flight potential and injects a "
-       "spurious one-step spike into every running env.",
+       "(weight 10.0, over `object_to_goal_xy_plus_z` — see that measure's L1-vs-norm note). "
+       "Partial-reset rule the framework must own: seed ONLY the resetting rows' buffer entries — "
+       "seeding all rows erases in-flight potential and injects a spurious one-step spike into "
+       "every running env.",
        stateful=True),
 
     _t("RewardScale", [
@@ -444,14 +445,19 @@ CHASSIS = {
             "DistancePull": _row(
                 weight=1.0, measure="tcp_to_object", kernel="neg_linear",
                 why="reach's whole dense signal is `reward = -tcp_to_object` — neg_linear at "
-                    "weight 1.0, no curvature yet (reach_env.py:96)."),
+                    "weight 1.0, no curvature yet."),
             "SuccessBonus": _row(
                 value=9.0, mode="add",
                 why="terminal +9.0, the 'avg reward / 9' dashboard convention shared across "
-                    "primitives so runs stay comparable on one scale (reach_env.py:97-99)."),
+                    "primitives so runs stay comparable on one scale."),
             "ActionPenalty": _row(
                 weight=0.001, measure="action_norm",
-                why="identical 0.001/l2 in all 15 audited primitives."),
+                why="same 0.001/l2 in all 15 audited primitives."),
+            "RewardScale": _row(
+                divisor=12.0, unnormalized=False,
+                why="inherited 12.0 (see RewardScale term above): reach/sphere_reach never "
+                    "override it, but this chassis' own max is ~9, not 12 — kept at 12.0 here only "
+                    "to match the deployed lineage, not to copy onto a new chassis."),
         },
     ),
     "close_and_hold": Chassis(
@@ -463,18 +469,21 @@ CHASSIS = {
             "DistancePull": _row(
                 weight=1.0, measure="tcp_to_object", kernel="neg_linear",
                 why="kept from approach — grab starts ~3cm from the cube and still needs the "
-                    "gradient while closing (grab_env.py:126-127)."),
+                    "gradient while closing."),
             "PredicateBonus": _row(
                 weight=3.0, predicate="grasped",
                 why="paid EVERY step held (not just on first contact) so the policy is rewarded for "
-                    "SUSTAINING the grip through the frozen null-hold — 3x the raw distance term "
-                    "(grab_env.py:128-131)."),
+                    "SUSTAINING the grip through the frozen null-hold — 3x the raw distance term."),
             "SuccessBonus": _row(
                 value=9.0, mode="add",
-                why="terminal +9.0 once the grip survives HOLD_K frozen steps "
-                    "(Contract.grab().execution.hold_steps) (grab_env.py:132-133)."),
+                why="terminal +9.0 once the grip survives HOLD_K frozen steps."),
             "ActionPenalty": _row(
                 weight=0.001, measure="action_norm", why="same 0.001/l2 as every other primitive."),
+            "RewardScale": _row(
+                divisor=12.0, unnormalized=False,
+                why="inherited 12.0 (see RewardScale term above): grab/sphere_grab never override "
+                    "it; the sustained hold reward (~3) sits well under 12 — the divisor fits only "
+                    "the success-step peak, not the signal dominating the episode."),
         },
     ),
     "hold_and_ramp": Chassis(
@@ -486,30 +495,33 @@ CHASSIS = {
             "PredicateBonus": _row(
                 weight=1.0, predicate="grasped",
                 why="keep the cube grasped through the ascent — releasing for a split second cuts "
-                    "the lift-progress signal entirely (lift_env.py:83-85)."),
+                    "the lift-progress signal entirely."),
             "Ramp": _row(
                 weight=8.0, measure="object_z", floor=0.0, cap=0.06, normalize=True, gate="grasped",
                 why="lift/sphere_lift: `8.0*clamp(cube_z/0.06,0,1)`, normalized so weight IS the max "
                     "(8.0). compact_grasp needs normalize=False, floor=cube_half_sizes (per-env), "
                     "cap=floor+0.04 instead — `10.0*clamp(cube_z-half,0,0.04)`, max 0.4. This "
                     "default's normalize=True on compact_grasp would train a lift not a seated grip, "
-                    "25x too large (compact_grasp_env.py:217-218)."),
+                    "25x too large."),
             "SuccessBonus": _row(
-                value=9.0, mode="add", why="terminal +9.0, dashboard convention (lift_env.py:90-91)."),
+                value=9.0, mode="add", why="terminal +9.0, dashboard convention."),
             "ActionPenalty": _row(weight=0.001, measure="action_norm", why="same 0.001/l2."),
+            "RewardScale": _row(
+                divisor=12.0, unnormalized=False,
+                why="inherited 12.0 (see RewardScale term above): lift/sphere_lift never override "
+                    "it, but this chassis' own max is ~18, not 12 — trains at ~2/3 scale. "
+                    "compact_grasp's Ramp caps at 0.4 not 8.0, so recompute per instance."),
         },
     ),
     "carry": Chassis(
         name="carry",
         doc="move_to_3d, descend_to_target, descend_stack, place_into_bin (4 primitives, IDENTICAL "
             "weights per the audit). Held cube travels to a hover point over the goal without "
-            "releasing; the richest chassis, 9 rows. Sourced from descend_to_target/descend_env.py, "
-            "the chassis' most heavily-commented instance.",
+            "releasing; the richest chassis, 9 rows. Sourced from descend_to_target/descend_env.py.",
         defaults={
             "PredicateBonus": _row(
                 weight=1.0, predicate="grasped",
-                why="hold-on baseline — never drop the cube, release is a separate primitive "
-                    "(descend_env.py:190-191)."),
+                why="hold-on baseline — never drop the cube, release is a separate primitive."),
             "DistancePull_xy": _row(
                 weight=1.5, measure="object_to_goal_xy", kernel="one_minus_tanh", k=4.0,
                 gate="grasped",
@@ -521,8 +533,7 @@ CHASSIS = {
                 why="descend to a HOVER just above the seat — attractor peaks at setpoint=_HOVER "
                     "(0.015), NEVER at the seat (setpoint=0). The old zero-setpoint version pulled "
                     "the cube INTO the platform: 16/16 grasp losses broke while LOW, fixed "
-                    "2026-06-04. Peaking at contact is a recorded failure, not a free parameter "
-                    "(descend_env.py:82-90,194-199)."),
+                    "2026-06-04. Peaking at contact is a recorded failure, not a free parameter."),
             "HingePenalty_crush": _row(
                 weight=3.0, measure="height_above_seat", threshold=0.0, side="below", gate="grasped",
                 why="pressing the cube BELOW resting height destabilizes the grasp — the other half "
@@ -533,7 +544,7 @@ CHASSIS = {
                 why="keep the gripper CLOSED while held — grip_q drifted -0.73 to -0.44 over the "
                     "descent before this term existed."),
             "VelocityPenalty": _row(
-                weight=0.3, linear_weight=0.3, angular_weight=0.05,
+                linear_weight=0.3, angular_weight=0.05,
                 why="anti-fling on the way down. Identical 0.3/0.05 across all 4 members; angular "
                     "knowingly shapes on the ~98% contact-solver noise, CLAUDE.md gotcha (2)."),
             "PredicateBonus_drop": _row(
@@ -555,42 +566,41 @@ CHASSIS = {
         name="carry_with_potential",
         doc="move_to_target, move_over_bin (2 primitives). Adds a potential-based progress term and "
             "a LATCHED success — once the cube has ever reached the zone, success stays true, "
-            "handing the deceleration/stop phase to the next primitive. Sourced from "
-            "move_to_target_env.py.",
+            "handing the deceleration/stop phase to the next primitive.",
         defaults={
             "PredicateBonus_hold": _row(
                 weight=0.3, predicate="grasped",
                 why="small constant baseline, deliberately weak so it doesn't crowd out the "
-                    "distance-shaped terms (move_to_target_env.py:194-196)."),
+                    "distance-shaped terms."),
             "PredicateBonus_hold_high": _row(
-                weight=0.3, predicate="grasped_and_high",
+                weight=0.3, predicate="and_(grasped, above_z(z=0.06))",
                 why="second half of the baseline, gated on carry altitude (MIN_CARRY_Z=0.06) so "
-                    "descending onto the platform early never collects it (move_to_target_env.py:49)."),
+                    "descending onto the platform early never collects it."),
             "DistancePull": _row(
                 weight=1.5, measure="object_to_goal_xy", kernel="one_minus_tanh", k=3.0,
-                gate="grasped_and_high",
+                gate="and_(grasped, above_z(z=0.06))",
                 why="gives an early policy a gradient toward the target instead of just holding the "
                     "cube up. Weight 1.5 is chosen to stay BELOW the 5.0 arrival bonus "
                     "(PredicateBonus_arrived) so there's still a strong commitment signal — crossing "
                     "into the zone beats hovering near it. The previous fully-sparse design (no "
-                    "proximity term) cost 178M from-scratch steps at 0% success "
-                    "(move_to_target_env.py:198-206)."),
+                    "proximity term) cost 178M from-scratch steps at 0% success."),
             "ProgressPotential": _row(
                 weight=5.0, measure="object_to_goal_xy", gate="grasped",
                 why="potential-based per-step DECREASE in distance, telescoping to ~1.5 max per "
                     "episode. Assigned post-reward, seeded per env_idx at reset so step 0 always "
                     "scores zero progress — reordering this changes the reward."),
             "PredicateBonus_arrived": _row(
-                weight=5.0, predicate="at_target_xy_grasped_high",
+                weight=5.0,
+                predicate="and_(grasped, above_z(z=0.06), within_radius(anchor=target_pos, "
+                          "radius_expr=0.05))",
                 why="sharp step at the tolerance boundary — d=5.1cm pays ~1.4, d=4.9cm pays ~5.4. "
                     "The jump IS the commitment signal, paid only for crossing in "
-                    "(move_to_target_env.py:214-218)."),
+                    "(tolerance MOVE_TOLERANCE=0.05)."),
             "SuccessBonus": _row(
                 value=50.0, mode="add", predicate_ref="latched",
                 why="terminal +50 once the LATCHED success first fires (has_arrived, "
                     "OR-accumulated). Smaller than an earlier +200-with-strict-streak design because "
-                    "this criterion is easier to satisfy: one frame at target is enough "
-                    "(move_to_target_env.py:223-226)."),
+                    "this criterion is easier to satisfy: one frame at target is enough."),
             "ActionPenalty": _row(weight=0.001, measure="action_norm", why="same 0.001/l2, kept tiny."),
         },
     ),
@@ -600,13 +610,13 @@ CHASSIS = {
             "gravity. Shortest chassis in the corpus.",
         defaults={
             "PredicateBonus": _row(
-                weight=5.0, predicate="released",
-                why="'the entire teaching signal' per source comment — paid the moment the gripper "
-                    "opens enough that contact is lost (release_env.py:76-80)."),
+                weight=5.0, predicate="not_grasped",
+                why="'the entire teaching signal' per source comment, paid the moment the gripper "
+                    "opens enough that contact is lost. `released = ~is_grasping` in source — "
+                    "exactly `not_grasped`."),
             "SuccessBonus": _row(
                 value=9.0, mode="add",
-                why="terminal +9.0 once release survives a 2-step not-grasping streak "
-                    "(release_env.py:81-82)."),
+                why="terminal +9.0 once release survives a 2-step not-grasping streak."),
             "ActionPenalty": _row(weight=0.001, measure="action_norm", why="same 0.001/l2."),
         },
     ),
@@ -619,12 +629,23 @@ assert len(CHASSIS) == 6, "6 chassis cover all 15 audited primitives — a 7th n
 
 def _fmt_param(p: Param) -> str:
     req = ", required" if p.required else f", default={p.default!r}"
-    return f"  - `{p.name}` ({p.type}{req}): {p.doc}" if p.doc else f"  - `{p.name}` ({p.type}{req})"
+    ch = f", choices={list(p.choices)}" if p.choices else ""
+    return f"  - `{p.name}` ({p.type}{req}{ch}): {p.doc}" if p.doc else f"  - `{p.name}` ({p.type}{req}{ch})"
 
 
 def _fmt_row(term_name: str, row: dict) -> str:
     fields = ", ".join(f"{k}={v!r}" for k, v in row.items() if k != "why")
     return f"- **{term_name}** {{{fields}}}\n  why: {row['why']}"
+
+
+def base_term(term_name: str) -> str:
+    """A chassis row key may carry a disambiguating suffix (e.g. "DistancePull_xy") when a chassis
+    instantiates the same term twice with different measures — the suffix is a row label, not a
+    second term type. Strip it back to the real TERMS key. Shared by the renderer and by
+    test_vocab.py's declared-params check, so the two can't drift apart on what "the term" means.
+    """
+    head = term_name.split("_")[0]
+    return head if head in TERMS else term_name
 
 
 def vocab_document() -> str:
@@ -680,18 +701,18 @@ def vocab_document() -> str:
         sig = f"{name}({params})" if params else name
         add(f"- `{sig}` — {pred.doc}")
     add("")
+    add("Composing predicates: `predicate`/`gate` accept a bare name above, or a nested call over "
+        "EXISTING names — never invent a compound name. Example: `and_(grasped, above_z(z=0.06), "
+        "within_radius(anchor=target_pos, radius_expr=0.05))`.")
+    add("")
 
-    add("## Chassis (weight presets — start here, deviate with a stated reason)")
+    add("## Chassis (weight presets — start here)")
     add("")
     for name, chassis in CHASSIS.items():
         add(f"### {name}")
         add(chassis.doc)
         for term_name, row in chassis.defaults.items():
-            # term_name may carry a disambiguating suffix (e.g. "DistancePull_xy") when a chassis
-            # instantiates the same term twice with different measures — the suffix is a row label,
-            # not a second term type.
-            base_term = term_name.split("_")[0] if term_name.split("_")[0] in TERMS else term_name
-            add(_fmt_row(base_term, row))
+            add(_fmt_row(base_term(term_name), row))
         add("")
 
     add("## Constraints `compile()` checks before any GPU run")
