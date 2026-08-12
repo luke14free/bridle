@@ -90,13 +90,22 @@ def cmd_relaunch(a):
     # bridle declares `dependencies = []`; Store._load_text already does the lazy `import yaml`
     # with a json fallback, so use it rather than adding a third YAML-reading path to a codebase
     # whose thesis is that two records of one fact is the disease.
-    import shutil
-
     from bridle.store import Store
     from bridle.adapters.preflight import collect, readable_env
     from bridle.lineage import NAMESPACES, EmptyDiff, UnknownOverride, format_diff
     from bridle.preflight import DYNAMIC, evaluate, format_effective, format_failures
-    from bridle.relaunch import build_plan, install_and_start, run_dir_for, systemd_unit
+    from bridle.relaunch import (
+        WarmStartRefused, build_plan, install_and_start, nonempty_run_dir_message, run_dir_for,
+        seed_warm_start, systemd_unit, vacuous_preflight_message,
+    )
+
+    # Validated UP FRONT, before any manifest/preflight work: a bogus --warm-start path used to
+    # reach `shutil.copyfile` unvalidated at the very end of this command (raising a raw traceback),
+    # or — when the preflight for this app has no DYNAMIC asserts — never get opened at all and
+    # silently seed a run that then trains from a checkpoint that never existed. Fail clean, first.
+    if a.warm_start and not os.path.isfile(a.warm_start):
+        print(f"refused: --warm-start {a.warm_start} does not exist")
+        return 1
 
     store = Store(a.store)
     manifest_path = os.path.join(os.path.expanduser(a.store), f"{a.app}.yaml")
@@ -165,7 +174,7 @@ def cmd_relaunch(a):
     # indistinguishable from six asserts having actually been checked and passed. Refuse unless the
     # operator explicitly says a vacuous preflight is acceptable.
     if not plan.asserts:
-        msg = f"PREFLIGHT VACUOUS (0 asserts) — looked at {pf_path} ({pf_source})"
+        msg = vacuous_preflight_message(plan.asserts, pf_path, pf_source)
         if not a.allow_vacuous_preflight:
             print(f"\n{msg}")
             return 1
@@ -181,10 +190,9 @@ def cmd_relaunch(a):
               "'primitives.<name>...') — refusing rather than silently skipping the "
               "non-empty-run-directory check")
         return 1
-    if os.path.isdir(run_dir) and os.listdir(run_dir) and not a.resume:
-        print(f"refused: {run_dir} already exists and is non-empty. A fresh relaunch would resume "
-              "from whatever ckpt sorts highest in there — pass --resume if that is intended, or "
-              "choose a new --exp.")
+    nonempty_msg = nonempty_run_dir_message(run_dir, a.resume)
+    if nonempty_msg:
+        print(nonempty_msg)
         return 1
 
     # Delete every namespaced variable that survived from the calling shell but is NOT part of this
@@ -215,11 +223,14 @@ def cmd_relaunch(a):
     # I2: seed the warm-start ckpt so the launcher's own resume logic (highest-numbered ckpt in
     # runs/<exp>/) actually picks it up. Without this, --warm-start's help text ("ckpt to seed and
     # to preflight against") was half true: preflight measured the warm policy, but the unit still
-    # trained from scratch.
+    # trained from scratch. F2: `seed_warm_start` refuses rather than clobbering a ckpt_1.pt that
+    # may hold real training progress; existence of `a.warm_start` itself was already checked above.
     if a.warm_start:
-        os.makedirs(run_dir, exist_ok=True)
-        seeded = os.path.join(run_dir, "ckpt_1.pt")
-        shutil.copyfile(a.warm_start, seeded)
+        try:
+            seeded = seed_warm_start(a.warm_start, run_dir, force=a.force_warm_start)
+        except WarmStartRefused as e:
+            print(str(e))
+            return 1
         print(f"seeded {seeded} from --warm-start {a.warm_start}")
 
     handle = install_and_start(f"bridle-{plan.exp}", unit_text)
@@ -364,6 +375,8 @@ def main(argv=None):
     r.add_argument("--preflight", default=None,
                    help="path to preflight.yaml; overrides the manifest's own `preflight:` key")
     r.add_argument("--warm-start", default=None, help="ckpt to seed and to preflight against")
+    r.add_argument("--force-warm-start", action="store_true",
+                   help="overwrite an existing runs/<exp>/ckpt_1.pt with --warm-start")
     r.add_argument("--from-scratch", action="store_true", help="skip asserts needing a warm start")
     r.add_argument("--allow-vacuous-preflight", action="store_true",
                    help="proceed even though the resolved preflight contributed zero asserts")

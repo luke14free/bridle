@@ -9,7 +9,10 @@ are what make the training environment DATA instead of prose.
 Run: python -m pytest bridle/tests/test_lineage.py
      PYTHONPATH=. python bridle/tests/test_lineage.py
 """
+import os
+import shutil
 import sys
+import tempfile
 
 from bridle.lineage import (
     Change, CkptPinViolation, EmptyDiff, UnknownOverride, apply_overrides, capture_env,
@@ -236,6 +239,107 @@ def run_checks():
     # here and the rest of the launcher would fall outside the quoted command
     check("the launcher's raw quote does not terminate the quoting",
           "-c 'echo hi'" not in execstart)
+
+    # ── F3: run_dir_for, the vacuous-preflight refusal, the non-empty-run-dir refusal, and
+    # --warm-start seeding — these are the refusals/resolution rules cli.cmd_relaunch delegates to
+    # bridle.relaunch precisely so they are unit-testable without a simulator or a real run dir. ──
+    from bridle.relaunch import (
+        WarmStartRefused, nonempty_run_dir_message, run_dir_for, seed_warm_start,
+        vacuous_preflight_message,
+    )
+
+    # -- run_dir_for --
+    check("run_dir_for derives primitives/<prim>/runs/<exp> from the preflight MODULE, not the app "
+          "name (apps are not named after the primitive they train, e.g. place_coord_v3 trains "
+          "descend_to_target)",
+          run_dir_for("primitives.descend_to_target.descend_env", "tol12", "/home/luca/lego-arm")
+          == "/home/luca/lego-arm/primitives/descend_to_target/runs/tol12")
+    check("run_dir_for refuses a module not shaped like primitives.<name>...",
+          run_dir_for("not_primitives.x", "tol12", "/home/luca/lego-arm") is None)
+    check("run_dir_for refuses a bare 'primitives' with nothing after it",
+          run_dir_for("primitives", "tol12", "/home/luca/lego-arm") is None)
+    check("run_dir_for refuses primitives. with an empty second segment",
+          run_dir_for("primitives.", "tol12", "/home/luca/lego-arm") is None)
+
+    # -- the vacuous-preflight refusal (C1(b)) --
+    check("a non-empty asserts tuple is never vacuous",
+          vacuous_preflight_message(plan.asserts, "x", "y") is None)
+    vac_msg = vacuous_preflight_message((), "/path/to/preflight.yaml", "guessed from the app name")
+    check("an empty asserts tuple produces the VACUOUS message naming the path and source",
+          vac_msg is not None and "PREFLIGHT VACUOUS" in vac_msg
+          and "/path/to/preflight.yaml" in vac_msg and "guessed from the app name" in vac_msg)
+
+    # -- the non-empty-run-dir refusal (I3) — real temp directories, never a real runs/<exp> --
+    tmp = tempfile.mkdtemp(prefix="bridle_test_rundir_")
+    try:
+        empty_dir = os.path.join(tmp, "empty")
+        os.makedirs(empty_dir)
+        check("an empty run dir is never refused",
+              nonempty_run_dir_message(empty_dir, resume=False) is None)
+        check("a run dir that does not exist yet is never refused",
+              nonempty_run_dir_message(os.path.join(tmp, "does-not-exist"), resume=False) is None)
+
+        nonempty_dir = os.path.join(tmp, "nonempty")
+        os.makedirs(nonempty_dir)
+        with open(os.path.join(nonempty_dir, "ckpt_1.pt"), "w") as f:
+            f.write("x")
+        msg = nonempty_run_dir_message(nonempty_dir, resume=False)
+        check("a non-empty run dir without --resume is refused, naming the directory",
+              msg is not None and nonempty_dir in msg)
+        check("--resume clears the non-empty-run-dir refusal",
+              nonempty_run_dir_message(nonempty_dir, resume=True) is None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # -- --warm-start seeding (I2/F2): a bogus path is refused clean, and an existing ckpt_1.pt is
+    # never silently clobbered — real temp directories, never a real runs/<exp> --
+    tmp2 = tempfile.mkdtemp(prefix="bridle_test_warmstart_")
+    try:
+        src = os.path.join(tmp2, "source_ckpt.pt")
+        with open(src, "w") as f:
+            f.write("real weights")
+        run_dir = os.path.join(tmp2, "runs", "exp1")
+
+        missing = os.path.join(tmp2, "nope.pt")
+        no_path_msg = None
+        try:
+            seed_warm_start(missing, run_dir)
+        except WarmStartRefused as e:
+            no_path_msg = str(e)
+        check("a nonexistent --warm-start path is refused", no_path_msg is not None)
+        check("the refusal names the missing path", missing in (no_path_msg or ""))
+        check("seed_warm_start raises WarmStartRefused, not a raw FileNotFoundError "
+              "(shutil.copyfile's old, uncaught failure mode)",
+              raises(WarmStartRefused, seed_warm_start, missing, run_dir))
+
+        dest = seed_warm_start(src, run_dir)
+        check("seed_warm_start copies to run_dir/ckpt_1.pt",
+              dest == os.path.join(run_dir, "ckpt_1.pt") and os.path.isfile(dest))
+        check("the seeded file's contents match the source", open(dest).read() == "real weights")
+
+        # a second, different ckpt seeded into the SAME run_dir must not clobber the first
+        src2 = os.path.join(tmp2, "source2.pt")
+        with open(src2, "w") as f:
+            f.write("different weights")
+        clobber_msg = None
+        try:
+            seed_warm_start(src2, run_dir)
+        except WarmStartRefused as e:
+            clobber_msg = str(e)
+        check("re-seeding into an existing ckpt_1.pt without --force-warm-start is refused",
+              clobber_msg is not None)
+        check("the clobber refusal names the file that would have been overwritten",
+              dest in (clobber_msg or ""))
+        check("the clobber refusal names the flag needed to proceed",
+              "--force-warm-start" in (clobber_msg or ""))
+        check("the refused re-seed left the original checkpoint untouched",
+              open(dest).read() == "real weights")
+
+        dest2 = seed_warm_start(src2, run_dir, force=True)
+        check("force=True (--force-warm-start) allows the overwrite",
+              dest2 == dest and open(dest).read() == "different weights")
+    finally:
+        shutil.rmtree(tmp2, ignore_errors=True)
 
 
 def test_bridle():

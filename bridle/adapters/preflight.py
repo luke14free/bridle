@@ -8,7 +8,7 @@ import ast
 import importlib
 import os
 
-from bridle.preflight import DYNAMIC, STATIC
+from bridle.preflight import DYNAMIC, NOT_MEASURED, STATIC
 from bridle.preflight import evaluate as _evaluate
 
 
@@ -197,9 +197,25 @@ def dynamic_metrics(env_id: str, module: str, ckpt=None, envs: int = 64, steps: 
 
 
 def collect(asserts, env_id: str, module: str, ckpt=None, envs: int = 64, steps: int = 64,
-           from_scratch: bool = False, evaluate=_evaluate) -> dict:
+           from_scratch: bool = False, evaluate=_evaluate, measure=dynamic_metrics,
+           stop_on_static_failure: bool = True) -> dict:
     """Observed values for every assert. Static first: if static fails there is no point paying for
-    the simulator, so a failing static tier short-circuits before `dynamic_metrics` ever builds one.
+    the simulator, so by default a failing static tier short-circuits before `dynamic_metrics` ever
+    builds one.
+
+    THE SHORT-CIRCUIT MUST NOT MASQUERADE AS A MEASUREMENT. Skipping the dynamic tier used to leave
+    every dynamic path simply absent from `values` — `evaluate` then reported it as `observed=None`,
+    which `format_failures` renders identically to a path that WAS measured and came back missing.
+    A reader could not tell "we checked and it failed" from "we never checked", which is the same
+    ambiguity this whole module exists to remove. So a short-circuit now explicitly marks every
+    skipped DYNAMIC path `bridle.preflight.NOT_MEASURED` (a distinct sentinel, not absence) — it
+    still fails `evaluate` (unmeasured is not a pass) but renders its own honest line.
+
+    `stop_on_static_failure=True` (the default) is right for `relaunch`: a static failure already
+    dooms the run, and skipping a ~30s simulator build for a run that cannot launch is a real saving.
+    Pass `stop_on_static_failure=False` when the point of the run IS the measurement — e.g.
+    `scripts/preflight_regression.sh` needs the real `is_grasped_at_end` printed in the arm that
+    fails static too, or the regression's headline number never appears.
 
     This module MEASURES; `bridle.preflight` DECIDES (module docstring). Judging "did static fail"
     is a decision, so it is not reimplemented here — `evaluate` is injected (defaulting to the real
@@ -207,12 +223,16 @@ def collect(asserts, env_id: str, module: str, ckpt=None, envs: int = 64, steps:
     `bridle.cli.cmd_relaunch` uses for the final pass/fail call. A callback was the other option
     considered; a plain function reference was simpler because `evaluate`'s signature already is
     the callback this needs (`asserts, values, from_scratch=` -> failures), so there was nothing
-    left to wrap.
+    left to wrap. `measure` is injected the same way (defaulting to the real `dynamic_metrics`) so
+    tests can exercise the short-circuit with a fake measurement and no simulator.
     """
     static_asserts = [a for a in asserts if a.tier == STATIC]
+    dynamic_asserts = [a for a in asserts if a.tier == DYNAMIC]
     values = static_values([a.path for a in static_asserts])
-    if any(a.tier == DYNAMIC for a in asserts):
-        if static_asserts and evaluate(static_asserts, values, from_scratch=from_scratch):
+    if dynamic_asserts:
+        if (stop_on_static_failure and static_asserts
+                and evaluate(static_asserts, values, from_scratch=from_scratch)):
+            values.update({a.path: NOT_MEASURED for a in dynamic_asserts})
             return values
-        values.update(dynamic_metrics(env_id, module, ckpt, envs, steps))
+        values.update(measure(env_id, module, ckpt, envs, steps))
     return values

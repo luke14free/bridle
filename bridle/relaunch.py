@@ -12,11 +12,17 @@ bridle does NOT import lego-arm to do this. It reads the app manifest as data an
 """
 import os
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 
 from bridle.lineage import apply_overrides, format_diff, require_change, require_known
 from bridle.preflight import DYNAMIC, STATIC, Assert, merge
+
+
+class WarmStartRefused(Exception):
+    """`--warm-start` points nowhere, or seeding it would silently clobber a checkpoint already on
+    disk. See `seed_warm_start`."""
 
 
 @dataclass(frozen=True)
@@ -96,6 +102,56 @@ def run_dir_for(module: str, exp: str, cwd: str):
     if len(parts) < 2 or parts[0] != "primitives" or not parts[1]:
         return None
     return os.path.join(cwd, "primitives", parts[1], "runs", exp)
+
+
+def vacuous_preflight_message(asserts, pf_path: str, pf_source: str):
+    """`None` if `asserts` measured something; otherwise the message a zero-assert preflight must
+    print. A caller must never let this render as `preflight OK` — to an automated reader that is
+    indistinguishable from every assert having actually been checked and passed (C1(b))."""
+    if asserts:
+        return None
+    return f"PREFLIGHT VACUOUS (0 asserts) — looked at {pf_path} ({pf_source})"
+
+
+def nonempty_run_dir_message(run_dir: str, resume: bool):
+    """`None` if it is safe to write into `run_dir`; otherwise the refusal message (I3). A fresh
+    relaunch into a directory some earlier lineage already populated would resume from whatever ckpt
+    sorts highest in there — checkpoint contamination, not a fresh run — unless the operator opts in
+    with `--resume`."""
+    if os.path.isdir(run_dir) and os.listdir(run_dir) and not resume:
+        return (f"refused: {run_dir} already exists and is non-empty. A fresh relaunch would "
+                "resume from whatever ckpt sorts highest in there — pass --resume if that is "
+                "intended, or choose a new --exp.")
+    return None
+
+
+def seed_warm_start(warm_start: str, run_dir: str, force: bool = False) -> str:
+    """Copy `warm_start` into `run_dir`/ckpt_1.pt so the launcher's own resume logic (whichever ckpt
+    sorts highest by number in `runs/<exp>/`) actually picks it up (I2).
+
+    Refuses (`WarmStartRefused`) instead of either of the two ways this used to fail open:
+      - `warm_start` does not exist: an unconditional `shutil.copyfile` raised a raw, uncaught
+        `FileNotFoundError` — the exact class of failure the refusal work exists to end. When the
+        preflight for this run carries no DYNAMIC asserts, `collect` never opens the path either, so
+        nothing catches a bogus `--warm-start` before it reaches this copy.
+      - `run_dir`/ckpt_1.pt already exists: an unconditional copy silently overwrote it. That file
+        can hold real training progress from a `--resume`'d run — clobbering it without a flag is
+        the same silent-corruption class this branch exists to prevent. `force=True` (the CLI's
+        `--force-warm-start`) is the explicit opt-in to discard it.
+
+    Returns the destination path on success.
+    """
+    if not os.path.isfile(warm_start):
+        raise WarmStartRefused(f"refused: --warm-start {warm_start} does not exist")
+    dest = os.path.join(run_dir, "ckpt_1.pt")
+    if os.path.isfile(dest) and not force:
+        raise WarmStartRefused(
+            f"refused: {dest} already exists — refusing to overwrite it with --warm-start "
+            f"{warm_start} (it may hold real training progress). Pass --force-warm-start if you "
+            "intend to discard it and re-seed from scratch.")
+    os.makedirs(run_dir, exist_ok=True)
+    shutil.copyfile(warm_start, dest)
+    return dest
 
 
 def systemd_unit(name: str, cmd: str, env: dict, cwd: str) -> str:

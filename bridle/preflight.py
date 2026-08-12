@@ -132,6 +132,51 @@ def merge(kind, authored) -> tuple:
     return tuple(out)
 
 
+class _NotMeasured:
+    """Sentinel for a DYNAMIC assert `collect` chose not to measure because the STATIC tier already
+    failed (the default, GPU-saving short-circuit — see `bridle.adapters.preflight.collect`).
+
+    Distinct from `None` (a path that WAS measured and the result is genuinely absent — usually a
+    typo'd assert name) and distinct from the adapter's own `_Unresolved` (a STATIC path that failed
+    to import). An unmeasured assert must still FAIL — unmeasured is not a pass — so `holds()` must
+    come out False for every bound shape (expect/min/max), the same trick `_Unresolved` uses: this
+    is not `None` so it skips the `value is None` fast-fail, and instead forces `==` False and every
+    ordering comparison True, which fails a min-floor, a max-ceiling, and an expect-equality alike.
+    `format_failures` then renders this sentinel's repr instead of `observed missing` or a raw
+    number, so the failure reads as "we never checked", not "we checked and it failed" — collapsing
+    those two is exactly the ambiguity F1 exists to remove.
+    """
+
+    def __repr__(self):
+        return "not measured (static tier failed first)"
+
+    __str__ = __repr__
+
+    def __eq__(self, other):
+        return False
+
+    def __hash__(self):
+        return id(self)
+
+    def __lt__(self, other):
+        return True
+
+    def __gt__(self, other):
+        return True
+
+    def __le__(self, other):
+        return True
+
+    def __ge__(self, other):
+        return True
+
+
+#: Returned by `collect` for every DYNAMIC assert path it chose not to measure. Never returned for
+#: a path that was measured and came back missing (that stays `None`) — see `_NotMeasured`'s
+#: docstring for why the distinction matters.
+NOT_MEASURED = _NotMeasured()
+
+
 @dataclass(frozen=True)
 class Failure:
     assertion: Assert
@@ -151,9 +196,17 @@ def evaluate(asserts, values: dict, from_scratch: bool = False) -> list:
 
 
 def format_effective(asserts) -> str:
-    """The merged set with provenance — printed before every launch so nothing is invisible."""
+    """The merged set with provenance — printed before every launch so nothing is invisible.
+
+    An assert with `needs="warm_start"` is marked inline: it is silently skipped under
+    `--from-scratch` (`evaluate`'s `from_scratch` branch), and a reader looking at this list ahead
+    of a from-scratch launch has to be able to tell which lines will not actually be checked."""
     w = max((len(a.tier) for a in asserts), default=7)
-    return "\n".join(f"  {a.tier:<{w}}  {a.describe():<52}  ({a.source})" for a in asserts)
+    lines = []
+    for a in asserts:
+        needs = f"  [needs={a.needs}, skipped by --from-scratch]" if a.needs else ""
+        lines.append(f"  {a.tier:<{w}}  {a.describe():<52}  ({a.source}){needs}")
+    return "\n".join(lines)
 
 
 #: One line of diagnosis per assert we have actually seen fail, with the measurement behind it.
@@ -173,7 +226,12 @@ HINTS = {
 def format_failures(failures) -> str:
     lines = ["PREFLIGHT FAILED"]
     for f in failures:
-        obs = "missing" if f.observed is None else f.observed
+        if f.observed is NOT_MEASURED:
+            obs = NOT_MEASURED          # str()s to "not measured (static tier failed first)"
+        elif f.observed is None:
+            obs = "missing"
+        else:
+            obs = f.observed
         lines.append(f"  [{f.assertion.tier}] {f.assertion.describe()}, observed {obs}")
         hint = HINTS.get(f.assertion.path)
         if hint:
