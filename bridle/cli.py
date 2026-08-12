@@ -3,6 +3,8 @@
     bridle tui --model local:qwen3-32b        # agent TUI + simulator window
     bridle skills                             # what runs on this rig, and what doesn't
     bridle plan descend_to_target             # why a skill needs adapting or rebuilding
+    bridle skill vocab                        # the authorable reward surface (the prompt payload)
+    bridle skill check primitives/x/skill.yaml   # schema -> compile, before a GPU-second is spent
 
 The TUI and the viewer come up together: the terminal is where you talk to the agent, the browser
 window is where you watch the robot. Neither replaces the other.
@@ -16,6 +18,8 @@ import argparse
 import importlib
 import os
 import sys
+import textwrap
+import warnings
 
 from bridle.agent import AgentSession
 from bridle.llm import PRESETS, from_spec
@@ -342,6 +346,253 @@ def cmd_lineage(a):
     return 1 if bad else 0
 
 
+# ── bridle skill: the three things the author of a skill.yaml needs ─────────────────────────────
+# THE AUTHOR IS A LOCAL 27-30B MODEL, so these three outputs are its entire API surface: the
+# vocabulary it writes against, the refusal when it gets one wrong, and the resolved plan showing
+# what it actually asked for. Measured stakes: one-shot authoring is 58.3% +/- 47.3%, refinement
+# against typed feedback is 97.6%, and stripping the typed content of that feedback collapses it to
+# 11.5%. A refusal that names no path, and a plan that hides the defaults the chassis supplied, are
+# both the stripped condition.
+
+#: `--terminate-on-success` is tri-state and `unknown` is a real answer, not a missing one: it
+#: selects the CONSERVATIVE branch of compile's horizon-integrated warning rather than asserting
+#: something about the env. Guessing here would put a number in a warning that nobody measured.
+_TERMINATION = {"yes": True, "no": False, "unknown": None}
+
+_MISSING = object()
+
+
+def _skill_document(a):
+    """`(doc, None)` or `(None, refusal text)`.
+
+    YAML is read through `Store._load_text` — the lazy `import yaml` with a json fallback — because
+    `bridle` declares `dependencies = []` and a second YAML-reading path in this repo would be two
+    records of one fact. `Store(a.store)` is constructed only for that loader; its root is the app
+    store and is not otherwise touched here.
+    """
+    if not os.path.isfile(a.file):
+        return None, f"no skill document at {a.file}"
+    try:
+        text = open(a.file).read()
+    except OSError as e:
+        return None, f"{a.file} could not be read: {e}"
+    try:
+        doc = Store(a.store)._load_text(text)
+    except Exception as e:
+        return None, (f"{a.file} does not parse as YAML (or as JSON, when PyYAML is absent): "
+                      f"{type(e).__name__}: {e}")
+    if doc is None:
+        return None, f"{a.file} parsed to nothing — the file is empty, or entirely comments"
+    if not isinstance(doc, dict):
+        return None, (f"{a.file} parsed to a {type(doc).__name__}, but a skill document is a "
+                      f"mapping of top-level fields (name, kind, contract, env_id, scene, reward, "
+                      f"success)")
+    return doc, None
+
+
+def _wrap(text, indent):
+    return textwrap.fill(text, width=98, initial_indent=indent, subsequent_indent=indent,
+                         break_long_words=False, break_on_hyphens=False)
+
+
+def _skill_refusal(a, stage, error):
+    """One refusal, in the form the author can act on without reading any Python: the stage that
+    said no, the dotted path, the legal set (carried inside the message by `SpecError`/`CompileError`
+    themselves), and the nearest legal spelling on its own line."""
+    lines = [f"skill {a.skill_cmd} FAILED — {stage}", "", _wrap(str(error), "  "), "",
+             f"  path: {error.path}"]
+    if getattr(error, "suggestion", None) is not None:
+        lines.append(f"  fix:  the nearest legal spelling is {error.suggestion!r}")
+    lines += ["", _wrap(
+        "This is the FIRST refusal only. The checks are ordered and a later one may be reading a "
+        "value this one rejected, so fix this path and run the command again rather than guessing "
+        "at what else might be wrong.", "  ")]
+    return "\n".join(lines)
+
+
+def _skill_warnings(plan):
+    """`RewardPlan.warnings` printed in full, always.
+
+    compile_spec also emits each note through the `warnings` module; `cmd_skill` silences that
+    channel and prints the field instead, because `UserWarning: ... (compile.py:704)` buries the
+    text in interpreter furniture and prints once per process. These notes carry the horizon-
+    integrated ratio and the "flooding check INCOMPLETE ... this is not a pass" line — a warning
+    computed and never shown is the same as not computing it.
+    """
+    if not plan.warnings:
+        return "\nwarnings: none"
+    out = [f"\nwarnings ({len(plan.warnings)}) — computed and printed, never dropped:"]
+    for i, note in enumerate(plan.warnings, 1):
+        out.append(textwrap.fill(note, width=98, initial_indent=f"  {i}. ",
+                                 subsequent_indent="     ", break_long_words=False,
+                                 break_on_hyphens=False))
+    return "\n".join(out)
+
+
+def _provenance(name, authored, inherited, chassis):
+    """Where this parameter's value came from: the author, the chassis, or the term's own default.
+
+    Recomputed with `spec.py`'s OWN `_chassis_defaults_for` rather than a second reimplementation of
+    the inheritance rule — a chassis may instantiate one term twice under suffixed keys (carry has
+    `DistancePull_xy` at k=4.0 and `DistancePull_height` at k=6.0) and a provenance report that
+    disagreed with the parser about which row was inherited would be worse than none.
+    """
+    if name in authored:
+        return "authored", None
+    if inherited.get(name) is not None:
+        return f"chassis {chassis.name!r} default", inherited.get("why")
+    return "term default", None
+
+
+def _skill_row(index, raw, row, op, chassis, terms, chassis_defaults_for):
+    out = []
+    label = row.term or ("expr" if row.expr is not None else "custom")
+    scope = f"/{op.scope}" if op.scope else ""
+    out.append(f"  [{index}] {op.kind}{scope:<12} {label}")
+    out.append(_wrap(f"why: {row.why}", "        "))
+
+    if row.term is None:
+        # Tiers 2 and 3. The custom row is printed with its opacity stated: the fingerprint records
+        # that part of this reward cannot be read from the document.
+        if row.expr is not None:
+            out.append(f"        expr     = {op.params['expr'].source!r}   authored")
+            bindings = dict(op.params["bindings"])
+            if bindings:
+                out.append(f"        bindings = {bindings}   bound from `params:`")
+        else:
+            out.append(f"        custom   = {op.params['target']!r}   authored — TIER 3, opaque: "
+                       f"only the adapter can call it, and nothing here can check what it returns")
+        return out
+
+    authored = {k: v for k, v in raw.items() if k not in ("term", "why") and v is not None}
+    inherited, _unchosen = chassis_defaults_for(chassis, row.term, authored)
+    said_why = False
+    for param in terms[row.term].params:
+        if param.name not in row.params:
+            continue
+        spec_value = row.params[param.name]
+        op_value = op.params.get(param.name, _MISSING)
+        value = spec_value if op_value is _MISSING else op_value
+        source, why = _provenance(param.name, authored, inherited, chassis)
+        note = ""
+        if isinstance(spec_value, str) and spec_value.startswith("params."):
+            note = f" (written `{spec_value}`)"     # the bound number AND what the author typed
+        if op_value is _MISSING:
+            note += "  [consumed by the fold: it became this op's kind/scope]"
+        out.append(f"        {param.name:<14} = {value!r:<22} {source}{note}")
+        if why and not said_why:
+            # ONE `why` per inherited row, not one per parameter: a chassis default is a whole row
+            # (`DistancePull_xy` is weight 1.5 AND measure object_to_goal_xy AND k=4.0, and the
+            # rationale is why those numbers go together), so repeating it under each field would
+            # bury the rest of the plan in four copies of one paragraph.
+            out.append(_wrap(f"why: {why}", " " * 25))
+            said_why = True
+        elif source == "term default" and param.doc:
+            out.append(_wrap(f"doc: {param.doc}", " " * 25))
+
+    for extra in sorted(set(op.params) - set(row.params)):
+        # Parameters the COMPILER added, named as such: the success criterion the replace row reads,
+        # and the per-row state buffer a stateful term needs. Both hash into the fingerprint.
+        out.append(f"        {extra:<14} = {op.params[extra]!r:<22} compiler-supplied")
+    return out
+
+
+def _skill_plan(a, doc, spec, plan):
+    """The resolved plan, with every chassis-supplied default and its rationale shown.
+
+    Nothing the author did not write may be invisible to them: a weight inherited from the chassis
+    trains exactly as hard as one they typed, and the audit's finding is that the measured failure
+    mode of LLM-authored rewards is bad WEIGHTS, not bad term choice.
+    """
+    from bridle.skill.spec import _chassis_defaults_for
+    from bridle.skill.vocab import CHASSIS, TERMS
+
+    chassis = CHASSIS[spec.kind]
+    raw_rows = doc.get("reward") or []
+    scale = (f"{plan.scale} — CARRIED, not folded into the rows below: "
+             f"compute_normalized_dense_reward returns compute_dense_reward/divisor, so the divisor "
+             f"belongs to the normalized path and the fold printed here is the UNSCALED one")
+    out = [
+        f"skill:    {spec.name}",
+        f"chassis:  {spec.kind}",
+        f"contract: {spec.contract}",
+        f"env_id:   {spec.env_id}",
+        f"plan@{plan.fingerprint()} — {len(plan.ops)} ops, {len(plan.measures_needed)} measures, "
+        f"{len(plan.state_slots)} state slot(s)",
+        _wrap(f"reward_scale: divisor {scale}", "  "),
+        "",
+        "reward fold — applied in DOCUMENT ORDER as acc = op(acc). This is a fold, not a sum: a",
+        "`replace` row overwrites everything above it, so row order is part of the reward.",
+        "",
+    ]
+    for i, (row, op) in enumerate(zip(spec.reward, plan.ops)):
+        raw = raw_rows[i] if i < len(raw_rows) and isinstance(raw_rows[i], dict) else {}
+        out += _skill_row(i, raw, row, op, chassis, TERMS, _chassis_defaults_for)
+        out.append("")
+
+    out += [
+        _wrap(f"success: {spec.success}", "  "),
+        _wrap(f"measures the env must supply ({len(plan.measures_needed)}): "
+              f"{', '.join(sorted(plan.measures_needed))}", "  "),
+        f"  state slots ({len(plan.state_slots)}): "
+        f"{', '.join(plan.state_slots) if plan.state_slots else 'none'}",
+        f"  horizon: " + (f"{a.horizon} (from --horizon)" if a.horizon else
+                          "NOT SUPPLIED — pass --horizon <max_episode_steps>; without it the "
+                          "horizon-integrated check below reports that it could not be computed"),
+        f"  terminate_on_success: {a.terminate_on_success}",
+        _skill_warnings(plan),
+    ]
+    return "\n".join(out)
+
+
+def cmd_skill(a):
+    """`vocab` | `check <file>` | `compile <file>` — tiers 1 and 2 of the three feedback tiers.
+
+    Tier 3 is preflight, which needs the simulator; nothing in this command starts one, so a clean
+    `check` says the document is well-formed and internally consistent, NOT that the reward trains.
+    """
+    from bridle.skill.vocab import vocab_document
+
+    if a.skill_cmd == "vocab":
+        print(vocab_document())
+        return 0
+
+    from bridle.skill.compile import CompileError, compile_spec
+    from bridle.skill.spec import SpecError, parse_spec
+
+    doc, refusal = _skill_document(a)
+    if refusal is not None:
+        print(f"skill {a.skill_cmd} FAILED — the document could not be read\n\n  {refusal}")
+        return 1
+    try:
+        spec = parse_spec(doc)
+    except SpecError as e:
+        print(_skill_refusal(a, "tier 1, schema (parse_spec)", e))
+        return 1
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")     # re-printed in full by `_skill_warnings`
+            plan = compile_spec(spec, horizon=a.horizon,
+                                terminate_on_success=_TERMINATION[a.terminate_on_success])
+    except CompileError as e:                   # FloodingError included — it is a CompileError
+        print(_skill_refusal(a, "tier 2, compile (compile_spec)", e))
+        return 1
+
+    if a.skill_cmd == "compile":
+        print(_skill_plan(a, doc, spec, plan))
+        return 0
+
+    print(f"skill check OK — {spec.name} ({spec.kind} chassis) — plan@{plan.fingerprint()}, "
+          f"{len(plan.ops)} ops")
+    print(_skill_warnings(plan))
+    print("\n" + _wrap(
+        "Passed tiers 1-2 of 3 (schema -> compile -> preflight). No simulator was started, so this "
+        "says the document is well-formed and internally consistent — not that the reward trains. "
+        "`bridle skill compile` prints the resolved plan, including every default the chassis "
+        "supplied on your behalf.", "  "))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="bridle", description=__doc__.split("\n")[0])
     ap.add_argument("--store", default=os.environ.get(
@@ -385,6 +636,23 @@ def main(argv=None):
     r.add_argument("--cwd", default="/home/luca/lego-arm")
     r.add_argument("--dry-run", action="store_true")
     r.set_defaults(fn=cmd_relaunch)
+
+    sk = sub.add_parser("skill", help="the declarative skill document: vocabulary, check, compile")
+    sk_sub = sk.add_subparsers(dest="skill_cmd", required=True)
+    sk_sub.add_parser("vocab", help="print the authorable reward surface (the prompt payload)"
+                      ).set_defaults(fn=cmd_skill)
+    for verb, helptext in (
+            ("check", "schema -> compile a skill.yaml; prints the first refusal, exits 1"),
+            ("compile", "print the resolved plan, including every chassis-supplied default")):
+        sp = sk_sub.add_parser(verb, help=helptext)
+        sp.add_argument("file", help="path to a skill.yaml")
+        sp.add_argument("--horizon", type=int, default=None,
+                        help="the env's max_episode_steps. Omitted, the horizon-integrated flooding "
+                             "check reports that it could NOT be computed — no default is invented")
+        sp.add_argument("--terminate-on-success", choices=tuple(_TERMINATION), default="unknown",
+                        help="does success end the episode? `unknown` counts the bonus once, which "
+                             "is the conservative branch")
+        sp.set_defaults(fn=cmd_skill)
 
     lg = sub.add_parser("lineage", help="check deployed records against the live environment")
     lg.add_argument("--cwd", default="/home/luca/lego-arm")
