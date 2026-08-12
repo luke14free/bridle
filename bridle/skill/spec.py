@@ -28,9 +28,12 @@ WHAT THIS MODULE REFUSES, AND WHY EACH ONE WAS PAID FOR:
   pressing the cube to dz=0 broke 16/16 grasps (2026-06-04, descend_env.py).
 
   A QUANTITY THAT EXISTS IN MORE THAN ONE FRAME MUST BE NAMED WITH ITS FRAME. descend's reward
-  grades `height_above_seat` against the LIVE seat while descend_stack's success gate grades a goal
-  frozen at init — one name, two truths (vocab.py, correction 2). So `height_above_seat` on its own
-  is refused and the author writes `height_above_seat_live` or `height_above_seat_static_goal`.
+  grades the seat height against the LIVE seat while descend_stack's success gate grades a goal
+  frozen at init — one quantity, two truths (vocab.py, correction 2). Both frames therefore carry
+  their frame in the MEASURES key and the bare `height_above_seat` is refused: the author writes
+  `height_above_seat_live` or `height_above_seat_static_goal`. The legal measure names ARE the
+  MEASURES keys — no alias layer, one validation path for what an author wrote and what a chassis
+  default supplied, and a `SkillSpec` re-emitted as YAML re-parses to the same spec.
 
   A `params.X` MUST RESOLVE. Per-skill params (§5) are how a skill declares the 69 corpus parameters
   `Contract` has no field for; a reference to an undeclared one is a silent zero at compile time.
@@ -43,7 +46,6 @@ tiers of feedback: schema -> compile -> preflight):
     `params.X` references. That grammar belongs to whoever evaluates it.
   - it does not resolve `contract:` to a real `Contract`, or `env_id` to a registered env.
 """
-import copy
 import dataclasses
 import difflib
 import re
@@ -57,7 +59,7 @@ from bridle.skill.vocab import CHASSIS, MEASURES, PREDICATES, TERMS, Frame, Sign
 
 __all__ = [
     "SpecError", "Row", "SkillSpec", "parse_spec", "json_schema",
-    "ROW_TERMS", "MEASURE_ALIASES", "LEGAL_MEASURE_NAMES", "AMBIGUOUS_QUANTITIES",
+    "ROW_TERMS", "LEGAL_MEASURE_NAMES",
 ]
 
 
@@ -97,13 +99,15 @@ def _unknown(path, what, value, candidates):
                      suggestion=_suggest(value, candidates))
 
 
-# ── measures: frames, aliases, and the one ambiguous quantity ───────────────────────────────────
-# A measure name in MEASURES already encodes its frame in the KEY (`height_above_seat` is the live
-# one, `height_above_seat_static_goal` the frozen one) — vocab.py made them distinct entries on
-# purpose. What the key does NOT do is force the author to have thought about which they meant, and
-# for the one quantity that exists twice that choice is the difference between grading the reward on
-# the live seat and grading it on a goal captured at init. So the bare quantity name is refused and
-# both frames are addressable by an explicit `<quantity>_<frame>` spelling.
+# ── measures: one name set, one validation path ─────────────────────────────────────────────────
+# The legal measure names ARE the MEASURES keys — no aliases, no second spelling, so a `SkillSpec`
+# re-emitted as YAML re-parses to the same spec and a chassis default and an authored value go
+# through the SAME check. (2026-08-12 review, finding 4: they used not to. The live seat height was
+# keyed on the bare quantity `height_above_seat` while its static-goal twin carried a frame suffix,
+# so the schema's legal set and the vocabulary's key set disagreed on exactly that one name, and the
+# carry chassis wrote the spelling the schema declared illegal — resolved silently by a second code
+# path. The vocabulary was renamed: `height_above_seat_live`.)
+LEGAL_MEASURE_NAMES = frozenset(MEASURES)
 
 _FRAME_SUFFIXES = tuple(f"_{f.value}" for f in Frame)
 
@@ -116,78 +120,82 @@ def _quantity(name):
     return name
 
 
-_FAMILY = {}
+#: bare quantity -> the frame-qualified MEASURES keys that read it, for quantities readable in more
+#: than one frame (exactly one today: the seat height, vocab.py correction 2). This RESOLVES NOTHING
+#: — it exists only so the refusal for the bare name can say WHY it is not a name, rather than
+#: "unknown measure". The bare quantity is the spelling every source comment and the design doc's §4
+#: example use, so it is the likeliest thing an author writes, and "one name, two truths" is the
+#: thing they have to be told.
+_FRAME_VARIANTS = {}
 for _key, _measure in MEASURES.items():
-    _FAMILY.setdefault(_quantity(_key), {})[_measure.frame.value] = _key
-
-#: quantity -> {frame: MEASURES key}, for every quantity readable in more than one frame. Exactly
-#: one today (`height_above_seat`), which is the one vocab.py's correction 2 was written about.
-AMBIGUOUS_QUANTITIES = MappingProxyType(
-    {q: MappingProxyType(dict(frames)) for q, frames in _FAMILY.items() if len(frames) > 1})
-
-#: every legal way to write a measure -> the MEASURES key it means. For an unambiguous quantity that
-#: is just the key; for an ambiguous one it is the two frame-qualified spellings and NOT the bare
-#: name, so `Row.params["measure"]` is always a real MEASURES key and an author always said which
-#: frame. Public because compile() binds `Expr.names`, which carry the authored spelling.
-MEASURE_ALIASES = {}
-for _quant, _frames in _FAMILY.items():
-    if len(_frames) > 1:
-        for _frame_name, _key in _frames.items():
-            MEASURE_ALIASES[f"{_quant}_{_frame_name}"] = _key
-    else:
-        MEASURE_ALIASES[next(iter(_frames.values()))] = next(iter(_frames.values()))
-MEASURE_ALIASES = MappingProxyType(MEASURE_ALIASES)
-
-LEGAL_MEASURE_NAMES = frozenset(MEASURE_ALIASES)
+    _FRAME_VARIANTS.setdefault(_quantity(_key), set()).add(_key)
+_FRAME_VARIANTS = MappingProxyType(
+    {q: frozenset(keys) for q, keys in _FRAME_VARIANTS.items()
+     if len(keys) > 1 and q not in MEASURES})
 
 
-def _ambiguous_frame_error(path, name):
-    frames = AMBIGUOUS_QUANTITIES[name]
-    options = ", ".join(f"{name}_{frame!s}" for frame in sorted(frames))
+def _frame_ambiguity_error(path, name):
+    keys = sorted(_FRAME_VARIANTS[name])
+    frames = sorted(MEASURES[k].frame.value for k in keys)
     return SpecError(
         path,
-        f"measure {name!r} names a quantity that is readable in {len(frames)} frames "
-        f"({', '.join(sorted(frames))}) and this row names neither — say which frame you mean: "
-        f"{options}. descend's reward grades this against the live seat while descend_stack's "
-        f"success gate grades it against a goal frozen at init: one name, two truths",
-        suggestion=f"{name}_{Frame.LIVE.value}" if Frame.LIVE.value in frames else None)
+        f"measure {name!r} names a quantity that is readable in {len(keys)} frames "
+        f"({', '.join(frames)}) and this row names neither — say which frame you mean: "
+        f"{', '.join(keys)}. descend's reward grades this against the live seat while "
+        f"descend_stack's success gate grades it against a goal frozen at init: one quantity, two "
+        f"truths",
+        legal=LEGAL_MEASURE_NAMES,
+        suggestion=_suggest(name, keys))
 
 
 def _resolve_measure(path, name):
-    """An author-written measure reference -> its MEASURES key. Raises on unknown or frame-ambiguous."""
+    """A measure reference -> its MEASURES key. Raises on unknown or frame-ambiguous.
+
+    The ONLY measure check in the module: an authored value and a chassis-supplied default both come
+    through here, so nothing can reach `MEASURES[...]` unvalidated and raise a bare `KeyError` out of
+    `parse_spec` — the author's contract is that they only ever catch `SpecError`.
+    """
     if not isinstance(name, str):
         raise SpecError(path, f"a measure is named by a string, got {type(name).__name__}",
                         legal=LEGAL_MEASURE_NAMES)
-    if name in MEASURE_ALIASES:
-        return MEASURE_ALIASES[name]
-    if name in AMBIGUOUS_QUANTITIES:
-        raise _ambiguous_frame_error(path, name)
+    if name in MEASURES:
+        return name
+    if name in _FRAME_VARIANTS:
+        raise _frame_ambiguity_error(path, name)
     raise _unknown(path, "measure", name, LEGAL_MEASURE_NAMES)
-
-
-def _canonical_default_measure(name):
-    """The same resolution for a measure the VOCABULARY wrote (a chassis default), which names the
-    bare quantity: carry's rows were read off descend_env.py, which grades the live seat. Resolving
-    it as live keeps the vocabulary's own defaults inheritable — the ambiguity refusal is aimed at
-    what the AUTHOR wrote, which is the choice nobody has made yet.
-    """
-    if name in MEASURE_ALIASES:
-        return MEASURE_ALIASES[name]
-    return _FAMILY.get(name, {}).get(Frame.LIVE.value, name)
 
 
 # ── predicates and per-skill param references ───────────────────────────────────────────────────
 
 # A predicate field is either a bare name (`grasped`) or a nested call over existing names
-# (`and_(grasped, above_z(z=0.06))`). Names in CALL position are predicate references; everything
-# else inside the parens is scene data (`anchor=target_pos`) and is not checked here.
-_CALL_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+# (`and_(grasped, above_z(z=0.06))`). Both the CALL names and the bare POSITIONAL names are
+# predicate references and both are checked. What is NOT a predicate, and is blanked out before the
+# names are read, is scene data: quoted strings, dotted attribute chains (`bin.inner_radius`,
+# `params.hover` — those get their own check), keyword-argument NAMES, and the identifier a keyword
+# argument is set to (`anchor=target_pos` — target_pos is a scene point, and vocab.py's own
+# carry_with_potential chassis writes exactly that).
+#
+# (2026-08-12 review, finding 2: only the call names used to be checked, so the typo in
+# `and_(grapsed, above_z(z=0.06))` — a BARE name, the position a compound predicate puts its
+# operands in — was never looked up and the row parsed clean. vocab.py's chassis compose via `and_`,
+# so this is the shape the author is shown and the shape they will copy.)
+_QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+_DOTTED_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)+")
+_KWARG_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\s*=(?!=)(?:\s*[A-Za-z_][A-Za-z0-9_]*)?")
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _PARAM_REF_RE = re.compile(r"\bparams\.([A-Za-z_][A-Za-z0-9_]*)")
 
 
+def _blank(pattern, text):
+    """Replace every match with the same number of spaces — keeps offsets, kills word boundaries."""
+    return pattern.sub(lambda m: " " * len(m.group(0)), text)
+
+
 def _predicate_names(text):
-    calls = set(_CALL_RE.findall(text))
-    return calls if calls else {text.strip()}
+    """Every identifier in a predicate expression that has to name a PREDICATES entry."""
+    for pattern in (_QUOTED_RE, _DOTTED_RE, _KWARG_RE):
+        text = _blank(pattern, text)
+    return set(_IDENT_RE.findall(text))
 
 
 def _check_predicate(path, value, declared_params):
@@ -196,7 +204,12 @@ def _check_predicate(path, value, declared_params):
                               "over existing names like `and_(grasped, above_z(z=0.06))`)",
                         legal=PREDICATES)
     _check_param_refs(path, value, declared_params)
-    for name in sorted(_predicate_names(value)):
+    names = _predicate_names(value)
+    if not names:
+        raise SpecError(path, f"{value!r} names no predicate: a predicate field is a bare name from "
+                              f"the list below, or a call over them like "
+                              f"`and_(grasped, above_z(z=0.06))`", legal=PREDICATES)
+    for name in sorted(names):
         if name not in PREDICATES:
             raise _unknown(path, "predicate", name, PREDICATES)
 
@@ -210,8 +223,30 @@ def _check_param_refs(path, text, declared_params):
                             legal=declared_params, suggestion=_suggest(name, declared_params))
 
 
-def _is_param_ref(value):
-    return isinstance(value, str) and value.startswith("params.")
+def _is_param_ref(param, value):
+    """Does this value stand in for a NUMBER that compile() binds from `params:` later?
+
+    Only numeric fields get the bypass. (2026-08-12 review, minor 2: the test used to be
+    `value.startswith("params.")` alone, so it skipped `choices` as well as typing and
+    `mode: params.hover` was accepted on PredicateBonus although `mode` is a closed set of three
+    strings. A string field's legal values are knowable NOW; deferring them to compile() buys
+    nothing and loses the refusal.)
+    """
+    return (param.type in ("float", "int") and isinstance(value, str)
+            and value.startswith("params."))
+
+
+def _legal_values_for(param):
+    """The enumerable legal set for a parameter, or None when its type is an open one (a float).
+    Used by refusals that have to state a legal set without having a wrong value to diff against.
+    """
+    if param.choices:
+        return param.choices
+    if param.name == "measure":
+        return LEGAL_MEASURE_NAMES
+    if param.name in ("predicate", "gate"):
+        return PREDICATES
+    return None
 
 
 # ── value typing ────────────────────────────────────────────────────────────────────────────────
@@ -268,40 +303,83 @@ class Row:
     why: str
 
 
+_DISCRIMINATORS = ("measure", "predicate")
+
+
 def _chassis_defaults_for(chassis, term_name, authored):
-    """The chassis row this authored row inherits from, or {}.
+    """`(the chassis row this authored row inherits from, the candidates it could not choose from)`.
 
     A chassis may instantiate one term several times under suffixed keys (carry has `DistancePull_xy`
     at k=4.0 and `DistancePull_height` at k=6.0 — collapsing them into one 3D kernel changes the
     task). When it does, the authored `measure`/`predicate` is what picks the right one; with no
     discriminator nothing is inherited and the term's own defaults apply, because guessing between
     1.5@k=4 and 2.5@k=6 is exactly the silent substitution this whole module exists to prevent.
+
+    The unchosen candidates come back with the answer so a downstream refusal can NAME them — an
+    author told only "the chassis supplies nothing" cannot tell that it in fact supplies two things
+    and they have to pick (2026-08-12 review, finding 3).
     """
     if chassis is None:
-        return {}
+        return {}, []
     candidates = [row for key, row in chassis.defaults.items() if base_term(key) == term_name]
     if len(candidates) == 1:
-        return candidates[0]
+        return candidates[0], []
     if not candidates:
-        return {}
-    for field in ("measure", "predicate"):
-        if field not in authored:
+        return {}, []
+    for field in _DISCRIMINATORS:
+        # A key present with a null value is not a discriminator — see the null rule in
+        # `_parse_term_row`; `measure:` with nothing after it must behave exactly like no key.
+        if authored.get(field) is None:
             continue
-        want = authored[field]
-        if field == "measure" and isinstance(want, str):
-            want = MEASURE_ALIASES.get(want, want)
-        hits = []
-        for row in candidates:
-            have = row.get(field)
-            if have is None:
-                continue
-            if field == "measure":
-                have = _canonical_default_measure(have)
-            if have == want:
-                hits.append(row)
+        hits = [row for row in candidates if row.get(field) == authored[field]]
         if len(hits) == 1:
-            return hits[0]
-    return {}
+            return hits[0], []
+    return {}, candidates
+
+
+def _describe_candidates(candidates):
+    """`measure='object_to_goal_xy' (weight=1.5, k=4.0)`, one per unchosen chassis row — enough for
+    an author to see WHICH row they meant and what picking it would inherit."""
+    out = []
+    for row in candidates:
+        field = next((f for f in _DISCRIMINATORS if row.get(f) is not None), None)
+        head = f"{field}={row[field]!r}" if field else "(no measure/predicate to name it by)"
+        rest = ", ".join(f"{k}={v!r}" for k, v in row.items()
+                         if k != "why" and k != field and not isinstance(v, str))
+        out.append(f"{head} ({rest})" if rest else head)
+    return "; ".join(out)
+
+
+def _required_param_error(path, param, term_name, chassis, candidates):
+    """The refusal for a required parameter nothing supplied.
+
+    (2026-08-12 review, finding 3: this used to read "neither the row nor the 'carry' chassis
+    supplies one" — which for `DistancePull` under `carry` is false twice over, since that chassis
+    supplies TWO DistancePull rows and the reason nothing was inherited is that the row named no
+    `measure` to choose between them. It carried no legal set and no suggestion either: the only
+    refusal in the module with neither, in the module whose premise is that a refusal a 27-30B
+    author cannot act on costs a round trip.)
+    """
+    where = f"{path}.{param.name}"
+    head = f"{param.name!r} is required by {term_name} ({param.doc or param.type})"
+    legal = _legal_values_for(param)
+    if candidates:
+        # Unconditional legal set on this branch: the parameter's own if it has an enumerable one,
+        # else the discriminators that would pick a candidate row — either way something to write.
+        discriminators = sorted({str(row[f]) for row in candidates
+                                 for f in _DISCRIMINATORS if row.get(f) is not None})
+        return SpecError(
+            where,
+            f"{head}. The '{chassis.name}' chassis supplies {len(candidates)} {term_name} rows and "
+            f"this row names no `{_DISCRIMINATORS[0]}`/`{_DISCRIMINATORS[1]}` to choose between "
+            f"them, so it inherited nothing — name the row you mean, or supply "
+            f"{param.name!r} yourself. The candidates are: {_describe_candidates(candidates)}",
+            legal=legal or discriminators)
+    return SpecError(
+        where,
+        f"{head} and neither the row nor the "
+        f"'{chassis.name if chassis else 'none'}' chassis supplies one",
+        legal=legal)
 
 
 def _parse_term_row(path, raw, chassis, declared_params):
@@ -323,36 +401,39 @@ def _parse_term_row(path, raw, chassis, declared_params):
             raise SpecError(f"{path}.{key}", f"unknown parameter {key!r} for {term_name}",
                             legal=declared, suggestion=_suggest(key, declared))
 
-    inherited = _chassis_defaults_for(chassis, term_name, authored)
+    inherited, unchosen = _chassis_defaults_for(chassis, term_name, authored)
     values = {}
     for param in term.params:
-        if param.name in authored:
-            value, from_author = authored[param.name], True
-        elif param.name in inherited:
-            value, from_author = inherited[param.name], False
+        # THE NULL RULE (2026-08-12 review, finding 1). A key PRESENT with a null value is not a
+        # supplied value: `measure:` with nothing after it is the commonest YAML slip there is, and
+        # treating its None as authored short-circuited required-ness, typing, `choices` AND the
+        # signed-measure gate below (which is written `is not None` precisely to let a term's own
+        # optional default through). A `HingePenalty` with `measure: null` parsed clean and handed
+        # compile() a crush penalty with no measure. So an authored null falls through exactly like
+        # an absent key — chassis default, then term default, then the required-parameter refusal —
+        # and the only None that reaches `values` is one that came from `param.default`, which is
+        # how the vocabulary spells "optional, off" (`axes`, `gate`, `enabled_if`).
+        if authored.get(param.name) is not None:
+            value = authored[param.name]
+        elif inherited.get(param.name) is not None:
+            value = inherited[param.name]
         elif param.required:
-            raise SpecError(
-                f"{path}.{param.name}",
-                f"{param.name!r} is required by {term_name} ({param.doc or param.type}) and "
-                f"neither the row nor the '{chassis.name if chassis else 'none'}' chassis "
-                f"supplies one")
+            raise _required_param_error(path, param, term_name, chassis, unchosen)
         else:
-            value, from_author = param.default, False
+            value = param.default
+            if value is None:
+                values[param.name] = None
+                continue
 
-        if value is None:
-            values[param.name] = None
-            continue
         field_path = f"{path}.{param.name}"
         if param.name == "measure":
-            value = (_resolve_measure(field_path, value) if from_author
-                     else _canonical_default_measure(value))
+            # One path for authored and chassis-supplied alike — see `_resolve_measure`.
+            value = _resolve_measure(field_path, value)
         elif param.name in ("predicate", "gate"):
             _check_predicate(field_path, value, declared_params)
         elif isinstance(value, str):
             _check_param_refs(field_path, value, declared_params)
-        if not _is_param_ref(value):
-            # A `params.X` stands in for a number compile() binds later, so its type is the param's
-            # to answer for, not this field's.
+        if not _is_param_ref(param, value):
             _check_type(field_path, param, value)
         values[param.name] = value
 
@@ -366,11 +447,9 @@ def _parse_term_row(path, raw, chassis, declared_params):
                 f"`clamp(signed_delta, min=0)` is identically zero, so the row trains, logs, and "
                 f"contributes nothing. The crush penalty this deletes exists because pressing to "
                 f"dz=0 broke 16/16 grasps (2026-06-04)",
-                legal=[n for n in LEGAL_MEASURE_NAMES
-                       if MEASURES[MEASURE_ALIASES[n]].sign is Sign.SIGNED])
+                legal=[n for n in LEGAL_MEASURE_NAMES if MEASURES[n].sign is Sign.SIGNED])
 
-    return Row(term=term_name, params=MappingProxyType(values), expr=None, custom=None,
-               why=raw["why"])
+    return Row(term=term_name, params=_freeze(values), expr=None, custom=None, why=raw["why"])
 
 
 def _parse_expr_row(path, raw, declared_params):
@@ -386,10 +465,10 @@ def _parse_expr_row(path, raw, declared_params):
     for name in sorted(parsed.names):
         # A declared param shadows a measure of the same name: the author wrote the param, so the
         # author meant the param. Nothing in the corpus collides today.
-        if name in declared_params or name in PREDICATES or name in MEASURE_ALIASES:
+        if name in declared_params or name in PREDICATES or name in MEASURES:
             continue
-        if name in AMBIGUOUS_QUANTITIES:
-            raise _ambiguous_frame_error(f"{path}.expr", name)
+        if name in _FRAME_VARIANTS:
+            raise _frame_ambiguity_error(f"{path}.expr", name)
         legal = set(LEGAL_MEASURE_NAMES) | set(PREDICATES) | set(declared_params)
         raise SpecError(f"{path}.expr", f"unknown name {name!r} in the expression: it is not a "
                                         f"measure, a predicate, or a param this document declares",
@@ -438,6 +517,23 @@ def _parse_row(index, raw, chassis, declared_params):
 
 # ── document sections ───────────────────────────────────────────────────────────────────────────
 
+def _freeze(value):
+    """A document fragment, deep-frozen: mappings become `MappingProxyType`, sequences tuples.
+
+    `dataclass(frozen=True)` only stops the FIELD being rebound, so before this
+    `spec.scene["goal"]["type"] = "MUTATED"` and `spec.params["hover"]["value"] = 99.0` both
+    succeeded (2026-08-12 review, minor 1). Those numbers hash into the contract fingerprint that
+    says which policy was trained under which spec, so a spec editable after construction is a
+    fingerprint that stops describing the run. Freezing also copies, which is what keeps `parse_spec`
+    from handing back views onto the caller's dict.
+    """
+    if isinstance(value, dict):
+        return MappingProxyType({k: _freeze(v) for k, v in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(v) for v in value)
+    return value
+
+
 _REQUIRED_FIELDS = ("name", "kind", "contract", "env_id", "scene", "reward", "success")
 _OPTIONAL_FIELDS = ("init", "params", "reward_scale", "preflight")
 _FIELDS = _REQUIRED_FIELDS + _OPTIONAL_FIELDS
@@ -478,7 +574,7 @@ def _parse_params(raw):
             raise _unknown(f"{path}.severity", "severity", severity, _SEVERITIES)
         if "doc" in body and not isinstance(body["doc"], str):
             raise SpecError(f"{path}.doc", f"`doc` is prose, got {type(body['doc']).__name__}")
-        out[name] = copy.deepcopy(body)
+        out[name] = _freeze(body)
     return out
 
 
@@ -494,14 +590,22 @@ def _parse_scene(raw):
         if not isinstance(kind, str) or not kind.strip():
             raise SpecError(f"{path}.type", "every scene object declares a `type` (cube, platform, "
                                             "bin, ...) — it is what the generator builds a body from")
-    return copy.deepcopy(raw)
+    return _freeze(raw)
 
 
-def _parse_reward_scale(raw, chassis):
+def _parse_reward_scale(raw, chassis, declared_params):
     """`reward_scale:` — `reward_ppo = dense / divisor`, stated explicitly (§1.4). 7 of 15 primitives
     inherit `compute_normalized_dense_reward` without overriding it and so train at dense/12.0 even
     where that is semantically wrong (lift's per-step max is ~18, reach's ~9); a generated env that
     forgets the field entirely trains at 12x the intended scale.
+
+    THE ASYMMETRY, RESOLVED TOWARD ALLOWING (2026-08-12 review, minor 3): `divisor: params.scale` is
+    accepted, exactly as `setpoint: params.hover` is in a reward row. It used to be refused as a
+    type error while the row form was allowed, which is a rule an author has to learn twice. The
+    divisor is a number a skill may well want declared once in `params:` with a severity — changing
+    it rescales every gradient, so `retrain` is the honest tag, and `params:` is the only place this
+    document can say that. Same numeric-only restriction as rows: `unnormalized` is a bool and takes
+    no reference.
     """
     term = TERMS["RewardScale"]
     declared = {p.name: p for p in term.params}
@@ -515,10 +619,16 @@ def _parse_reward_scale(raw, chassis):
     inherited = chassis.defaults.get("RewardScale", {}) if chassis else {}
     values = {}
     for param in term.params:
-        if param.name in authored:
+        # The null rule of `_parse_term_row` applies here too: `divisor:` with nothing after it
+        # falls through to the chassis' 12.0 rather than becoming a None nobody can divide by.
+        if authored.get(param.name) is not None:
             value = authored[param.name]
-            _check_type(f"reward_scale.{param.name}", param, value)
-        elif param.name in inherited:
+            field_path = f"reward_scale.{param.name}"
+            if isinstance(value, str):
+                _check_param_refs(field_path, value, declared_params)
+            if not _is_param_ref(param, value):
+                _check_type(field_path, param, value)
+        elif inherited.get(param.name) is not None:
             value = inherited[param.name]
         else:
             value = param.default
@@ -550,7 +660,7 @@ def _parse_preflight(raw):
             if not any(key in bounds for key in ("min", "max", "expect")):
                 raise SpecError(path, "a preflight assert with no bound (min/max/expect) is not a "
                                       "claim, it is a check that can never fail")
-    return copy.deepcopy(raw)
+    return _freeze(raw)
 
 
 # ── the document ────────────────────────────────────────────────────────────────────────────────
@@ -614,7 +724,7 @@ def parse_spec(doc: dict) -> SkillSpec:
     if not isinstance(init, dict):
         raise SpecError("init", f"`init:` is a mapping, got {type(init).__name__}")
 
-    reward_scale = _parse_reward_scale(doc.get("reward_scale"), chassis)
+    reward_scale = _parse_reward_scale(doc.get("reward_scale"), chassis, params)
 
     rows = doc["reward"]
     if not isinstance(rows, list):
@@ -631,9 +741,9 @@ def parse_spec(doc: dict) -> SkillSpec:
 
     return SkillSpec(
         name=name, kind=kind, contract=contract, env_id=env_id,
-        scene=MappingProxyType(scene), init=MappingProxyType(copy.deepcopy(init)),
-        params=MappingProxyType(params), reward_scale=MappingProxyType(reward_scale),
-        reward=reward, success=success, preflight=MappingProxyType(preflight))
+        scene=_freeze(scene), init=_freeze(init),
+        params=_freeze(params), reward_scale=_freeze(reward_scale),
+        reward=reward, success=success, preflight=_freeze(preflight))
 
 
 # ── the schema a model is handed ────────────────────────────────────────────────────────────────

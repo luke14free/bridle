@@ -20,14 +20,17 @@ surviving record of why a number is what it is — the source comments it was co
 history, were written 1–5 times and never touched again; the JOURNAL contains no weight-sweep record.
 
 THREE CORRECTIONS THE ADVERSARIAL CRITICS FORCED (design doc §1, all encoded below):
-  1. Every `Measure` carries a `sign`. `height_above_seat` MUST be SIGNED: it feeds both the hover
-     attractor (`1 - tanh(6*|sdz-hover|)`) and the crush penalty (`-3.0*clamp(-sdz, min=0)`). An
-     unsigned reading — the natural default for an undifferentiated "measure library" — makes the
+  1. Every `Measure` carries a `sign`. `height_above_seat_live` MUST be SIGNED: it feeds both the
+     hover attractor (`1 - tanh(6*|sdz-hover|)`) and the crush penalty (`-3.0*clamp(-sdz, min=0)`).
+     An unsigned reading — the natural default for an undifferentiated "measure library" — makes the
      crush penalty identically zero and silently deletes the term that exists because pressing to
      dz=0 broke 16/16 grasps (2026-06-04, descend_env.py).
-  2. Every `Measure` carries a `frame`. descend_stack's reward grades `height_above_seat` against a
+  2. Every `Measure` carries a `frame`. descend_stack's reward grades the seat height against a
      FROZEN goal (`self._stack_goal`) while its `evaluate()` success gate grades the LIVE top
-     (`self._live_top()`) — one name, two frames, so both must exist as distinct measures.
+     (`self._live_top()`) — one quantity, two frames, so both must exist as distinct measures.
+     BOTH therefore carry their frame IN THE KEY (`height_above_seat_live`,
+     `height_above_seat_static_goal`) and the bare quantity is not a name anything may be written
+     under — a spec naming it would mean whichever frame the reader assumed (design doc §1.2).
   3. `Ramp` (was `HeightRamp`) carries `normalize`, and `floor`/`cap` may be per-env values. lift's
      `8.0*clamp(z/0.06, 0, 1)` and compact_grasp's `10.0*clamp(z-half, 0, 0.04)` are NOT the same
      formula; applying lift's normalized default to compact_grasp trains a lift, not a seated grip
@@ -99,17 +102,17 @@ MEASURES = dict([
        "object z minus its own natural resting height, read live. Feeds lift's Ramp "
        "(`8.0*clamp(z/0.06,0,1)`) and the `height_above_resting_in` success band."),
 
-    _m("height_above_seat", Sign.SIGNED, Frame.LIVE, "m",
+    _m("height_above_seat_live", Sign.SIGNED, Frame.LIVE, "m",
        "object z minus the DESTINATION seat's resting height (platform top + half, or a live stack "
-       "top + half). SIGNED: + = above seat, - = pressed into it. Feeds BOTH descend's hover "
-       "attractor `2.5*(1-tanh(6*|sdz-hover|))` AND its crush penalty `-3.0*clamp(-sdz,min=0)` — "
-       "UNSIGNED makes the crush penalty identically zero, deleting the term that exists because "
+       "top + half), read live. SIGNED: + = above seat, - = pressed into it. Feeds BOTH descend's "
+       "hover attractor `2.5*(1-tanh(6*|sdz-hover|))` AND its crush penalty `-3.0*clamp(-sdz,min=0)` "
+       "— UNSIGNED makes the crush penalty identically zero, deleting the term that exists because "
        "pressing to dz=0 broke 16/16 grasps (2026-06-04)."),
 
     _m("height_above_seat_static_goal", Sign.SIGNED, Frame.STATIC_GOAL, "m",
-       "same quantity as height_above_seat but vs the FROZEN stack goal captured at episode init "
-       "(self._stack_goal), not the live top. descend_stack's reward grades against this while "
-       "evaluate() grades the live top — one name, two frames, why Measure.frame exists."),
+       "same quantity as height_above_seat_live but vs the FROZEN stack goal captured at episode "
+       "init (self._stack_goal), not the live top. descend_stack's reward grades against this while "
+       "evaluate() grades the live top — one quantity, two frames, why Measure.frame exists."),
 
     _m("object_z", Sign.MAGNITUDE, Frame.LIVE, "m",
        "raw world-frame z of the held object's center. lift's Ramp reads `cube_z` directly, not a "
@@ -361,7 +364,7 @@ TERMS = dict([
        "`-weight * clamp(signed_delta(side, measure, threshold), min=0) * gate`. One row covers six "
        "unrelated jobs across 9/15 primitives: crush, jaw creep, container drift, stack topple, "
        "spawn-xy bulldozing, finger-grinding force. REQUIRES a SIGNED measure — an unsigned "
-       "height_above_seat makes `clamp(-sdz, min=0)` identically zero and silently deletes the term.",
+       "height_above_seat_live makes `clamp(-sdz, min=0)` identically zero and deletes the term.",
        needs_signed_measure=True),
 
     _t("VelocityPenalty", [
@@ -528,17 +531,18 @@ CHASSIS = {
                 why="re-center over the target while held; move delivers ~6cm off. k=4 on xy is "
                     "DIFFERENT from k=6 on height below — one 3D-norm kernel changes the task."),
             "DistancePull_height": _row(
-                weight=2.5, measure="height_above_seat", kernel="one_minus_tanh", k=6.0,
+                weight=2.5, measure="height_above_seat_live", kernel="one_minus_tanh", k=6.0,
                 setpoint=0.015, gate="grasped",
                 why="descend to a HOVER just above the seat — attractor peaks at setpoint=_HOVER "
                     "(0.015), NEVER at the seat (setpoint=0). The old zero-setpoint version pulled "
                     "the cube INTO the platform: 16/16 grasp losses broke while LOW, fixed "
                     "2026-06-04. Peaking at contact is a recorded failure, not a free parameter."),
             "HingePenalty_crush": _row(
-                weight=3.0, measure="height_above_seat", threshold=0.0, side="below", gate="grasped",
+                weight=3.0, measure="height_above_seat_live", threshold=0.0, side="below",
+                gate="grasped",
                 why="pressing the cube BELOW resting height destabilizes the grasp — the other half "
-                    "of the 2026-06-04 slip-fix above. Needs SIGNED height_above_seat: unsigned, "
-                    "`clamp(-sdz,min=0)` is identically zero and this term vanishes."),
+                    "of the 2026-06-04 slip-fix above. Needs SIGNED height_above_seat_live: "
+                    "unsigned, `clamp(-sdz,min=0)` is identically zero and this term vanishes."),
             "HingePenalty_grip": _row(
                 weight=1.0, measure="gripper_qpos", threshold=-0.6, side="above", gate="grasped",
                 why="keep the gripper CLOSED while held — grip_q drifted -0.73 to -0.44 over the "
@@ -667,8 +671,9 @@ def vocab_document() -> str:
     add("Every measure declares a SIGN (`signed`: can be negative, e.g. below vs above a surface; "
         "`magnitude`: always >= 0) and a FRAME (`live`: fresh every step; `at_reset`: vs a value "
         "captured once at reset; `static_goal`: vs a goal frozen once). Both load-bearing: an "
-        "unsigned height_above_seat silently zeroes a crush penalty that exists because a signed "
-        "version broke 16/16 grasps; a frame mismatch grades reward and success on two truths.")
+        "unsigned height_above_seat_live silently zeroes a crush penalty that exists because a "
+        "signed version broke 16/16 grasps; a frame mismatch grades reward and success on two "
+        "truths. A two-frame quantity carries its frame IN THE KEY; there is no bare spelling.")
     add("")
 
     add("## Terms")

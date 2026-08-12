@@ -3,8 +3,8 @@
 WHY THIS EXISTS: this vocabulary is what a local 27-30B model is handed in its prompt, and every
 property tested here was paid for by a measured failure.
 
-  SIGN     an unsigned height_above_seat makes the crush penalty identically zero, silently deleting
-           the term that exists because pressing to dz=0 broke 16/16 grasps (2026-06-04).
+  SIGN     an unsigned height_above_seat_live makes the crush penalty identically zero, silently
+           deleting the term that exists because pressing to dz=0 broke 16/16 grasps (2026-06-04).
   FRAME    descend_stack grades its reward against a static goal and its success against a live top.
   DEFAULTS the literature's measured failure mode for LLM-authored rewards is bad WEIGHTS, so every
            default carries the rationale that justifies it, in the text the model reads.
@@ -70,9 +70,24 @@ def run_checks():
           set(mode_param.choices) == {"add", "replace", "floor"})
 
     # ── measures: sign and frame are mandatory and load-bearing ──
-    check("height_above_seat exists", "height_above_seat" in MEASURES)
-    check("height_above_seat is SIGNED — an unsigned one zeroes the crush penalty",
-          MEASURES["height_above_seat"].sign is Sign.SIGNED)
+    check("height_above_seat_live exists", "height_above_seat_live" in MEASURES)
+    check("height_above_seat_live is SIGNED — an unsigned one zeroes the crush penalty",
+          "height_above_seat_live" in MEASURES and
+          MEASURES["height_above_seat_live"].sign is Sign.SIGNED)
+    # (2026-08-12 review, finding 4) the LIVE reading used to be keyed on the BARE quantity while its
+    # static-goal twin carried a frame suffix, so the same string meant "the live seat" in MEASURES
+    # and "illegal, say which frame" in the schema — and the carry chassis wrote the illegal one.
+    # Both frames now carry their frame in the key; the bare quantity names nothing.
+    check("the bare quantity is not a measure — both frames are frame-qualified",
+          "height_above_seat" not in MEASURES)
+    check("both frames of the seat height exist and are SIGNED",
+          {"height_above_seat_live", "height_above_seat_static_goal"} <= set(MEASURES) and
+          all(MEASURES[n].sign is Sign.SIGNED
+              for n in ("height_above_seat_live", "height_above_seat_static_goal")))
+    check("every chassis default names a measure that exists (the rename can't half-land)",
+          all(row["measure"] in MEASURES
+              for chassis in CHASSIS.values() for row in chassis.defaults.values()
+              if "measure" in row))
     check("object_to_goal_xy is a magnitude", MEASURES["object_to_goal_xy"].sign is Sign.MAGNITUDE)
     check("every measure declares a sign", all(m.sign in (Sign.SIGNED, Sign.MAGNITUDE)
                                                for m in MEASURES.values()))

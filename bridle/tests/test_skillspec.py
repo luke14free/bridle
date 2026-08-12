@@ -15,8 +15,8 @@ The other properties paid for by a measured failure:
   SIGN       HingePenalty over an unsigned measure makes `clamp(-sdz, min=0)` identically zero and
              silently deletes the term that exists because pressing to dz=0 broke 16/16 grasps
              (2026-06-04). The row still trains — it just trains without the term.
-  FRAME      descend's reward grades `height_above_seat` against the live seat while descend_stack's
-             success grades a frozen goal. One quantity, two frames.
+  FRAME      descend's reward grades the seat height against the live seat while descend_stack's
+             success grades a frozen goal. One quantity, two frames, so two names.
   DEFAULTS   a chassis supplies the deployed weights; the diff against them is what gets reviewed.
 
 Run: python -m pytest bridle/tests/test_skillspec.py
@@ -37,11 +37,20 @@ THREE DEVIATIONS FROM THE BRIEF'S SKETCH, all forced by the vocabulary as it act
   ...and one deviation the ambiguous-frame rule forces: §4 writes `measure: height_above_seat`,
   which this schema refuses as frame-ambiguous (two frames exist for that quantity, so the row must
   name one). The fixture writes `height_above_seat_live`, and the bare form is the frame test.
+
+  (2026-08-12 review, finding 4) That rule used to be enforced by an ALIAS layer in spec.py, because
+  `height_above_seat` was itself the MEASURES key for the live reading — so the legal set and the
+  key set disagreed on exactly that name, a chassis default wrote the illegal spelling and a second
+  code path resolved it silently, and `Row.params["measure"]` stored a spelling the parser refuses.
+  The vocabulary was renamed instead (`height_above_seat_live`); the alias layer is gone, the legal
+  set IS `MEASURES`, and `test_round_trips` below is the invariant that keeps it that way.
 """
 import json
 import sys
 
-from bridle.skill.spec import Row, SkillSpec, SpecError, json_schema, parse_spec
+from bridle.skill.spec import (
+    LEGAL_MEASURE_NAMES, Row, SkillSpec, SpecError, json_schema, parse_spec,
+)
 from bridle.skill.vocab import CHASSIS, MEASURES, TERMS
 
 FAILS = []
@@ -154,6 +163,18 @@ def error_from(doc):
     return None
 
 
+def accepts(label, doc):
+    """The mirror of `refuses`: assert the document parses, and hand back the spec (None if not).
+
+    Used where a plausible REGRESSION would refuse a legal document — an uncaught SpecError there
+    would abort the run and hide every check after it, which is exactly what a mutation test needs
+    not to happen.
+    """
+    exc = error_from(doc)
+    check(f"{label}: accepted", exc is None)
+    return parse_spec(doc) if exc is None else None
+
+
 def refuses(label, doc, *fragments, path=None, suggestion=None):
     """Assert the document is refused with a message a model can act on: SpecError, and every
     fragment present in `str(exc)` verbatim."""
@@ -203,6 +224,30 @@ def run_checks():
         row_mutable = False
     check("a Row's params cannot be mutated in place", not row_mutable)
 
+    # (2026-08-12 review, minor 1) `frozen=True` only stops the FIELD being rebound. Every value
+    # below hashes into the contract fingerprint that records which policy was trained under which
+    # spec, so a nested container that can be edited after construction is a fingerprint that stops
+    # describing the run.
+    def mutates(fn):
+        try:
+            fn()
+            return True
+        except Exception:
+            return False
+
+    for label, mutate in (
+        ("scene", lambda: spec.scene["goal"].__setitem__("type", "MUTATED")),
+        ("params", lambda: spec.params["hover"].__setitem__("value", 99.0)),
+        ("preflight", lambda: spec.preflight["static"]["descend_env._CENTER_TOL"]
+                                  .__setitem__("max", 99.0)),
+        ("init", lambda: spec.init.__setitem__("snapshot", "MUTATED")),
+        ("reward_scale", lambda: spec.reward_scale.__setitem__("divisor", 99.0)),
+        ("a scene list", lambda: spec.scene["held"]["half"].append(0.02)),
+    ):
+        check(f"{label} cannot be mutated after construction", not mutates(mutate))
+    check("the fixture really does carry a nested list for that last check to bite on",
+          isinstance(descend_doc()["scene"]["held"]["half"], list))
+
     # parsing must not write defaults back into the caller's dict
     doc = descend_doc()
     parse_spec(doc)
@@ -248,23 +293,71 @@ def run_checks():
     refuses("a row whose why is blank", row_edited(4, why="   "), "why", "rationale")
     refuses("a row whose why is not prose", row_edited(4, why=1.0), "why", "rationale")
 
-    # the frame-qualified form resolves back to the MEASURES key compile() will look up
-    check("a frame-qualified measure resolves to its canonical key",
-          spec.reward[2].params["measure"] == "height_above_seat")
+    # ── finding 4: one name set, so a spec survives being re-emitted and re-parsed ──────────────
+    # The invariant that made the finding visible: the schema's legal set and the vocabulary's key
+    # set are the SAME set. When they were not, `height_above_seat_live` was legal-but-not-a-key and
+    # `height_above_seat` was a-key-but-not-legal, and the difference was papered over by an alias
+    # table on one path and a silent live-frame default on the other.
+    check("the legal measure names ARE the MEASURES keys (no alias layer)",
+          set(LEGAL_MEASURE_NAMES) == set(MEASURES))
+    check("a stored measure is the name it was written under",
+          spec.reward[2].params["measure"] == "height_above_seat_live")
     check("the frozen-goal measure is nameable directly",
           parse_spec(row_edited(2, measure="height_above_seat_static_goal")
                      ).reward[2].params["measure"] == "height_above_seat_static_goal")
+    # re-emit every resolved measure and re-parse it: a spec that cannot round-trip cannot be
+    # written back to YAML, diffed, or fingerprinted from its own text.
+    reparsed = parse_spec(row_edited(2, measure=spec.reward[2].params["measure"]))
+    check("a resolved measure re-parses to itself (round trip)",
+          reparsed.reward[2].params["measure"] == spec.reward[2].params["measure"])
+    check("every chassis-supplied measure is a legal authored spelling too",
+          all(row["measure"] in LEGAL_MEASURE_NAMES
+              for c in CHASSIS.values() for row in c.defaults.values() if "measure" in row))
+    # a chassis-supplied measure now goes through the SAME validation as an authored one — there is
+    # no second resolution path that could hand `MEASURES[...]` a key it never checked
+    inherited_measure = parse_spec({
+        "name": "reach", "kind": "approach", "contract": "reach", "env_id": "SO100Reach-v1",
+        "scene": {"held": {"type": "cube", "half": 0.014}},
+        "reward": [{"term": "DistancePull", "why": "the approach chassis supplies the measure."}],
+        "success": "grasped",
+    })
+    check("a chassis-supplied measure lands as a real MEASURES key",
+          inherited_measure.reward[0].params["measure"] in MEASURES)
 
     # ── the rest of the vocabulary is checked too, not just terms and measures ──────────────────
     refuses("unknown chassis", doc_with(kind="cary"), "cary", "carry", path="kind",
             suggestion="carry")
     refuses("unknown predicate", row_edited(0, predicate="grapsed"), "grapsed", "grasped",
             path="reward[0].predicate", suggestion="grasped")
-    refuses("unknown predicate inside a gate", row_edited(1, gate="and_(grasped, abov_z(z=0.06))"),
+    refuses("unknown predicate in CALL position inside a gate",
+            row_edited(1, gate="and_(grasped, abov_z(z=0.06))"),
             "abov_z", "above_z", path="reward[1].gate")
+    # ── finding 2: the BARE operands of a compound predicate are names too ──────────────────────
+    # The check above was labelled "unknown predicate inside a gate" but the typo it plants is in
+    # CALL position, which the first implementation already looked up. The operand position — where
+    # `and_(grasped, ...)` actually puts a predicate, and the shape vocab.py's own chassis write —
+    # was never checked at all, so this parsed clean and compile() would bind nothing.
+    refuses("a typo'd BARE operand inside a compound gate",
+            row_edited(1, gate="and_(grapsed, above_z(z=0.06))"),
+            "grapsed", "grasped", path="reward[1].gate", suggestion="grasped")
+    refuses("a typo'd BARE operand inside a compound predicate",
+            row_edited(0, predicate="or_(grasped, not_grapsed)"),
+            "not_grapsed", "not_grasped", path="reward[0].predicate", suggestion="not_grasped")
+    refuses("a predicate string that names nothing at all",
+            row_edited(0, predicate="!!!"), "names no predicate", path="reward[0].predicate")
     check("a compound gate over real predicates is accepted",
           parse_spec(row_edited(1, gate="and_(grasped, above_z(z=0.06))")
                      ).reward[1].params["gate"].startswith("and_("))
+    # ...and the price of checking bare names must not be false refusals: a keyword argument's VALUE
+    # is scene data (`anchor=target_pos` is a point, not a predicate), and every predicate string
+    # the shipped vocabulary writes has to keep parsing. carry_with_potential writes the hardest one.
+    chassis_predicates = sorted({row[field] for c in CHASSIS.values() for row in c.defaults.values()
+                                 for field in ("predicate", "gate") if field in row})
+    check("the vocabulary writes more than one compound predicate (the check bites)",
+          sum("(" in p for p in chassis_predicates) >= 2)
+    for text in chassis_predicates:
+        check(f"a chassis' own predicate is accepted verbatim: {text[:48]}",
+              error_from(row_edited(0, predicate=text)) is None)
     refuses("unknown row parameter", row_edited(0, wieght=1.0), "wieght", "weight",
             path="reward[0].wieght", suggestion="weight")
     refuses("a parameter of the wrong type", row_edited(0, weight="heavy"),
@@ -274,6 +367,69 @@ def run_checks():
     refuses("a required parameter with no default anywhere",
             doc_with(reward=[{"term": "Ramp", "measure": "object_z", "why": "ramp the lift."}]),
             "cap", "required", path="reward[0].cap")
+
+    # ── finding 3: the required-parameter refusal must be true and actionable ───────────────────
+    # The carry chassis supplies TWO DistancePull rows; nothing was inherited because the row names
+    # no measure to choose between them. The refusal used to say "neither the row nor the 'carry'
+    # chassis supplies one" — the opposite of the truth — with no legal set and no suggestion, the
+    # only refusal in the module with neither. What the author needs is the candidates.
+    ambiguous_row = refuses(
+        "a required parameter the chassis supplies TWICE names both candidates",
+        doc_with(reward=[{"term": "DistancePull", "why": "pull it in."}]),
+        "required", "carry", "2 DistancePull rows", "object_to_goal_xy", "height_above_seat_live",
+        path="reward[0].measure")
+    check("...and does NOT claim the chassis supplies nothing",
+          "chassis supplies one" not in str(ambiguous_row))
+    check("...and states a legal set, unconditionally",
+          "legal values:" in str(ambiguous_row))
+    check("...and shows what picking a candidate would inherit (the weights that differ)",
+          "1.5" in str(ambiguous_row) and "2.5" in str(ambiguous_row))
+    # naming one of them resolves it — the refusal's own instruction has to work
+    check("naming the candidate's measure is the fix the message asks for",
+          parse_spec(doc_with(reward=[{"term": "DistancePull", "measure": "object_to_goal_xy",
+                                       "why": "pull it in."}])).reward[0].params["weight"] == 1.5)
+    # the same shape over a predicate-discriminated pair (carry's grasped / not_grasped bonuses)
+    refuses("...and the same for a predicate-discriminated pair",
+            doc_with(reward=[{"term": "PredicateBonus", "why": "bonus."}]),
+            "required", "2 PredicateBonus rows", "grasped", "not_grasped",
+            path="reward[0].predicate")
+
+    # ── finding 1: a key present with a null value is NOT a supplied value ──────────────────────
+    # `measure:` with nothing after it is the commonest LLM YAML slip there is. Treating that None
+    # as authored short-circuited required-ness, typing, `choices` AND the signed-measure gate (whose
+    # guard reads `is not None`), so `HingePenalty` with `measure: null` parsed and stored None.
+    refuses("a null measure on HingePenalty is refused, not stored",
+            row_edited(3, measure=None), "measure", "required", path="reward[3].measure")
+    check("a null key and an absent key are refused identically",
+          str(error_from(row_edited(3, measure=None))) == str(error_from(row_edited(3,
+                                                                                   measure=DROP))))
+    check("no accepted row leaves a needs_signed_measure term without a measure",
+          all(r.term is None or not TERMS[r.term].needs_signed_measure
+              or r.params.get("measure") is not None
+              for d in (descend_doc(), row_edited(3, measure="gripper_qpos"))
+              for r in parse_spec(d).reward))
+    refuses("a null predicate on PredicateBonus is refused",
+            row_edited(0, predicate=None), "required", path="reward[0].predicate")
+    refuses("a null cap does not satisfy Ramp's required cap",
+            doc_with(reward=[{"term": "Ramp", "measure": "object_z", "cap": None,
+                              "why": "ramp the lift."}]),
+            "cap", "required", path="reward[0].cap")
+    # ...and the other direction: a null falls THROUGH, exactly like an absent key
+    nulled = parse_spec(row_edited(0, weight=None))
+    check("a null weight falls through to the chassis default rather than storing None",
+          nulled.reward[0].params["weight"] == 1.0)
+    check("a null optional still ends up at the term's own default, not None",
+          parse_spec(row_edited(0, mode=None)).reward[0].params["mode"] == "add")
+    check("a term default that IS None still comes through as None (axes/gate are optional)",
+          spec.reward[0].params.get("scope") == "preceding" and
+          parse_spec(row_edited(1, gate=DROP)).reward[1].params["gate"] == "grasped")
+    check("an authored null on a single-candidate chassis inherits the chassis value",
+          parse_spec({
+              "name": "reach", "kind": "approach", "contract": "reach", "env_id": "SO100Reach-v1",
+              "scene": {"held": {"type": "cube", "half": 0.014}},
+              "reward": [{"term": "DistancePull", "measure": None, "why": "a bare `measure:`."}],
+              "success": "grasped",
+          }).reward[0].params["measure"] == "tcp_to_object")
     refuses("unknown top-level field", doc_with(reward_scal={"divisor": 12.0}),
             "reward_scal", "reward_scale", path="reward_scal", suggestion="reward_scale")
     refuses("a missing required field", doc_with(success=DROP), "success", path="success")
@@ -291,6 +447,30 @@ def run_checks():
     # ── per-skill params (§5): declared, severity-tagged, and actually referenced ───────────────
     refuses("a params.X that resolves to nothing", row_edited(2, setpoint="params.hovr"),
             "hovr", "hover", path="reward[2].setpoint", suggestion="hover")
+    # (2026-08-12 review, minor 2) the `params.X` bypass is for NUMBERS whose type only compile()
+    # can answer for. It used to be a bare `startswith("params.")`, so it also skipped `choices` and
+    # `mode: params.hover` was accepted on PredicateBonus although `mode` is a closed set of three.
+    refuses("a params.X does not buy its way past a closed choice set",
+            row_edited(0, mode="params.hover"), "params.hover", "replace", path="reward[0].mode")
+    check("...while a params.X in a NUMERIC field is still deferred to compile()",
+          parse_spec(row_edited(2, setpoint="params.hover")
+                     ).reward[2].params["setpoint"] == "params.hover")
+    # (2026-08-12 review, minor 3) resolved toward ALLOWING: `reward_scale` takes a `params.X` in
+    # its numeric field exactly as a reward row does, rather than being the one place the rule flips.
+    scaled = accepts("reward_scale takes a params.X reference, like a row value",
+                     doc_with(reward_scale={"divisor": "params.hover"}))
+    check("...and stores it verbatim for compile() to bind",
+          scaled is not None and scaled.reward_scale["divisor"] == "params.hover")
+    refuses("...and it is checked against `params:` like a row value",
+            doc_with(reward_scale={"divisor": "params.hovr"}), "hovr", "hover",
+            path="reward_scale.divisor", suggestion="hover")
+    refuses("...but a bool field takes no reference (numeric-only, as in rows)",
+            doc_with(reward_scale={"unnormalized": "params.hover"}), "unnormalized", "bool",
+            path="reward_scale.unnormalized")
+    nulled_scale = accepts("a null reward_scale field is not a divisor of None",
+                           doc_with(reward_scale={"divisor": None}))
+    check("...it falls through to the chassis' 12.0",
+          nulled_scale is not None and nulled_scale.reward_scale["divisor"] == 12.0)
     refuses("a params.X in the success criterion that resolves to nothing",
             doc_with(success="all[grasped, height_above_resting_in(params.lowband)]"),
             "lowband", "low_band", path="success")
