@@ -181,6 +181,18 @@ def fold_both(plan, env, action, info, ref_slots, adapter_fn):
     return got, reference
 
 
+def _warnings_off():
+    """`height_above_resting_in` reads the table-frame measure and warns about it on purpose (see
+    `_warn_default_resting_frame`); block [H] is where that warning is asserted on, so it is silenced
+    where it is merely incidental rather than being weakened at the source."""
+    import contextlib
+    import warnings
+    stack = contextlib.ExitStack()
+    stack.enter_context(warnings.catch_warnings())
+    warnings.simplefilter("ignore")
+    return stack
+
+
 def agree(got, reference, tol=2e-6):
     return (tuple(got.shape) == (N,)
             and all(abs(float(got[i]) - reference[i]) <= tol for i in range(N)))
@@ -521,6 +533,53 @@ def run_checks():
     check("I3 the measures this file folds as SIGNED are still declared SIGNED upstream",
           not (set(SE._SIGN_LOAD_BEARING) - SE.SIGNED_MEASURES),
           ", ".join(sorted(SE._SIGN_LOAD_BEARING)))
+
+    # ── [J] every predicate is REACHED, not just registered ──────────────────────────────────────
+    # `PREDICATE_FNS` having 16 entries says nothing about whether 16 of them run: the key-set assert
+    # below compares names. This calls each one through the real parse -> desugar -> evaluate path
+    # and insists on a (N,) float. It is also the check that makes a file move like the
+    # skill_env -> skill_predicates split provable: a helper left behind surfaces here as a
+    # NameError on the one predicate that used it, not as a crash in a training run six hours in.
+    print("\n[J] every predicate evaluates")
+    spellings = {
+        "grasped": "grasped",
+        "not_grasped": "not_grasped",
+        "above_z": "above_z(z=0.06)",
+        "below_height": "below_height(z=0.06)",
+        "within_radius": "within_radius(anchor=target_pos, radius_expr=0.05)",
+        "in_cylinder": "in_cylinder(radius=0.05, floor=0.01)",
+        "at_rest": "at_rest(linear=0.02, angular=0.5)",
+        "undisturbed": "undisturbed(drift=0.01, tilt=0.3)",
+        "height_above_resting_in": "height_above_resting_in(band=0.01)",
+        "and_": "and_(grasped, above_z(z=0.06))",
+        "or_": "or_(grasped, above_z(z=0.06))",
+        "not_": "not_(grasped)",
+        "sustained": "sustained(grasped, k=2, consecutive=True)",
+        "latched": "latched(grasped)",
+        "forall": "forall(grasped, over=bricks)",
+        "for_n": "for_n(grasped, over=bricks, n=2)",
+    }
+    check("J0 a spelling is exercised for every registered predicate",
+          set(spellings) == set(SE.PREDICATE_FNS), sorted(set(spellings) ^ set(SE.PREDICATE_FNS)))
+    env_p, slots_p = FakeEnv(), SE.StateSlots()
+    slots_p.ensure(env_p)
+    ctx_p = SE.MeasureContext(env_p, None, action, {}, slots_p, SE.DEFAULT_BINDING, where="test")
+    bad, refused = [], []
+    with _warnings_off():
+        for name, text in spellings.items():
+            try:
+                v = ctx_p.predicate(text)
+            except SE.SkillEnvError as exc:
+                refused.append(name)
+                if "scene" not in str(exc):
+                    bad.append(f"{name}: refused for the wrong reason ({exc})")
+                continue
+            if not (v.dtype.is_floating_point and tuple(v.shape) == (N,)
+                    and float(v.min()) >= 0.0 and float(v.max()) <= 1.0):
+                bad.append(f"{name}: {v.dtype} {tuple(v.shape)}")
+    check("J1 every implemented predicate returns a (N,) float in [0,1]", not bad, "; ".join(bad))
+    check("J2 the two quantifiers are the only refusals, and they refuse on the scene block",
+          sorted(refused) == ["for_n", "forall"], f"refused: {sorted(refused)}")
 
 
 def test_bridle():
