@@ -92,7 +92,7 @@ def cmd_relaunch(a):
     # whose thesis is that two records of one fact is the disease.
     from bridle.store import Store
     from bridle.adapters.preflight import collect, readable_env
-    from bridle.lineage import format_diff
+    from bridle.lineage import NAMESPACES, EmptyDiff, UnknownOverride, format_diff
     from bridle.preflight import DYNAMIC, evaluate, format_effective, format_failures
     from bridle.relaunch import build_plan, install_and_start, systemd_unit
 
@@ -106,14 +106,30 @@ def cmd_relaunch(a):
         doc = {}
         print(f"warning: no preflight.yaml at {pf_path} — running kind asserts only")
     overrides = dict(kv.split("=", 1) for kv in a.set or [])
-    plan = build_plan(manifest, doc, overrides, a.exp,
-                      readable_env(a.module or doc.get("module", "")))
+    try:
+        plan = build_plan(manifest, doc, overrides, a.exp,
+                          readable_env(a.module or doc.get("module", "")))
+    except (EmptyDiff, UnknownOverride, ValueError) as e:
+        # These three already carry an actionable message (lineage.py / relaunch.py write them for
+        # a human to read). The callers of this command include an automated agent, for which a raw
+        # traceback is not a contract — so refuse cleanly instead of letting it propagate, the same
+        # way a preflight failure below already returns 1 with a clean message.
+        print(f"refused: {e}")
+        return 1
 
     print(f"\nrelaunch {plan.app} as {plan.exp}\n\nchange:")
     print(format_diff(plan.changes))
     print("\neffective asserts:")
     print(format_effective(plan.asserts))
 
+    # Delete every namespaced variable that survived from the calling shell but is NOT part of this
+    # plan, before updating with plan.env. Preflight's STATIC tier imports the target module
+    # in-process and reads os.environ directly, but systemd_unit() below only emits `Environment=`
+    # lines for plan.env — so a stray namespaced var left in the process environment would let
+    # preflight validate a configuration that is not the one the launched unit actually gets.
+    # Preflight is worthless if it measures a different config than the one that runs.
+    for k in [k for k in os.environ if k.startswith(NAMESPACES) and k not in plan.env]:
+        del os.environ[k]
     os.environ.update(plan.env)
     values = collect(plan.asserts, doc.get("env_id", ""), a.module or doc.get("module", ""),
                      a.warm_start, doc.get("eval_envs", 64), doc.get("eval_steps", 64))

@@ -123,7 +123,7 @@ def run_checks():
           compare_records(eff, {"PRIM_COORD_OBS": "0"}, "x", prefix="COORD_CKPT_") == [])
 
     # ── the relaunch plan: the whole of today's mistake #2, prevented ──
-    from bridle.relaunch import build_plan
+    from bridle.relaunch import build_plan, systemd_unit
     manifest = {"name": "place_coord_v3",
                 "training": {"launcher": "bash train.sh", "source": "captured",
                              "env": {"PRIM_CARRY_GRIP_HOLD": "1", "PRIM_CARRY_GRIP_CLOSE": "0.0",
@@ -133,7 +133,9 @@ def run_checks():
     plan = build_plan(manifest, doc, {"PRIM_DESCEND_CENTER_TOL": "0.012"}, "tol12", readable)
     check("relaunch inherits the grip freeze", plan.env["PRIM_CARRY_GRIP_HOLD"] == "1")
     check("relaunch applies the one override", plan.env["PRIM_DESCEND_CENTER_TOL"] == "0.012")
-    check("relaunch records exactly one change", len(plan.changes) == 1)
+    # one override change + the two mandatory name-change entries (COORD_EXP, BRIDLE_EXP) — see
+    # the FINDING-1 tests below for why both must move and both must be reported
+    check("relaunch records the override plus the two name changes", len(plan.changes) == 3)
     check("relaunch names the run", plan.env["COORD_EXP"] == "tol12" or plan.exp == "tol12")
     check("relaunch merged the kind asserts",
           any(a.path == "is_grasped_at_end" for a in plan.asserts))
@@ -142,6 +144,50 @@ def run_checks():
     check("an unreadable override is refused",
           raises(UnknownOverride, build_plan, manifest, doc,
                  {"PRIM_DSTACK_CENTER_TOL": "0.012"}, "x", readable))
+
+    # ── FINDING 1: the lineage name must ACTUALLY move, for both name variables, every time ──
+    # `manifest` above already captures an env with NEITHER COORD_EXP nor BRIDLE_EXP set — the
+    # exact case that broke: primitives/descend_to_target/teacher_train.sh reads only BRIDLE_EXP
+    # (`EXP=${BRIDLE_EXP:-descend-teacher-seed20}`), so a lineage that relied on that shell default
+    # never had BRIDLE_EXP in its captured env, and the old `if key in t["env"] or key ==
+    # "COORD_EXP"` guard left BRIDLE_EXP unset — the relaunch would then write into the ORIGINAL
+    # run's directory.
+    check("COORD_EXP is set even though it was absent from the capture",
+          plan.env["COORD_EXP"] == "tol12")
+    check("BRIDLE_EXP is set even though it was absent from the capture",
+          plan.env["BRIDLE_EXP"] == "tol12")
+    check("both name variables are reported in the diff, not injected silently",
+          {"COORD_EXP", "BRIDLE_EXP"} <= {c.key for c in plan.changes})
+    check("the diff shows COORD_EXP moving from unset",
+          any(c.key == "COORD_EXP" and c.before is None and c.after == "tol12"
+              for c in plan.changes))
+    check("the diff shows BRIDLE_EXP moving from unset",
+          any(c.key == "BRIDLE_EXP" and c.before is None and c.after == "tol12"
+              for c in plan.changes))
+
+    # a captured env that ALREADY has BRIDLE_EXP (an old lineage name) must be moved off it, and
+    # the move must be reported — not silently overwritten
+    manifest_named = {"name": "place_coord_v3",
+                      "training": {"launcher": "bash train.sh", "source": "captured",
+                                   "env": {"PRIM_CARRY_GRIP_HOLD": "1",
+                                           "PRIM_DESCEND_CENTER_TOL": "0.025",
+                                           "BRIDLE_EXP": "place-coord-v3-seed20"}}}
+    plan_named = build_plan(manifest_named, doc, {"PRIM_DESCEND_CENTER_TOL": "0.012"},
+                            "tol12", readable)
+    check("an existing BRIDLE_EXP is moved to the new lineage name",
+          plan_named.env["BRIDLE_EXP"] == "tol12")
+    check("moving an existing BRIDLE_EXP is reported in the diff",
+          any(c.key == "BRIDLE_EXP" and c.before == "place-coord-v3-seed20" and c.after == "tol12"
+              for c in plan_named.changes))
+
+    # ── FINDING 4: a launcher containing a single quote must not break ExecStart's quoting ──
+    unit = systemd_unit("tol12", "bash -c 'echo hi'", {"BRIDLE_EXP": "tol12"}, "/home/luca/lego-arm")
+    execstart = next(l for l in unit.splitlines() if l.startswith("ExecStart="))
+    check("ExecStart is present", execstart)
+    # if the launcher's own quote were left unescaped, it would close the ExecStart quoting right
+    # here and the rest of the launcher would fall outside the quoted command
+    check("the launcher's raw quote does not terminate the quoting",
+          "-c 'echo hi'" not in execstart)
 
 
 def test_bridle():

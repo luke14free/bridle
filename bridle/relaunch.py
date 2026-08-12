@@ -11,6 +11,7 @@ bridle does NOT import lego-arm to do this. It reads the app manifest as data an
 `training.launcher` as a string, exactly as Foundry/ShellStageRunner already do.
 """
 import os
+import shlex
 import subprocess
 from dataclasses import dataclass
 
@@ -65,10 +66,17 @@ def build_plan(manifest: dict, preflight_doc: dict, overrides: dict, exp: str,
     env, changes = apply_overrides(t["env"], overrides)
     require_change(changes)
     # The lineage name must move with the lineage: a changed run must never write into the
-    # unchanged run's directory, which is how a contaminated ckpt gets resumed from.
-    for key in ("COORD_EXP", "BRIDLE_EXP"):
-        if key in t["env"] or key == "COORD_EXP":
-            env[key] = exp
+    # unchanged run's directory, which is how a contaminated ckpt gets resumed from. Both
+    # COORD_EXP and BRIDLE_EXP are set UNCONDITIONALLY — not only when already present in the
+    # captured env — and routed through the same apply_overrides() that produced `changes` above,
+    # so the rename is reported in the diff instead of happening silently behind it. The asymmetry
+    # is deliberate: setting a name variable the launcher does not read is harmless, while failing
+    # to set the one it DOES read is exactly the contamination this module exists to prevent — e.g.
+    # primitives/descend_to_target/teacher_train.sh reads only `EXP=${BRIDLE_EXP:-descend-teacher-
+    # seed20}`, so a lineage that relied on that shell default never exported BRIDLE_EXP, and an
+    # `if key in t["env"]` guard on it would leave the relaunch writing into the original run dir.
+    env, name_changes = apply_overrides(env, {"COORD_EXP": exp, "BRIDLE_EXP": exp})
+    changes = changes + name_changes
     asserts = merge(preflight_doc.get("kind"), _asserts_from_doc(preflight_doc))
     return RelaunchPlan(manifest["name"], exp, env, changes, asserts, t["launcher"])
 
@@ -77,6 +85,10 @@ def systemd_unit(name: str, cmd: str, env: dict, cwd: str) -> str:
     """Long jobs are systemd --user units, never bare nohup (CLAUDE.md): reboot-resumable, and
     `systemctl --user status` is the one place to look."""
     lines = "\n".join(f"Environment={k}={v}" for k, v in sorted(env.items()))
+    # shlex.quote, not a hand-written "'{cmd}'": a launcher containing a single quote (a training
+    # arg with an embedded string, say) would otherwise close the ExecStart quoting early and hand
+    # systemd a broken command line.
+    quoted_cmd = shlex.quote(cmd)
     return f"""[Unit]
 Description=bridle relaunch — {name}
 After=network.target
@@ -85,7 +97,7 @@ After=network.target
 Type=simple
 WorkingDirectory={cwd}
 {lines}
-ExecStart=/bin/bash -lc '{cmd}'
+ExecStart=/bin/bash -lc {quoted_cmd}
 Restart=on-failure
 RestartSec=30
 
