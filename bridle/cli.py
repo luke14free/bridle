@@ -14,6 +14,7 @@ whole project exists to prevent.
 """
 import argparse
 import importlib
+import os
 import sys
 
 from bridle.agent import AgentSession
@@ -84,9 +85,56 @@ def cmd_tui(a):
     return 0
 
 
+def cmd_relaunch(a):
+    """Reproduce a deployed lineage with named overrides, gated by preflight."""
+    # bridle declares `dependencies = []`; Store._load_text already does the lazy `import yaml`
+    # with a json fallback, so use it rather than adding a third YAML-reading path to a codebase
+    # whose thesis is that two records of one fact is the disease.
+    from bridle.store import Store
+    from bridle.adapters.preflight import collect, readable_env
+    from bridle.lineage import format_diff
+    from bridle.preflight import DYNAMIC, evaluate, format_effective, format_failures
+    from bridle.relaunch import build_plan, install_and_start, systemd_unit
+
+    store = Store(a.store)
+    manifest = store._load_text(
+        open(os.path.join(os.path.expanduser(a.store), f"{a.app}.yaml")).read())
+    pf_path = a.preflight or os.path.join(a.cwd, "primitives", a.app, "preflight.yaml")
+    if os.path.isfile(pf_path):
+        doc = store._load_text(open(pf_path).read()) or {}
+    else:
+        doc = {}
+        print(f"warning: no preflight.yaml at {pf_path} — running kind asserts only")
+    overrides = dict(kv.split("=", 1) for kv in a.set or [])
+    plan = build_plan(manifest, doc, overrides, a.exp,
+                      readable_env(a.module or doc.get("module", "")))
+
+    print(f"\nrelaunch {plan.app} as {plan.exp}\n\nchange:")
+    print(format_diff(plan.changes))
+    print("\neffective asserts:")
+    print(format_effective(plan.asserts))
+
+    os.environ.update(plan.env)
+    values = collect(plan.asserts, doc.get("env_id", ""), a.module or doc.get("module", ""),
+                     a.warm_start, doc.get("eval_envs", 64), doc.get("eval_steps", 64))
+    failures = evaluate(plan.asserts, values, from_scratch=a.from_scratch)
+    if failures:
+        print("\n" + format_failures(failures))
+        return 1
+    print("\npreflight OK")
+    if a.dry_run:
+        print("(dry run — pass --launch to start)")
+        return 0
+    handle = install_and_start(f"bridle-{plan.exp}",
+                               systemd_unit(plan.exp, plan.launcher, plan.env, a.cwd))
+    print(f"launched: systemd --user {handle}")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="bridle", description=__doc__.split("\n")[0])
-    ap.add_argument("--store", default="~/.bridle/apps")
+    ap.add_argument("--store", default=os.environ.get(
+        "BRIDLE_STORE", "/home/luca/lego-arm/composer/store/apps"))
     ap.add_argument("--cameras", default="base", help="comma-separated camera names on your rig")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -106,6 +154,19 @@ def main(argv=None):
     p = sub.add_parser("plan", help="why a skill needs adapting or rebuilding")
     p.add_argument("app")
     p.set_defaults(fn=cmd_plan)
+
+    r = sub.add_parser("relaunch", help="retrain a deployed lineage with one variable changed")
+    r.add_argument("app")
+    r.add_argument("--set", action="append", metavar="K=V",
+                   help="override one variable; repeatable. An empty diff is refused.")
+    r.add_argument("--exp", required=True, help="name for the new lineage (COORD_EXP/BRIDLE_EXP)")
+    r.add_argument("--module", default=None, help="python module that registers the env")
+    r.add_argument("--preflight", default=None, help="path to preflight.yaml")
+    r.add_argument("--warm-start", default=None, help="ckpt to seed and to preflight against")
+    r.add_argument("--from-scratch", action="store_true", help="skip asserts needing a warm start")
+    r.add_argument("--cwd", default="/home/luca/lego-arm")
+    r.add_argument("--dry-run", action="store_true")
+    r.set_defaults(fn=cmd_relaunch)
 
     a = ap.parse_args(argv)
     return a.fn(a)

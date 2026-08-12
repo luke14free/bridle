@@ -122,6 +122,27 @@ def run_checks():
     check("prefix scopes the comparison",
           compare_records(eff, {"PRIM_COORD_OBS": "0"}, "x", prefix="COORD_CKPT_") == [])
 
+    # ── the relaunch plan: the whole of today's mistake #2, prevented ──
+    from bridle.relaunch import build_plan
+    manifest = {"name": "place_coord_v3",
+                "training": {"launcher": "bash train.sh", "source": "captured",
+                             "env": {"PRIM_CARRY_GRIP_HOLD": "1", "PRIM_CARRY_GRIP_CLOSE": "0.0",
+                                     "PRIM_COORD_OBS": "1", "PRIM_DESCEND_CENTER_TOL": "0.025"}}}
+    doc = {"kind": "carry", "dynamic": {"descend_low_once": {"min": 0.5}}}
+    readable = {"PRIM_CARRY_GRIP_HOLD", "PRIM_COORD_OBS", "PRIM_DESCEND_CENTER_TOL"}
+    plan = build_plan(manifest, doc, {"PRIM_DESCEND_CENTER_TOL": "0.012"}, "tol12", readable)
+    check("relaunch inherits the grip freeze", plan.env["PRIM_CARRY_GRIP_HOLD"] == "1")
+    check("relaunch applies the one override", plan.env["PRIM_DESCEND_CENTER_TOL"] == "0.012")
+    check("relaunch records exactly one change", len(plan.changes) == 1)
+    check("relaunch names the run", plan.env["COORD_EXP"] == "tol12" or plan.exp == "tol12")
+    check("relaunch merged the kind asserts",
+          any(a.path == "is_grasped_at_end" for a in plan.asserts))
+    check("a no-op relaunch is refused",
+          raises(EmptyDiff, build_plan, manifest, doc, {}, "x", readable))
+    check("an unreadable override is refused",
+          raises(UnknownOverride, build_plan, manifest, doc,
+                 {"PRIM_DSTACK_CENTER_TOL": "0.012"}, "x", readable))
+
 
 def test_bridle():
     run_checks()
