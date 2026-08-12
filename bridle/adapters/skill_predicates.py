@@ -4,7 +4,7 @@ WHAT THIS IS: a parser and evaluator, not an env adapter. A `gate:`, a `predicat
 line in a skill document are all the same little language — a bare vocabulary name, or a call over
 vocabulary names (`and_(grasped, above_z(z=0.06))`), plus the bracket sugar `all[...]`/`any[...]`
 the design doc §4 and the acceptance fixture write. This module owns that language end to end: the
-`ast` whitelist, the desugarer, argument resolution, and the sixteen predicates themselves.
+`ast` whitelist, the desugarer, argument resolution, and the seventeen predicates themselves.
 
 WHY IT IS NOT IN `skill_env.py`. It re-implements the whitelist discipline `bridle/skill/expr.py`
 already owns for reward expressions, for the same stated reason (the author is a 27-30B model, so
@@ -21,7 +21,10 @@ DEFINED here, at the bottom of that edge, and re-exported by `skill_env` so ever
 `except skill_env.SkillEnvError` keeps catching the same class object.
 
 Every predicate returns a 0.0/1.0 FLOAT tensor, not a bool one, so it can be multiplied into a gate
-and subtracted from 1 without the bool-tensor arithmetic error `skill_env._B` exists to avoid.
+and subtracted from 1 without `RuntimeError: Subtraction, the `-` operator, with a bool tensor is
+not supported`. `compile._numeric` now normalises a bool CONDITION at the source, but a predicate is
+a VALUE — it is multiplied into gates and subtracted from 1 by term math that never goes near
+`_numeric` — so returning a float here is still the contract, not a redundancy.
 
 Torch is imported lazily inside the functions that need it, matching `adapters/preflight.py` and
 `skill_env.py`: this module must import on a box with no torch so that the `PREDICATE_FNS` key-set
@@ -55,7 +58,7 @@ def _norm(v):
 # refusal rather than something that depends on it never being tried.
 #
 # Every predicate returns a 0.0/1.0 FLOAT tensor, not a bool one, so it can be multiplied into a
-# gate and subtracted from 1 without the bool-tensor arithmetic error `_B` exists to avoid.
+# gate and subtracted from 1 without torch's bool-tensor subtraction error (module docstring).
 
 #: `ast.List`/`ast.Tuple` are admitted for ONE reason: `and_`/`or_` declare `terms: list[predicate]`,
 #: so `and_(terms=[grasped, above_z(z=0.06)])` is a spelling the vocabulary's own type invites even
@@ -290,10 +293,36 @@ def _p_height_above_resting_in(ctx, args):
     held cube being positioned is never stationary and the at-rest gate never latched (eval
     2026-06-03: descend_low_once=1.0 while obj_at_rest=0.06). Reads the measure it NAMES — if the
     band is meant against the destination seat, bind `resting_surface_z` (see
-    `_m_height_above_resting`) rather than expecting this predicate to switch measures silently."""
+    `_m_height_above_resting`) rather than expecting this predicate to switch measures silently.
+
+    IT IS BOUNDED BELOW, and its sibling `below_resting_height(band)` is not. Use this one when
+    below-the-surface is a FAILURE; use the sibling when it merely still counts as low, which is how
+    `descend_env.py`'s own `low` gate is written. The two disagree on 37 of 64 forced
+    full-criterion descend states (measured 2026-08-12)."""
     band = args.number(0, "band", required=True)
     height = ctx.measure("height_above_resting")
     return _f((height >= 0.0) & (height <= band), ctx)
+
+
+def _p_below_resting_height(ctx, args):
+    """`height_above_resting < band`, UNBOUNDED BELOW — `descend_env.py`'s `low` gate.
+
+    The lower bound `height_above_resting_in` imposes is wrong for THIS criterion on purpose: a cube
+    pressed BELOW its resting height is still low, and the crush penalty (descend's
+    `-3.0*clamp(-sdz, min=0)`, which exists because pressing to dz=0 broke 16/16 grasps on
+    2026-06-04), not the success gate, is what handles pressing.
+
+    Measured 2026-08-12: routing descend's criterion through `height_above_resting_in` instead
+    disagreed on 37 of 4456 sampled states on this component alone, on 64/64 of the states below the
+    seat, and on 37 of 64 at FULL criterion level once `centered` is forced true.
+
+    Reads the measure it NAMES — if the band is meant against a destination seat, bind
+    `resting_surface_z` (see `_m_height_above_resting`) rather than expecting this predicate to
+    switch measures silently.
+    """
+    band = args.number(0, "band", required=True)
+    height = ctx.measure("height_above_resting")
+    return _f(height < band, ctx)
 
 
 def _p_and(ctx, args):
@@ -367,6 +396,7 @@ PREDICATE_FNS = {
     "at_rest": _p_at_rest,
     "undisturbed": _p_undisturbed,
     "height_above_resting_in": _p_height_above_resting_in,
+    "below_resting_height": _p_below_resting_height,
     "and_": _p_and,
     "or_": _p_or,
     "not_": _p_not,

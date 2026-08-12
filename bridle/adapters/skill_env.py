@@ -11,8 +11,9 @@ spells out what every one of the 9 terms computes, and a second transcription in
 two halves of a reward stop agreeing — the stdlib evaluator a unit test asserts on and the CUDA
 evaluator PPO actually trains against would drift apart silently, each one "correct". So this module
 CALLS that table (`_TERM_VALUE` below) with batched values and only supplies (a) the readings and
-(b) the ordered fold's `torch.where` selection. See `_B` for the one adaptation that makes calling it
-with tensors possible at all.
+(b) the ordered fold's `torch.where` selection. The readings are handed over as RAW tensors: see the
+note above `_values_for` for the wrapper that used to be needed and the compile.py fix that removed
+the need for it.
 
 WHAT IS NOT SHARED, AND WHY: the fold loop itself. `evaluate_plan` selects with
 `_where(c, a, b) = c*a + (1-c)*b`, which is right for a scalar and right for a tensor, but the plan
@@ -41,7 +42,6 @@ owns, and it is the part that grows when quantifiers land. It knows nothing abou
 reverse — which is why `SkillEnvError` and `_norm` are defined there and re-exported here.
 """
 import dataclasses
-import operator
 import warnings as warn
 
 from bridle.adapters.skill_predicates import (
@@ -64,95 +64,6 @@ __all__ = [
 #: rather than left as bare imports so a linter does not delete them as unused.
 _REEXPORTED = (PREDICATE_FNS, SkillEnvError, _desugar_brackets, _eval_predicate_text, _f, _norm,
                _up_axis)
-
-
-# ── the batched value ───────────────────────────────────────────────────────────────────────────
-# `compile.py`'s helpers are written branch-free (`_where(c,a,b) = c*a + (1-c)*b`) specifically so
-# the same code can fold a Python float and a CUDA tensor. It ALMOST works. It does not, and the
-# reason is one line of torch:
-#
-#     >>> 1 - torch.tensor([True, False])
-#     RuntimeError: Subtraction, the `-` operator, with a bool tensor is not supported.
-#
-# `_max`, `_min`, `_clamp` and `_relu` all build their condition from a comparison (`a > b`), and a
-# torch comparison yields a BOOL tensor, so `compile._relu(torch.tensor([-1.0, 2.0]))` raises today
-# (measured 2026-08-13). Reported as a defect in compile.py; NOT worked around by transcribing the
-# term math, which is the whole thing this file is trying not to do.
-#
-# `_B` closes it from the outside: a thin value wrapper whose comparisons return a 0.0/1.0 FLOAT
-# tensor instead of a bool one. Every helper in `compile.py` and `expr.py` then runs verbatim over
-# batched tensors, and the arithmetic PPO trains against is literally the arithmetic the CPU unit
-# tests assert on.
-
-_ARITHMETIC = {"add": operator.add, "sub": operator.sub, "mul": operator.mul,
-               "truediv": operator.truediv, "pow": operator.pow}
-_COMPARISON = {"lt": operator.lt, "le": operator.le, "gt": operator.gt, "ge": operator.ge,
-               "eq": operator.eq, "ne": operator.ne}
-
-
-class _B:
-    """One batched `(N,)` reading, wrapped so scalar-shaped code can operate on it elementwise."""
-
-    __slots__ = ("t",)
-
-    def __init__(self, t):
-        self.t = t
-
-    def __repr__(self):
-        return f"_B({tuple(self.t.shape)}, {self.t.dtype})"
-
-    def __abs__(self):
-        return _B(self.t.abs())
-
-    def __neg__(self):
-        return _B(-self.t)
-
-    def __pos__(self):
-        return _B(self.t)
-
-    # `tanh`/`exp`/`log`/`sqrt` are METHOD dispatch in both `compile._dispatch` and
-    # `expr._method_or_math` (`getattr(x, "tanh", None)`), which is the mechanism that keeps one
-    # expression string meaning one thing for a float and for a tensor. Providing them keeps `_B` on
-    # the tensor branch rather than falling through to `math.tanh`, which would raise on a batch.
-    def tanh(self):
-        return _B(self.t.tanh())
-
-    def exp(self):
-        return _B(self.t.exp())
-
-    def log(self):
-        return _B(self.t.log())
-
-    def sqrt(self):
-        return _B(self.t.sqrt())
-
-
-def _raw(x):
-    return x.t if isinstance(x, _B) else x
-
-
-def _install_operators(cls):
-    for name, fn in _ARITHMETIC.items():
-        def forward(self, other, fn=fn):
-            return _B(fn(self.t, _raw(other)))
-
-        def reflected(self, other, fn=fn):
-            return _B(fn(_raw(other), self.t))
-
-        setattr(cls, f"__{name}__", forward)
-        setattr(cls, f"__r{name}__", reflected)
-    for name, fn in _COMPARISON.items():
-        def compare(self, other, fn=fn):
-            # ...to the operand's own float dtype, NOT to bool: a bool result is exactly what makes
-            # `1 - c` raise, and a 0.0/1.0 float multiplies and subtracts like the scalar case.
-            return _B(fn(self.t, _raw(other)).to(self.t.dtype))
-
-        setattr(cls, f"__{name}__", compare)
-
-
-_install_operators(_B)
-# Defining `__eq__` drops the default `__hash__`; `_B` is only ever a dict VALUE, never a key.
-_B.__hash__ = None
 
 
 # ── how a skill's nouns map onto one env ────────────────────────────────────────────────────────
@@ -280,7 +191,6 @@ class StateSlots:
         buffer = self._buffers.get(name)
         if buffer is None:
             seed = init()
-            seed = seed.t if isinstance(seed, _B) else seed
             shape = (self.num_envs,) if width is None else (self.num_envs, width)
             buffer = torch.empty(shape, dtype=self.dtype, device=self.device)
             buffer.copy_(torch.as_tensor(seed, device=self.device, dtype=self.dtype).expand(shape))
@@ -297,7 +207,6 @@ class StateSlots:
         buffer = self._buffers.get(name)
         if buffer is None:
             return
-        value = value.t if isinstance(value, _B) else value
         buffer[env_idx] = torch.as_tensor(value, device=buffer.device, dtype=buffer.dtype)
 
     def fill_rows(self, name, env_idx, value):
@@ -478,6 +387,20 @@ def _m_height_above_resting(ctx):
     return ctx.object_p[..., 2] - (surface + ctx.half)
 
 
+#: The `(type(env), resting_surface_z, seat_top)` triples this process has already decided about.
+#:
+#: WHY THE GUARD IS MEMOISED AND NOT JUST RE-EVALUATED. `_warn_default_resting_frame` is called from
+#: inside `_m_height_above_resting`, so it ran once per `compute_dense_reward` for any plan naming
+#: that measure — and its condition does `float(ctx._as_batch(seat).max())`, which SYNCHRONISES CUDA:
+#: a host-device round trip inserted into the reward hot path of every step of every rollout. The
+#: f-string argument to `warn.warn` was also built on every call, whatever the warning filter did
+#: with it afterwards. Measured 2026-08-13 on the CPU fake: 5 reward steps -> 5 evaluations of the
+#: guard, 5 seat reads. Nothing in the key can change within a rollout (the env's type is fixed, and
+#: the binding is a frozen dataclass captured at build time), so the decision is taken once and the
+#: hot path costs one set lookup after that.
+_WARNED_RESTING_FRAME = set()
+
+
 def _warn_default_resting_frame(ctx):
     """The default `resting_surface_z=0.0` is the TABLE. Say so, out loud, when the env has a seat.
 
@@ -492,9 +415,20 @@ def _warn_default_resting_frame(ctx):
     `xyz[:,2] = cube_half_sizes`). Refusing would reject the one lineage the measure was ported from.
     The condition is narrow on purpose: it fires only when the env publishes a raised seat, i.e. only
     when there are two candidate surfaces and the default silently picked one.
+
+    IT DECIDES ONCE PER `(env type, resting_surface_z, seat_top)`, not once per step — see
+    `_WARNED_RESTING_FRAME` for the CUDA sync that made the per-step version a hot-path cost. Warning
+    once is also what `warnings`' own default filter would do with the message; what it would NOT do
+    is skip building it.
     """
     if ctx.binding.resting_surface_z != 0.0:
         return
+    key = (type(ctx.env), ctx.binding.resting_surface_z, ctx.binding.seat_top)
+    if key in _WARNED_RESTING_FRAME:
+        return
+    #: Recorded BEFORE the seat is read, so the "this env publishes no seat" answer is memoised too:
+    #: that branch is the one that pays the sync and then says nothing.
+    _WARNED_RESTING_FRAME.add(key)
     seat = getattr(ctx.env, ctx.binding.seat_top, None)
     if seat is None or float(ctx._as_batch(seat).max()) <= 0.0:
         return
@@ -806,35 +740,55 @@ def _success_value(ctx, plan):
 def _values_for(ctx, plan):
     """Everything `compile._VALUE` will ask for, keyed exactly as it asks for it: measure names,
     the gate/predicate STRINGS as written in the document, the success signals, and one entry per
-    state slot. Only what the plan declares is read — a measure no row names costs no sim call."""
+    state slot. Only what the plan declares is read — a measure no row names costs no sim call.
+
+    THE VALUES ARE RAW TENSORS, and until 2026-08-13 they could not be. `compile.py`'s helpers are
+    branch-free (`_where(c,a,b) = c*a + (1-c)*b`) precisely so one fold serves a Python float and a
+    CUDA batch, but every one of them builds its condition from a comparison, a torch comparison
+    yields a BOOL tensor, and
+
+        >>> 1 - torch.tensor([True, False])
+        RuntimeError: Subtraction, the `-` operator, with a bool tensor is not supported.
+
+    so `compile._relu(torch.tensor([-1.0, 2.0]))` raised and `HingePenalty`/`Ramp` could not fold a
+    bare tensor at all. This file carried a `_B` wrapper whose comparisons returned 0.0/1.0 floats to
+    close that from the outside. `compile._numeric` (`c * 1`, commit f1da01b) closes it at the
+    source, for every caller rather than for this one, so the wrapper was deleted: measured over the
+    plans in `bridle/tests/test_skill_env_fold.py`, raw == wrapped BITWISE on all 62 dumped tensors
+    (fold outputs, slot buffers, all 19 measures, all 15 evaluable predicates, and the whole
+    `_values_for` payload). `_numeric` yields int64 where the wrapper yielded float32 for the
+    CONDITION; that never reaches a result, because both branches of every `_where` in the fold are
+    floats and int64 * float32 promotes to float32 — also measured, over every selection the suite
+    performs.
+    """
     import torch
     values = {}
     for name in plan.measures_needed:
-        values[name] = _B(ctx.measure(name))
+        values[name] = ctx.measure(name)
     for op in plan.ops:
         for key in ("predicate", "gate"):
             text = op.params.get(key)
             if isinstance(text, str):
-                values[text] = _B(ctx.predicate(text))
+                values[text] = ctx.predicate(text)
         if op.fn_key == "expr":
             for name in op.params["expr"].names:
                 if name in PREDICATES and name not in values:
-                    values[name] = _B(ctx.predicate(name))
+                    values[name] = ctx.predicate(name)
         if op.stateful:
             slot = op.params["slot"]
             # `.clone()`: `_advance_state` writes the NEW measure into this same buffer after the
             # fold, and a live view would turn `prev - measure` into `measure - measure` = 0 for any
             # caller that evaluated the two in the other order.
-            values[slot] = _B(ctx.slots.slot(
-                slot, init=lambda o=op: ctx.measure(o.params["measure"])).clone())
+            values[slot] = ctx.slots.slot(
+                slot, init=lambda o=op: ctx.measure(o.params["measure"])).clone()
 
     needs_success = any(op.fn_key == "SuccessBonus" for op in plan.ops)
     if needs_success:
         success = _success_value(ctx, plan)
-        values["success"] = _B(success)
+        values["success"] = success
         latch = ctx.slots.slot("success_latched", init=lambda: torch.zeros_like(success))
         latch.copy_(torch.maximum(latch, success))
-        values["success_latched"] = _B(latch.clone())
+        values["success_latched"] = latch.clone()
     return values
 
 
@@ -870,6 +824,18 @@ def _check_plan(plan):
     """
     for op in plan.ops:
         if op.fn_key == "custom":
+            # A custom row skips the mode/scope validation below because its VALUE is opaque — it is
+            # an imported `module:function`, not a term with a condition/level split. Skipping the
+            # validation is not the same as accepting any mode: the fold adds a custom row
+            # unconditionally, so a declared `mode: replace` would be silently folded as `add`, which
+            # is the same defect class as the scope one this function was written for. Refuse it.
+            if op.kind != "add":
+                raise SkillEnvError(
+                    f"custom row {op.params.get('target')!r} declares `mode: {op.kind}` and this "
+                    f"fold can only ADD one. A replace/floor row needs a (condition, level) split "
+                    f"and a tier-3 row is one opaque number — express the criterion as a "
+                    f"`SuccessBonus`/`PredicateBonus` row with `mode: {op.kind}`, and keep the "
+                    f"custom row for the value it computes")
             continue
         if op.fn_key not in _TERM_VALUE:
             raise SkillEnvError(f"no evaluator for reward row kind {op.fn_key!r}")
@@ -928,10 +894,10 @@ def build_reward_fn(plan: RewardPlan, *, binding: EnvBinding = DEFAULT_BINDING, 
                 acc = acc + _custom_row(ctx, op.params["target"])
                 continue
             if op.kind == "add":
-                acc = acc + _raw(_TERM_VALUE[op.fn_key](op.params, values))
+                acc = acc + _TERM_VALUE[op.fn_key](op.params, values)
                 continue
             condition, level = _TERM_CONDITION_LEVEL[op.fn_key](op.params, values)
-            condition = _raw(condition).to(torch.bool)
+            condition = condition.to(torch.bool)
             level = _fold_level(acc, level, op)
             # `reached` is what the row's mode operates OVER. `_check_plan` has already refused a
             # scope this table has no entry for, so the lookup cannot KeyError here.
@@ -953,6 +919,12 @@ def _fold_level(acc, level, op):
     one element tensors can be converted to Python scalars` — a message that names torch's conversion
     rule and not the reward row that broke, which is the wrong end of the stack for the author this
     file writes its messages for.
+
+    `torch.is_tensor(level)` reads the level RAW, and so does the caller's `condition`. It did not
+    always: while `_values_for` wrapped its readings, `condition` went through an unwrapping `_raw()`
+    that `level` never did, so a wrapped level would have slipped past this check. Deleting the
+    wrapper (see `_values_for`) removed the asymmetry rather than exposing it — there is now one
+    representation for both.
     """
     import torch
     if torch.is_tensor(level) and level.numel() != 1:
@@ -1015,9 +987,19 @@ def build_reset_fn(plan: RewardPlan, *, binding: EnvBinding = DEFAULT_BINDING, s
     platform, wrong for a live stack top the arm has already begun to disturb, and the docstring of
     that measure claimed the reset. `plan.measures_needed` and `plan.state_slots` say exactly which
     slots the plan will ask for, so they are allocated from the post-restore state instead of being
-    guessed at. `frame.object_up0` is NOT in that set — it belongs to the `undisturbed` predicate,
-    which the plan does not enumerate — so it keeps first-read freezing and is re-seeded once it
-    exists.
+    guessed at.
+
+    TWO SLOTS KEEP FIRST-READ FREEZING, and they are both reached through the `undisturbed`
+    predicate, which the plan does not enumerate: `frame.object_up0` (the reset orientation) and
+    `frame.object_xy0` (the reset xy). `object_xy0`'s allocation is gated on
+    `"object_xy_drift_from_reset" in plan.measures_needed`, and `undisturbed` reads that measure
+    through `ctx.measure(...)` rather than through a row, so a plan whose only reader is the
+    predicate leaves the gate false. Both are therefore frozen at the first step that reads them,
+    one action after the reset, and both are re-seeded rows-only once they exist — which is what
+    keeps a partial reset correct for them even though the freeze point is late. Closing the gap
+    needs the plan to enumerate the measures its PREDICATES read; until it does, this is stated
+    rather than silent, and `[E]` in `bridle/tests/test_skill_env_fold.py` pins the re-seeding for
+    both slots.
     """
     state = slots
 
@@ -1045,13 +1027,20 @@ def build_reset_fn(plan: RewardPlan, *, binding: EnvBinding = DEFAULT_BINDING, s
             `allocate=True` also creates it when the plan says it will be read. Allocation fills the
             WHOLE buffer, which the `StateSlots` docstring records as the one place that is not an
             exception to the partial-reset rule: at allocation no env has history to erase. Every
-            write after it, including the `seed` on the next line, is rows-only.
+            write after it, including the `seed` below, is rows-only.
+
+            ONE `reader()` CALL, NOT TWO. The allocate path used to pass `reader` to `slot()` and
+            then call `reader()` again for the `seed`, so every newly allocated slot cost two sim
+            reads per reset — of the same post-restore state, since nothing steps in between.
             """
-            if not state.has(name):
-                if not allocate:
-                    return
-                state.slot(name, init=reader, width=width)
-            state.seed(name, env_idx, reader()[env_idx])
+            if state.has(name):
+                reading = reader()
+            elif allocate:
+                reading = reader()
+                state.slot(name, init=lambda: reading, width=width)
+            else:
+                return
+            state.seed(name, env_idx, reading[env_idx])
 
         needed = plan.measures_needed
         anchor("frame.object_xy0", lambda: ctx.object_p[..., :2], 2,
