@@ -112,6 +112,21 @@ class Resolution:
         return head + ("\n" + "\n".join(lines) if lines else "")
 
 
+def _norm(v):
+    """Normalise sequence types before comparing.
+
+    A contract that has round-tripped through YAML/JSON comes back with LISTS where the in-memory
+    object had TUPLES. Comparing those naively reports every camera and every termination rule as
+    changed — a spurious ADAPT that would send someone to retrain a perfectly good policy for
+    nothing. Serialisation format is not a property of the robot.
+    """
+    if isinstance(v, (list, tuple)):
+        return tuple(_norm(x) for x in v)
+    if isinstance(v, dict):
+        return {k: _norm(x) for k, x in v.items()}
+    return v
+
+
 def _flat(d, prefix=""):
     out = {}
     for k, v in (d or {}).items():
@@ -119,7 +134,7 @@ def _flat(d, prefix=""):
         if isinstance(v, dict):
             out.update(_flat(v, prefix=f"{key}."))
         else:
-            out[key] = v
+            out[key] = _norm(v)
     return out
 
 
