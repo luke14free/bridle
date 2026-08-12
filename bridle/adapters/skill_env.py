@@ -25,23 +25,31 @@ BATCHING IS THE BINDING CONSTRAINT (phase2-decisions, global constraints). Every
 tensor over up to 4096 parallel environments, and there is no Python loop over environments and no
 Python `if` on a batched condition anywhere below — a `bool()` on a batch takes ONE branch for all
 4096 envs at once, which is not a slower right answer but a different reward.
+
+TORCH IS IMPORTED LAZILY, INSIDE THE FUNCTIONS THAT NEED IT, the same way `adapters/preflight.py`
+does it — and for the same measured reason. A module-scope `import torch` made this file
+unimportable on a box without torch, so no file in `bridle/tests/` could import it (checked
+2026-08-13: `grep -rl adapters.skill_env bridle/tests/` was empty), and the two key-set asserts at
+the bottom of the MEASURE/PREDICATE tables — free guards that cost nothing to run — never ran in the
+suite that actually runs. The import is cached after the first call, so the per-call cost is a dict
+lookup, not a re-import.
 """
 import ast
 import dataclasses
 import operator
-
-import torch
+import warnings as warn
 
 from bridle.skill.compile import RewardPlan
 from bridle.skill.compile import _CONDITION_LEVEL as _TERM_CONDITION_LEVEL
+from bridle.skill.compile import _SCOPE_REACH
 from bridle.skill.compile import _VALUE as _TERM_VALUE
 from bridle.skill.compile import _bind_text
 from bridle.skill.vocab import MEASURES, PREDICATES, Sign
 
 __all__ = [
-    "MEASURE_FNS", "PREDICATE_FNS", "EnvBinding", "DEFAULT_BINDING", "MeasureContext",
-    "StateSlots", "SkillEnvError", "build_reward_fn", "build_success_fn", "build_reset_fn",
-    "SkillRuntime",
+    "MEASURE_FNS", "PREDICATE_FNS", "SIGNED_MEASURES", "EnvBinding", "DEFAULT_BINDING",
+    "MeasureContext", "StateSlots", "SkillEnvError", "build_reward_fn", "build_success_fn",
+    "build_reset_fn", "SkillRuntime",
 ]
 
 
@@ -231,14 +239,18 @@ class StateSlots:
     is nothing to erase. Every write after that goes through `seed(env_idx)`.
     """
 
-    def __init__(self, num_envs=None, device=None, dtype=torch.float32):
+    def __init__(self, num_envs=None, device=None, dtype=None):
+        #: `dtype=None` means float32 and is resolved HERE rather than in the signature, because a
+        #: `dtype=torch.float32` default would evaluate at class-definition time and drag the
+        #: module-scope torch import back in (see the module docstring).
+        import torch
         #: Both may be None until `ensure(env)` sees a live env. That is what lets ONE `StateSlots`
         #: be shared by the reward/success/reset callables before any of them has an env: built
         #: separately they would each allocate their own, and a `latched` success in the reward fold
         #: would be a different latch from the one the success criterion accumulates.
         self.num_envs = None if num_envs is None else int(num_envs)
         self.device = device
-        self.dtype = dtype
+        self.dtype = torch.float32 if dtype is None else dtype
         self._buffers = {}
 
     @classmethod
@@ -261,6 +273,7 @@ class StateSlots:
         `init` is a CALLABLE, not a value, so the seeding read only happens on the step the buffer is
         first needed — a plan that never reads a slot never touches the simulator for it.
         """
+        import torch
         buffer = self._buffers.get(name)
         if buffer is None:
             seed = init()
@@ -277,6 +290,7 @@ class StateSlots:
     def seed(self, name, env_idx, value):
         """Write `value` into the rows named by `env_idx` and NOWHERE else. See the class docstring
         for the crash and the spurious-progress-spike this is the fix for."""
+        import torch
         buffer = self._buffers.get(name)
         if buffer is None:
             return
@@ -302,6 +316,7 @@ class StateSlots:
         against the env's own per-env step counter, so it stays correct under partial reset where the
         counters differ across the batch.
         """
+        import torch
         if elapsed is None:
             return None
         elapsed = elapsed.to(dtype=self.dtype, device=self.device)
@@ -323,6 +338,10 @@ class MeasureContext:
     info: dict
     slots: StateSlots
     binding: EnvBinding = DEFAULT_BINDING
+    #: Which builder made this context, named so a refusal can say which call has no action to read.
+    #: `build_reset_fn` and `build_success_fn` both evaluate with `action=None`, and a message that
+    #: names only one of them sends the reader to the wrong line (see `_action`).
+    where: str = "this evaluation"
 
     def __post_init__(self):
         self.env = getattr(self.env, "unwrapped", self.env)
@@ -368,6 +387,7 @@ class MeasureContext:
 
     def _as_batch(self, value):
         """Any scalar/(N,)/(N,1) env attribute, as a `(N,)` tensor on the env's device."""
+        import torch
         t = torch.as_tensor(value, device=self.device, dtype=torch.float32)
         if t.dim() == 0:
             return t.expand(self.num_envs)
@@ -375,6 +395,7 @@ class MeasureContext:
 
     def resolve_length(self, value, what):
         """A binding field that is either a number or the name of an env attribute."""
+        import torch
         if isinstance(value, str):
             return self._as_batch(self.attr(value, what))
         return torch.full((self.num_envs,), float(value), device=self.device, dtype=torch.float32)
@@ -397,6 +418,7 @@ class MeasureContext:
 def _check_batch(value, name, num_envs):
     """Every reading is `(N,)` float. A measure that returns `(N,1)` or `(N,3)` broadcasts silently
     into an `(N,N)` reward the moment it meets another row, so the shape is asserted at the source."""
+    import torch
     if not torch.is_tensor(value):
         raise SkillEnvError(f"measure {name!r} returned {type(value).__name__}, not a tensor")
     value = value.reshape(-1) if value.dim() == 2 and value.shape[1] == 1 else value
@@ -414,6 +436,7 @@ def _check_batch(value, name, num_envs):
 
 
 def _norm(v):
+    import torch
     return torch.linalg.norm(v, dim=-1)
 
 
@@ -452,8 +475,37 @@ def _m_height_above_resting(ctx):
     whose object's resting surface is the platform binds `resting_surface_z="platform_top_z"`; the
     seat-relative reading has its own name (`height_above_seat_live`) and is never silently
     substituted here."""
+    _warn_default_resting_frame(ctx)
     surface = ctx.resolve_length(ctx.binding.resting_surface_z, "the resting surface height")
     return ctx.object_p[..., 2] - (surface + ctx.half)
+
+
+def _warn_default_resting_frame(ctx):
+    """The default `resting_surface_z=0.0` is the TABLE. Say so, out loud, when the env has a seat.
+
+    A document that writes `height_above_resting_in(0.01)` against descend and does not pass
+    `resting_surface_z="platform_top_z"` measures the table frame and gets a band that is 3 cm out —
+    `scripts/probe_skill_env.py` has to pass exactly that binding for its G4 check to agree with
+    descend's own gate (35/35), and before this warning nothing said so. A silent wrong frame is the
+    defect class the `Frame` tag on every measure exists to prevent, so it is not silent.
+
+    It is a warning and not a refusal because the table frame is CORRECT for the measure's own cited
+    source — lift's Ramp, whose object rests on the table (grasp_cube.py:574 spawns the cube at
+    `xyz[:,2] = cube_half_sizes`). Refusing would reject the one lineage the measure was ported from.
+    The condition is narrow on purpose: it fires only when the env publishes a raised seat, i.e. only
+    when there are two candidate surfaces and the default silently picked one.
+    """
+    if ctx.binding.resting_surface_z != 0.0:
+        return
+    seat = getattr(ctx.env, ctx.binding.seat_top, None)
+    if seat is None or float(ctx._as_batch(seat).max()) <= 0.0:
+        return
+    warn.warn(
+        f"`height_above_resting` is being measured against the TABLE (EnvBinding."
+        f"resting_surface_z=0.0), but {type(ctx.env).__name__} publishes a raised seat "
+        f"`{ctx.binding.seat_top}`. If the band you mean is above that seat, pass "
+        f"EnvBinding(resting_surface_z={ctx.binding.seat_top!r}) — or use the measure that names "
+        f"the seat frame, `height_above_seat_live`.", stacklevel=2)
 
 
 def _seat_resting_z(ctx):
@@ -478,8 +530,17 @@ def _m_height_above_seat_static_goal(ctx):
     descend_stack grades its reward against `self._stack_goal` while its `evaluate()` gates success
     on the LIVE top — one quantity, two frames, which is why `Measure.frame` exists (vocab.py,
     correction 2). When the env publishes such a goal it is read from there; otherwise the goal is
-    frozen into a slot at reset, which for a bolted-down platform IS the frozen goal rather than a
-    stand-in for one."""
+    frozen into a slot.
+
+    WHEN THE FREEZE HAPPENS, exactly: `build_reset_fn` PRE-ALLOCATES this slot from the post-restore
+    state whenever `plan.measures_needed` contains this measure, so the freeze point is the reset. It
+    is not "at reset" by construction — `StateSlots.slot()` freezes on first READ, and `build_reset_fn`
+    used to re-seed only a slot that already existed, so before 2026-08-13 episode 1's freeze point
+    was the first `compute_dense_reward` call instead. Identical for a bolted-down platform, wrong for
+    a live stack top that the arm has already begun to disturb. A plan reached through the free
+    `build_reward_fn` with no reset hook installed still freezes on first read; there is nowhere else
+    to put it."""
+    import torch
     published = getattr(ctx.env, ctx.binding.static_goal or "", None)
     if published is not None:
         goal = torch.as_tensor(published, device=ctx.device, dtype=torch.float32)
@@ -544,10 +605,22 @@ def _m_object_angular_velocity(ctx):
 
 
 def _action(ctx):
+    """The current action, or a refusal that names WHICH call has none.
+
+    Two builders evaluate without an action and the fix differs between them, so the message cannot
+    name just one: `build_success_fn` has no action because a success criterion is evaluated from
+    `evaluate()` (move the row out of `success:`), and `build_reset_fn` has none because a reset
+    happens between steps (a stateful row over an action measure cannot be re-anchored there —
+    `action_delta_norm`'s buffer re-seeds itself on the next step instead). `MeasureContext.where`
+    carries the caller so the reader is sent to the right line.
+    """
+    import torch
     if ctx.action is None:
         raise SkillEnvError(
-            "this row reads the action (`action_norm`/`action_delta_norm`) and none was supplied — "
-            "build_success_fn evaluates without one. Move the row out of the success criterion")
+            f"this row reads the action (`action_norm`/`action_delta_norm`) and {ctx.where} "
+            f"evaluates without one. From `build_success_fn`: move the row out of the `success:` "
+            f"criterion. From `build_reset_fn`: an action-valued row cannot be re-anchored at reset "
+            f"— drop `reseed_on_restore`, or use a measure of the scene rather than of the action")
     return torch.as_tensor(ctx.action, device=ctx.device, dtype=torch.float32)
 
 
@@ -567,6 +640,7 @@ def _m_action_delta_norm(ctx):
 
 def _yaw(q):
     """Raw planar yaw from a wxyz quaternion `(N,4)`. compact_grasp_env.py:81-82, verbatim."""
+    import torch
     return torch.atan2(2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
                        1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2))
 
@@ -580,6 +654,7 @@ def _m_yaw_diff_mod_symmetry(ctx):
     compact_grasp's box branch (`remainder(raw + pi/4, pi/2) - pi/4`). Not wired as a DistancePull
     target anywhere in the corpus — a 5-DoF arm generally cannot reach a full-pose target, so
     shaping on it generates reward hacking rather than behaviour (vocab.MEASURES)."""
+    import torch
     goal_yaw = ctx.resolve_length(ctx.binding.goal_yaw, "the goal yaw")
     period = float(ctx.binding.yaw_symmetry)
     delta = _yaw(ctx.held.pose.q) - goal_yaw
@@ -592,6 +667,7 @@ def _m_joint_pos_margin_to_limit(ctx):
     the reading is `min over joints of min(q - lower, upper - q)`, clamped at 0 because the measure
     is declared a MAGNITUDE and a joint driven past its limit by the solver is at margin 0, not at a
     negative distance."""
+    import torch
     robot = ctx.attr("agent", "the robot").robot
     q = robot.get_qpos()
     limits = robot.get_qlimits()
@@ -653,6 +729,28 @@ assert set(MEASURE_FNS) == set(MEASURES), (
 #: vocabulary shows up here rather than in a stale hand-written list.
 SIGNED_MEASURES = frozenset(n for n, m in MEASURES.items() if m.sign is Sign.SIGNED)
 
+#: Measures whose implementation ABOVE depends on the vocabulary still declaring them SIGNED, with
+#: the measured consequence of it not doing so. This is what `SIGNED_MEASURES` is FOR — without a
+#: consumer it was a derived set nobody read, which is the same as not deriving it.
+#:
+#: The failure it guards is a two-step one, and each step looks reasonable alone: the vocabulary
+#: relabels a measure MAGNITUDE, and a later reader "fixes" the implementation to match by returning
+#: `.abs()`. `_m_height_above_seat_live`'s docstring records what that costs — descend's crush
+#: penalty `-3.0*clamp(-sdz, min=0)` becomes identically zero, so the term still trains, still logs,
+#: and contributes nothing, and pressing the cube to dz=0 broke 16/16 grasps on 2026-06-04.
+_SIGN_LOAD_BEARING = {
+    "height_above_seat_live": "descend's crush penalty `-3.0*clamp(-sdz, min=0)` is identically "
+                              "zero against a magnitude; pressing to dz=0 broke 16/16 grasps",
+    "height_above_resting": "the `height_above_resting_in` band is `0 <= h <= band`, and a "
+                            "magnitude makes the lower bound unfalsifiable",
+    "gripper_qpos": "descend's grip-hold hinge penalises `qpos - (-0.6)` above zero; a magnitude "
+                    "inverts which side of the jaw travel is penalised",
+}
+assert not (set(_SIGN_LOAD_BEARING) - SIGNED_MEASURES), (
+    f"these measures are implemented as signed differences and the vocabulary no longer declares "
+    f"them SIGNED: "
+    f"{ {n: _SIGN_LOAD_BEARING[n] for n in sorted(set(_SIGN_LOAD_BEARING) - SIGNED_MEASURES)} }")
+
 
 # ── predicates ──────────────────────────────────────────────────────────────────────────────────
 # A predicate field is a bare name or a nested call over existing names (`spec._check_predicate`),
@@ -681,12 +779,20 @@ def _desugar_brackets(text):
     belongs to whoever evaluates it"), and the document form in the design doc §4 and in the
     acceptance fixture is the bracket one. It is sugar and nothing more: the bracket lowers to the
     `and_`/`or_` that already exist in PREDICATES, so there is one set of semantics, not two.
+
+    THE MATCH IS ANCHORED AT A WORD BOUNDARY. It was not, and `all`/`any` are suffixes of ordinary
+    words: `overall[x]` rewrote to `overand_(x)` and `many[q]` to `mor_(q)` (measured 2026-08-13).
+    Neither is a legal predicate either way, so nothing was mis-EVALUATED — but the refusal named a
+    predicate the author never typed, and this file's whole premise is that the error message is the
+    API for an author who cannot introspect it.
     """
     out, depth_stack = [], []
     i = 0
     while i < len(text):
         matched = None
-        for word, replacement in _BRACKET_SUGAR.items():
+        # A sugar word only counts at the start of an identifier: `all[` yes, `overall[` no.
+        boundary = i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+        for word, replacement in (_BRACKET_SUGAR.items() if boundary else ()):
             if text.startswith(word + "[", i):
                 matched = (word, replacement)
                 break
@@ -791,6 +897,7 @@ def _literal(node):
 
 def _f(mask, ctx):
     """A bool tensor as the 0.0/1.0 float every predicate returns."""
+    import torch
     return mask.to(dtype=torch.float32) if torch.is_tensor(mask) else \
         torch.full((ctx.num_envs,), float(mask), device=ctx.device)
 
@@ -817,6 +924,7 @@ def _p_below_height(ctx, args):
 
 
 def _anchor_xy(ctx, name):
+    import torch
     if name is None:
         return ctx.goal[..., :2]
     value = getattr(ctx.env, name, None)
@@ -847,6 +955,7 @@ def _p_in_cylinder(ctx, args):
 def _p_at_rest(ctx, args):
     """Either bound may be omitted. NEVER gate on angular alone for a grasped object — CLAUDE.md
     gotcha (2), ~98% contact-solver noise — but that is a document-level choice this cannot police."""
+    import torch
     linear = args.number(0, "linear")
     angular = args.number(1, "angular")
     if linear is None and angular is None:
@@ -862,6 +971,7 @@ def _p_at_rest(ctx, args):
 
 def _up_axis(q):
     """The object's own +z axis in world coordinates, from a wxyz quaternion `(N,4)`."""
+    import torch
     w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
     return torch.stack([2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)], dim=-1)
 
@@ -870,6 +980,7 @@ def _p_undisturbed(ctx, args):
     """Moved less than `drift` and tilted less than `tilt` SINCE RESET — so the tilt is measured
     against the reset orientation's own up-axis, not against world vertical: an object that spawns
     on its side is not "tilted" until something tips it."""
+    import torch
     drift = args.number(0, "drift", required=True)
     tilt = args.number(1, "tilt", required=True)
     up = _up_axis(ctx.held.pose.q)
@@ -919,6 +1030,7 @@ def _p_sustained(ctx, args):
 
     The streak advances at most once per control step even when the same predicate is read from both
     `evaluate()` and `compute_dense_reward()` — see `StateSlots.fresh_rows`."""
+    import torch
     value = args.predicate(0, "predicate")
     k = args.number(1, "k", default=1.0)
     consecutive = args.flag(2, "consecutive", True)
@@ -933,6 +1045,7 @@ def _p_sustained(ctx, args):
 def _p_latched(ctx, args):
     """OR-accumulated: once true it stays true for the episode. move_to_target/move_over_bin's
     success — the bonus it feeds pays every remaining step. Idempotent, so it needs no step guard."""
+    import torch
     value = args.predicate(0, "predicate")
     latch = ctx.slots.slot(f"pred.latched.{args.source}", init=lambda: torch.zeros_like(value))
     latch.copy_(torch.maximum(latch, value))
@@ -1038,6 +1151,17 @@ def _success_value(ctx, plan):
     state would be a second implementation of the same predicate, free to disagree. Only when the
     env publishes none is the op's own `condition` (the criterion, params already bound into it by
     `compile._lower_term_row`) evaluated.
+
+    THIS IS NOT A CLAIM THAT THE DOCUMENT'S SUCCESS EQUALS THE ENV'S. It is the opposite: reading
+    `info["success"]` is what makes the two agree by CONSTRUCTION on this path, which is why
+    `scripts/probe_skill_env.py`'s reward-parity numbers (max abs diff 1.2e-07 / 2.4e-07 vs
+    `descend_env.compute_dense_reward`) establish that the replace/floor MECHANICS agree — both sides
+    consume the same `info["success"]` — and establish nothing about whether the document's
+    `success:` line is the same predicate the env publishes. On the §4 fixture it measurably is not:
+    the same probe's G5 finds `height_above_resting_in` and descend's `low` gate disagreeing on 29/29
+    rows below the seat, because the predicate carries a `>= 0` lower bound the gate lacks. Task 6
+    measures that disagreement separately; a preflight assert comparing `build_success_fn` against
+    the env's own `evaluate()` is what would close it.
     """
     published = ctx.info.get("success") if isinstance(ctx.info, dict) else None
     if published is not None:
@@ -1053,6 +1177,7 @@ def _values_for(ctx, plan):
     """Everything `compile._VALUE` will ask for, keyed exactly as it asks for it: measure names,
     the gate/predicate STRINGS as written in the document, the success signals, and one entry per
     state slot. Only what the plan declares is read — a measure no row names costs no sim call."""
+    import torch
     values = {}
     for name in plan.measures_needed:
         values[name] = _B(ctx.measure(name))
@@ -1100,6 +1225,19 @@ def _advance_state(ctx, plan):
 
 
 def _check_plan(plan):
+    """Refuse, before any GPU is spent, a plan this fold cannot run — including one whose SCOPE it
+    would otherwise honour by accident.
+
+    The scope check is the point. `compile._SCOPE_REACH` is deliberately ONE table, read by
+    `_HONOURED` (what compiles) and by `evaluate_plan` (what runs), so that a scope cannot be
+    declared legal which the fold ignores — its own comment names the failure it exists to stop,
+    `scope: all` accepted and quietly folded as `preceding`. This adapter is the third reader, and
+    until 2026-08-13 it was not a reader at all: it folded against `acc` directly and validated only
+    `fn_key`, so the moment a second entry landed in that table the plan would compile clean,
+    `evaluate_plan` would honour the new scope, and the GPU fold would silently treat it as
+    `preceding`. Measured with a second entry spliced into the table: `evaluate_plan` returned 0.0
+    where this fold returned -5.0.
+    """
     for op in plan.ops:
         if op.fn_key == "custom":
             continue
@@ -1108,6 +1246,15 @@ def _check_plan(plan):
         if op.kind != "add" and op.fn_key not in _TERM_CONDITION_LEVEL:
             raise SkillEnvError(f"row kind {op.kind!r} needs a condition/level split and "
                                 f"{op.fn_key!r} has none")
+        # `scope` is None for a plain `add` — the accumulator IS the preceding rows, so an add row
+        # reaches nothing and carries no scope (`compile._lower_term_row`).
+        if op.kind != "add" and op.scope not in _SCOPE_REACH:
+            raise SkillEnvError(
+                f"reward row {op.fn_key!r} declares scope={op.scope!r}, which this fold does not "
+                f"implement — legal: {', '.join(sorted(_SCOPE_REACH))}. A scope reaches back into "
+                f"the accumulator and every reader of it has to agree what it reaches; defaulting "
+                f"an unknown one to `preceding` is the silent divergence "
+                f"`compile._SCOPE_REACH` exists to prevent")
 
 
 def build_reward_fn(plan: RewardPlan, *, binding: EnvBinding = DEFAULT_BINDING, slots=None):
@@ -1123,7 +1270,13 @@ def build_reward_fn(plan: RewardPlan, *, binding: EnvBinding = DEFAULT_BINDING, 
     `12.0 - 0.001*||a||` (descend_env.py:210-212) — not 12.0, and not the sum of every row. The
     selection is `torch.where` on a per-env condition; a Python `if` there would take one branch for
     all 4096 environments, which is a different reward, not a slower one.
+
+    WHAT A replace/floor ROW OPERATES OVER COMES FROM `compile._SCOPE_REACH`, not from this file —
+    the same table `_HONOURED` builds its legal scope set from and `evaluate_plan` folds against.
+    `bridle/tests/test_skill_env_fold.py` splices a second entry into that table and asserts the two
+    folds still agree, which is the only thing that keeps the third reader honest.
     """
+    import torch
     _check_plan(plan)
     state = slots
 
@@ -1133,7 +1286,7 @@ def build_reward_fn(plan: RewardPlan, *, binding: EnvBinding = DEFAULT_BINDING, 
         if state is None:
             state = StateSlots()
         state.ensure(base)
-        ctx = MeasureContext(base, obs, action, info, state, binding)
+        ctx = MeasureContext(base, obs, action, info, state, binding, where="build_reward_fn")
         values = _values_for(ctx, plan)
 
         acc = torch.zeros(ctx.num_envs, dtype=torch.float32, device=ctx.device)
@@ -1149,14 +1302,38 @@ def build_reward_fn(plan: RewardPlan, *, binding: EnvBinding = DEFAULT_BINDING, 
                 continue
             condition, level = _TERM_CONDITION_LEVEL[op.fn_key](op.params, values)
             condition = _raw(condition).to(torch.bool)
-            level = torch.full_like(acc, float(level))
-            acc = (torch.where(condition, level, acc) if op.kind == "replace"
-                   else torch.where(condition, torch.maximum(acc, level), acc))
+            level = _fold_level(acc, level, op)
+            # `reached` is what the row's mode operates OVER. `_check_plan` has already refused a
+            # scope this table has no entry for, so the lookup cannot KeyError here.
+            reached = _SCOPE_REACH[op.scope](acc)
+            acc = (torch.where(condition, level, reached) if op.kind == "replace"
+                   else torch.where(condition, torch.maximum(reached, level), acc))
 
         _advance_state(ctx, plan)
         return acc
 
     return reward_fn
+
+
+def _fold_level(acc, level, op):
+    """The replace/floor level, broadcast to the batch — or a refusal that names why it could not be.
+
+    `_CONDITION_LEVEL` returns a compile-time scalar today (`SuccessBonus.value`,
+    `PredicateBonus.weight`), and `float(level)` on a per-environment tensor raises `ValueError: only
+    one element tensors can be converted to Python scalars` — a message that names torch's conversion
+    rule and not the reward row that broke, which is the wrong end of the stack for the author this
+    file writes its messages for.
+    """
+    import torch
+    if torch.is_tensor(level) and level.numel() != 1:
+        raise SkillEnvError(
+            f"reward row {op.fn_key!r} produced a PER-ENVIRONMENT level of shape "
+            f"{tuple(level.shape)} for a `mode: {op.kind}` row, and this fold's level is a "
+            f"compile-time scalar (SuccessBonus `value`, PredicateBonus `weight`). A per-env level "
+            f"needs `torch.where(condition, level, reached)` with `level` broadcast instead of "
+            f"`torch.full_like` — implement that in `_fold_level` rather than letting "
+            f"`float(level)` decide")
+    return torch.full_like(acc, float(level))
 
 
 def build_success_fn(spec, *, binding: EnvBinding = DEFAULT_BINDING, slots=None):
@@ -1177,7 +1354,7 @@ def build_success_fn(spec, *, binding: EnvBinding = DEFAULT_BINDING, slots=None)
         if state is None:
             state = StateSlots()
         state.ensure(base)
-        ctx = MeasureContext(base, None, None, info, state, binding)
+        ctx = MeasureContext(base, None, None, info, state, binding, where="build_success_fn")
         return ctx.predicate(criterion) > 0.5
 
     return success_fn
@@ -1200,6 +1377,17 @@ def build_reset_fn(plan: RewardPlan, *, binding: EnvBinding = DEFAULT_BINDING, s
     Re-anchoring after the restore rather than before is `reseed_on_restore`, and it is why descend's
     own `_initialize_episode` re-seeds `prev_place_dist` from the true state at line 137 instead of
     trusting the pre-restore value.
+
+    A SLOT THE PLAN NEEDS IS ALLOCATED HERE, NOT ON FIRST READ. `StateSlots.slot()` freezes its
+    anchor the first time something asks for it, and this hook used to re-seed only a slot that
+    already existed — so on episode 1 the freeze point of `height_above_seat_static_goal` was the
+    first `compute_dense_reward` call, one action after the reset. Identical for a bolted-down
+    platform, wrong for a live stack top the arm has already begun to disturb, and the docstring of
+    that measure claimed the reset. `plan.measures_needed` and `plan.state_slots` say exactly which
+    slots the plan will ask for, so they are allocated from the post-restore state instead of being
+    guessed at. `frame.object_up0` is NOT in that set — it belongs to the `undisturbed` predicate,
+    which the plan does not enumerate — so it keeps first-read freezing and is re-seeded once it
+    exists.
     """
     state = slots
 
@@ -1209,7 +1397,7 @@ def build_reset_fn(plan: RewardPlan, *, binding: EnvBinding = DEFAULT_BINDING, s
         if state is None:
             state = StateSlots()
         state.ensure(base)
-        ctx = MeasureContext(base, None, None, {}, state, binding)
+        ctx = MeasureContext(base, None, None, {}, state, binding, where="build_reset_fn")
 
         # Accumulators go back to zero for the restarting rows: a latched success or a sustained
         # streak carried across an episode boundary is a success the new episode did not earn. The
@@ -1220,19 +1408,42 @@ def build_reset_fn(plan: RewardPlan, *, binding: EnvBinding = DEFAULT_BINDING, s
                 state.fill_rows(name, env_idx, -1.0)
             elif name.startswith("pred.") or name == "success_latched":
                 state.fill_rows(name, env_idx, 0.0)
-        # Anchors and potentials are re-READ from the post-restore state, per slot, rows only.
-        for name, reader in (("frame.object_xy0", lambda: ctx.object_p[..., :2]),
-                             ("frame.object_up0", lambda: _up_axis(ctx.held.pose.q)),
-                             ("frame.static_goal_seat_z", lambda: _seat_resting_z(ctx))):
-            if state.has(name):
-                state.seed(name, env_idx, reader()[env_idx])
-        if state.has(f"frame.scene_xy0.{binding.scene_object}"):
-            state.seed(f"frame.scene_xy0.{binding.scene_object}", env_idx,
-                       _scene_object(ctx).pose.p[..., :2][env_idx])
+
+        def anchor(name, reader, width=None, allocate=False):
+            """Re-READ one buffer from the post-restore state, rows only.
+
+            `allocate=True` also creates it when the plan says it will be read. Allocation fills the
+            WHOLE buffer, which the `StateSlots` docstring records as the one place that is not an
+            exception to the partial-reset rule: at allocation no env has history to erase. Every
+            write after it, including the `seed` on the next line, is rows-only.
+            """
+            if not state.has(name):
+                if not allocate:
+                    return
+                state.slot(name, init=reader, width=width)
+            state.seed(name, env_idx, reader()[env_idx])
+
+        needed = plan.measures_needed
+        anchor("frame.object_xy0", lambda: ctx.object_p[..., :2], 2,
+               allocate="object_xy_drift_from_reset" in needed)
+        anchor("frame.object_up0", lambda: _up_axis(ctx.held.pose.q), 3)
+        anchor("frame.static_goal_seat_z", lambda: _seat_resting_z(ctx), None,
+               # ...only when the env does not publish one. When it does, the measure reads the
+               # published goal and never touches this slot, and allocating it would freeze a value
+               # nothing reads (and pay a sim read per reset for it).
+               allocate=("height_above_seat_static_goal" in needed
+                         and getattr(base, binding.static_goal or "", None) is None))
+        anchor(f"frame.scene_xy0.{binding.scene_object}",
+               lambda: _scene_object(ctx).pose.p[..., :2], 2,
+               allocate="scene_object_xy_drift" in needed)
         for op in plan.ops:
-            if op.stateful and state.has(op.params["slot"]):
-                state.seed(op.params["slot"], env_idx,
-                           ctx.measure(op.params["measure"])[env_idx])
+            if op.stateful:
+                # A stateful row over an action measure raises here, from `_action`, naming
+                # `build_reset_fn` — a reset happens between steps and has no action to anchor to.
+                # That refusal is deliberate: leaving last episode's action in the buffer pays the
+                # new episode's first step a potential difference across an episode boundary.
+                anchor(op.params["slot"], lambda o=op: ctx.measure(o.params["measure"]),
+                       allocate=True)
 
     return reset_fn
 
