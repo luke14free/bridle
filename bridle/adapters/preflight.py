@@ -147,37 +147,22 @@ def dynamic_metrics(env_id: str, module: str, ckpt=None, envs: int = 64, steps: 
 
     raw = gym.make(env_id, num_envs=envs, obs_mode="state", sim_backend="physx_cuda",
                     control_mode="pd_joint_target_delta_pos", max_episode_steps=400)
-    # MUST explicitly wrap with ManiSkillVectorEnv(..., auto_reset=False, ignore_terminations=True)
-    # rather than trust any `gym.make*` call to do it safely — there is no kwarg-passthrough route.
-    # `mani_skill/utils/registration.py`'s own vector constructor is
-    #     def make_vec(env_id, **kwargs):
-    #         env = gym.make(env_id, **kwargs)
-    #         env = ManiSkillVectorEnv(env)
-    #         return env
-    # which forwards NOTHING to `ManiSkillVectorEnv(env)` — so it always takes the class defaults
-    # (`mani_skill/vector/wrappers/gymnasium.py`, `ManiSkillVectorEnv.__init__`):
-    #     auto_reset: bool = True,
-    #     ignore_terminations: bool = False,
-    # Under those defaults, `ManiSkillVectorEnv.step()` does:
-    #     if dones.any() and self.auto_reset:
-    #         final_info = torch_clone_dict(infos)
-    #         obs, infos = self.reset(options=dict(env_idx=env_idx))
-    #         infos["final_info"] = final_info
-    # and `dones = terminations | truncations` where `terminations` comes straight from
-    # `BaseEnv.step` (`mani_skill/envs/sapien_env.py`): `terminated = info["success"].clone()`
-    # whenever `evaluate()` returns a `"success"` key — which `descend_env.py` does. So the instant
-    # a sub-env succeeds, that index is reset within the SAME `.step()` call and its `info` is
-    # overwritten with fresh post-reset (False) values; the real terminal values only survive under
-    # `infos["final_info"]`, which a probe that scans `info` directly (as this one does) never reads.
-    # `lerobot_sim2real/rl/ppo_state.py` hits this exact trap and avoids it the only way available —
-    # building `ManiSkillVectorEnv` itself, not through any `gym.make*` kwarg:
-    #     envs = gym.make(args.env_id, num_envs=args.num_envs, ...)
-    #     envs = ManiSkillVectorEnv(envs, args.num_envs, ignore_terminations=not args.partial_reset, ...)
-    # Measured cost of getting this wrong (bridle/preflight.py's own worked example, 2026-08-12): a
-    # descend policy with real `is_grasped_at_end` 0.859 reads far lower once the successful steps'
-    # info gets silently replaced by the post-reset frame. `auto_reset=False` here goes one step
-    # further than ppo_state.py's `ignore_terminations` (which still auto-resets on truncation) —
-    # this probe wants a fixed-length window with NO reset at all, ever, mid-rollout or otherwise.
+    # `gym.make(env_id, num_envs=...)` above returns a raw env, not a ManiSkillVectorEnv: ManiSkill's
+    # `register_env` wires `entry_point=partial(registration.make, env_id=uid)` for plain `gym.make`
+    # and only points `vector_entry_point` at `registration.make_vec` — and `gymnasium.make()` never
+    # consults `vector_entry_point` (that's read solely by `gymnasium.make_vec()`, which nothing here
+    # calls). So the wrap below is ASSERTING the "no mid-rollout reset" property this probe needs, not
+    # repairing an observed bug in the line above it.
+    #
+    # It is worth asserting explicitly rather than relying on it by accident: `BaseEnv.step`
+    # (`mani_skill/envs/sapien_env.py`) sets `terminated = info["success"].clone()` whenever
+    # `evaluate()` returns a `"success"` key — `descend_env.py` does — so a future switch to
+    # `gym.make_vec`, or a change to `ManiSkillVectorEnv`'s `auto_reset=True`/`ignore_terminations=False`
+    # defaults, would silently reintroduce a mid-rollout reset that overwrites a just-succeeded
+    # sub-env's `info` before this probe (which scans `info` directly) ever reads it. This probe's
+    # rates must stay reset-free to be comparable to the trainer's own eval, which guards the same way
+    # (`lerobot_sim2real/rl/ppo_state.py` builds `ManiSkillVectorEnv(..., ignore_terminations=not
+    # args.partial_reset)` itself rather than trusting `gym.make*` defaults).
     env = ManiSkillVectorEnv(raw, envs, auto_reset=False, ignore_terminations=True)
     obs, _ = env.reset(seed=0)
     dev = env.unwrapped.device
