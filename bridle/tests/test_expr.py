@@ -69,7 +69,37 @@ def run_checks():
     check("where picks the false branch", close(parse("where(x > 1, 10, 20)").evaluate({"x": 0}), 20.0))
     check("power", close(parse("2 ** 3").evaluate({}), 8.0))
     check("unary minus", close(parse("-x").evaluate({"x": 4}), -4.0))
-    check("comparison yields a number", close(parse("(x > 1) * 5").evaluate({"x": 2}), 5.0))
+    # A comparison is normalized to a numeric type unconditionally (see _eval_compare), because a
+    # bare comparison can be an entire reward row and a Python `bool` there is a batch-semantics
+    # trap. This check asserts the actual claim directly — `(x > 1) * 5 == 5.0` alone would pass
+    # whether evaluate() returned `True` or `1.0`, since Python's `bool` is an `int` subclass and
+    # arithmetic can't tell them apart; asserting `type(...) is not bool` can.
+    check("bare comparison evaluates to a numeric type, not a bare bool",
+          type(parse("x > 1").evaluate({"x": 2})) is not bool)
+    check("comparison composes arithmetically", close(parse("(x > 1) * 5").evaluate({"x": 2}), 5.0))
+
+    # ── Expr.names: call position vs. value position ──
+    # A Name is a free variable unless it sits in CALL POSITION (the `func` of a Call) — filtering by
+    # id string instead (`node.id in ALLOWED_CALLS`) would make a measure literally named `min`
+    # invisible to this compile-time check. DECISION (see expr.py parse()): such a name is ALLOWED —
+    # call vs. value position is unambiguous in the grammar, so there's no real hole to close by
+    # refusing it, only friction to add.
+    check("a builtin-shaped name used as a VALUE is a free variable",
+          parse("min - 1").names == frozenset({"min"}))
+    check("a builtin-shaped name used as a CALL is still not reported",
+          parse("min(a, b)").names == frozenset({"a", "b"}))
+    check("mixed call+value use of the same name reports only the value use",
+          parse("min(min, 2)").names == frozenset({"min"}))
+
+    # ── unbounded exponent literals refused at parse time ──
+    check("small literal power still parses", parse("2 ** 8").evaluate({}) == 256)
+    check("variable exponent is NOT guarded (caller's concern, not the parser's)",
+          close(parse("x ** y").evaluate({"x": 2, "y": 10}), 1024.0))
+    check("huge literal exponent is refused at parse time", raises(ExprError, parse, "2 ** 300000"))
+    try:
+        parse("2 ** 300000")
+    except ExprError as e:
+        check("exponent guard names the offending value", "300000" in str(e))
 
     # ── SAFETY: everything outside the whitelist is refused AT PARSE TIME ──
     for src, why in [

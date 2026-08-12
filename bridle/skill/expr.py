@@ -113,6 +113,34 @@ def _validate_constant(node: ast.Constant) -> None:
         )
 
 
+# `2 ** 300000` parses instantly but is a ~100k-digit int the moment it's evaluated — real time and
+# memory spent before the value ever reaches a tensor, usually because a model typo'd an extra digit
+# into an exponent. 64 is generous for any reward-shaping exponent that has ever appeared in practice
+# (even `x ** 10` is already an unusually sharp shaping term) while still being nowhere near a value
+# that could occur by legitimate accident.
+_MAX_LITERAL_EXPONENT = 64
+
+
+def _validate_pow(node: ast.BinOp) -> None:
+    # Only the fully-literal case (`2 ** 300000`, both base AND exponent numeric constants) is
+    # guarded here, and only by inspecting the constant's already-parsed value — this never computes
+    # the power itself, so the guard itself can't be the expensive part. A variable exponent
+    # (`x ** y`, or even `x ** 300000` with a non-constant base) is a legitimate runtime value whose
+    # magnitude depends on what `x`/`y` are bound to at evaluate() time — that is the caller's
+    # concern (e.g. clamping inputs), not something this parser can or should judge.
+    left, right = node.left, node.right
+    if not (isinstance(left, ast.Constant) and type(left.value) in (int, float)):
+        return
+    if not (isinstance(right, ast.Constant) and type(right.value) in (int, float)):
+        return
+    if abs(right.value) > _MAX_LITERAL_EXPONENT:
+        raise ExprError(
+            f"literal exponent {right.value!r} exceeds the maximum allowed literal exponent "
+            f"({_MAX_LITERAL_EXPONENT}) in a reward expression; a value this large is almost always "
+            f"a typo (e.g. an extra digit) rather than an intended reward shaping term"
+        )
+
+
 def _validate(tree: ast.AST) -> None:
     for node in ast.walk(tree):
         node_type = type(node)
@@ -122,6 +150,8 @@ def _validate(tree: ast.AST) -> None:
             _validate_call(node)
         elif node_type is ast.Constant:
             _validate_constant(node)
+        elif node_type is ast.BinOp and isinstance(node.op, ast.Pow):
+            _validate_pow(node)
 
 
 def parse(src: str) -> "Expr":
@@ -141,12 +171,26 @@ def parse(src: str) -> "Expr":
 
     _validate(tree)
 
-    # Free variables = every Name node that isn't itself a whitelisted call target. Because a Call's
-    # func name is validated above to be a bare Name already in ALLOWED_CALLS, this simple filter is
-    # sufficient — no need to track "am I in call-target position" separately.
+    # Free variables = every Name node NOT in CALL POSITION (i.e. not the `func` of an ast.Call).
+    # This must be a positional check, not a filter on `node.id in ALLOWED_CALLS` — the latter would
+    # drop a Name from `.names` just because it happens to share a spelling with a builtin, even when
+    # used as a plain value (`min - 1` uses `min` as a variable, not a call; filtering by id would
+    # make that free variable invisible to the compiler's "every name resolves to a declared measure"
+    # check, and it would then blow up at evaluate() time instead — the exact failure mode `.names`
+    # exists to prevent). So: collect the *node identities* (via id()) of every Name sitting in
+    # call-func position, then exclude exactly those specific AST nodes, not every Name of that id.
+    #
+    # DECISION: a measure MAY be named `min`/`max`/`abs`/etc. Call vs. value position is unambiguous
+    # in this grammar (`min(...)` is always a Call.func, a bare `min` is always a value) — there is no
+    # real ambiguity for an author to trip over, so refusing the name at parse time would only add
+    # friction without closing any actual hole.
+    call_func_ids = {
+        id(node.func) for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
     names = frozenset(
         node.id for node in ast.walk(tree)
-        if isinstance(node, ast.Name) and node.id not in ALLOWED_CALLS
+        if isinstance(node, ast.Name) and id(node) not in call_func_ids
     )
     return Expr(tree, src, names)
 
@@ -232,12 +276,19 @@ def _eval_compare(node: ast.Compare, env: dict):
     # the same batch reason `_where` is branch-free: `and` forces a single Python bool out of a
     # tensor with more than one element ("ambiguous truth value"), but multiplying elementwise
     # bool/float results reduces correctly across a whole batch.
+    #
+    # `result` is seeded with the numeric identity `1`, not `None`/the bare first `ok`, so that even
+    # an UNCHAINED single comparison (`x > 1`) comes out of the first multiplication as a numeric
+    # type, not a raw Python `bool` (or a bool tensor). A bare comparison can be an entire reward row
+    # (`expr: "x > 1"`) — a Python `bool` there is a batch-semantics trap in the making even though
+    # `bool` arithmetic happens to work today, so we normalize to numeric unconditionally rather than
+    # rely on that coincidence.
     left = _eval(node.left, env)
-    result = None
+    result = 1
     for op, comparator in zip(node.ops, node.comparators):
         right = _eval(comparator, env)
         ok = _COMPARE_OPS[type(op)](left, right)
-        result = ok if result is None else result * ok
+        result = result * ok
         left = right
     return result
 
