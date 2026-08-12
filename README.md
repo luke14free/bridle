@@ -123,19 +123,22 @@ The honest consequence: proprioception cannot say *which* object is held, so `la
 unimplementable and `validate()` rejects it. Thresholds are **fitted** from recorded traces
 (`bridle.calibrate`), never guessed.
 
-## Where it's going 🚧
+## The rest of it ✅🚧
 
-| | component | what it does |
-|---|---|---|
-| **M1** | `Rig` + extended `Contract` | your setup as data: embodiment, gripper geometry, action space, control rate, camera rig. The fingerprint becomes `f(rig, execution, task)`. |
-| **M2** | App store as **recipes** | a skill = manifest (what the LLM needs to choose it) + recipe (how to regenerate it) + stamped artifacts. `resolve(app, rig)` returns *run* / *adapt* / *retrain*. |
-| **M3** | `Foundry` | executes a recipe on your rig — teacher → distil → student → eval → a stamped checkpoint registered locally. |
-| **M4** | Orchestrator | the LLM loop, tools built from the store, BYO model behind a thin provider interface (local or remote). |
-| **M5** | Second backend | Isaac alongside ManiSkill — the real test of whether these abstractions hold. |
-| **M6** | Real bridge | sim → real → sim, calibration and deployment to hardware. |
+| | component | what it does | |
+|---|---|---|---|
+| **M1** | `Rig` + `resolve()` | your setup as data; per-field **run / adapt / retrain** with reasons | ✅ |
+| **M2** | App store as **recipes** | manifest + recipe + stamped artifacts; `plan(app, rig)` also answers **blocked** | ✅ |
+| **M3** | `Foundry` | executes a recipe on your rig, injecting the contract; stamps what comes out | ✅ |
+| **M4** | Orchestrator | BYO LLM; tools built from the store, filtered to what your rig can run | ✅ |
+| **M5** | Real bridge | sim → real → sim, calibration and deployment to hardware | 🚧 |
 
-Also on the roadmap: composing novel capabilities by mixing existing skills, and LLM-authored IK for
+Also planned: composing novel capabilities by mixing existing skills, and LLM-authored IK for
 motions no skill covers.
+
+**One backend, by choice.** ManiSkill only. A second engine would validate abstractions we do not
+yet need validated; the cost is that `EnvSpec` is ManiSkill-shaped today and the first port will pay
+for it.
 
 ### Risks worth naming up front
 
