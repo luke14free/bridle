@@ -328,6 +328,15 @@ def _chassis_defaults_for(chassis, term_name, authored):
     author told only "the chassis supplies nothing" cannot tell that it in fact supplies two things
     and they have to pick (2026-08-12 review, finding 3).
 
+    PRIVATE BY NAME, BUT NOT PRIVATE IN FACT: `bridle/skill/report.py`'s `format_plan` (what
+    `bridle skill compile` prints) imports this function to label each parameter it renders
+    `authored` / `chassis '<name>' default` / `term default`. That coupling is
+    deliberate and must survive a refactor — a provenance report that re-implemented the suffixed-key
+    rule would diverge exactly where it matters, on the chassis that instantiates one term twice
+    (`DistancePull_xy` at k=4.0 against `DistancePull_height` at k=6.0), and would then tell the
+    author a weight was inherited from a row the parser did not use. Change the signature and you
+    change the CLI: `grep -rn _chassis_defaults_for` before touching it.
+
     `chassis` is never None: `parse_spec` refuses an unknown `kind:` before assigning
     `CHASSIS[kind]`, so every caller has a real chassis. The `chassis is None` guard that used to
     open this function, and the `chassis.name if chassis else 'none'` fallback in

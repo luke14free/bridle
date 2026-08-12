@@ -46,6 +46,15 @@ __all__ = ["Diagnostic", "TAGS", "WHOLE_REWARD", "diagnose", "format_diagnostics
 #: address means one thing across all three feedback tiers.
 WHOLE_REWARD = "reward"
 
+#: How a whole-fold message names its own subject IN PROSE, and the reason it needs a phrase rather
+#: than the bare address. `WHOLE_REWARD` is the ordinary English word "reward", which turns up in
+#: ordinary advice ("check your reward document") — so a message merely CONTAINING it has not
+#: necessarily said what it is about. Both whole-fold messages below open with this phrase, and
+#: `test_diagnose.py` asserts the phrase, not the bare word: on 2026-08-13 a reviewer rewrote both
+#: messages to address nothing at all, left "reward" in the prose incidentally, and the check that
+#: existed to catch exactly that reported 0 failures.
+_WHOLE_FOLD_PHRASE = "the reward fold as a whole"
+
 #: Declared once, in the order diagnostics are returned: the composition failures first (they explain
 #: the run), then the row-level structural ones, then what could not be checked. Exported so a caller
 #: can assert against the set rather than string-matching prose, and so a typo'd tag cannot ship.
@@ -152,6 +161,24 @@ def _read_term(name, raw):
     return _Term(name=name, mean=mean, lo=lo, hi=hi, problem=problem)
 
 
+def _optional_steps(label, given):
+    """A positive number of steps, or None for "not available". Refuses everything else.
+
+    `ep_len` and `horizon` both come through here so they cannot drift apart again: they are context
+    for one message fragment each, no rule reads either, and the honest answer when a caller has not
+    measured one is to say so rather than to substitute a plausible default.
+    """
+    if given is None:
+        return None
+    value = _number(given)
+    if value is None or value <= 0:
+        raise ValueError(f"{label} is a positive number of steps, or None to say it is not "
+                         f"available; got {given!r}. There is no default and none is invented: an "
+                         f"absent one costs a fragment of one message, a fabricated one puts a "
+                         f"number nobody measured into feedback the author will act on.")
+    return value
+
+
 def _pct(x):
     return f"{100.0 * x:.1f}%"
 
@@ -163,7 +190,7 @@ def _n(x):
 
 # ── the checks ──────────────────────────────────────────────────────────────────────────────────
 
-def diagnose(term_stats, success_rate, ep_len, *, horizon=None):
+def diagnose(term_stats, success_rate, ep_len=None, *, horizon=None):
     """Read a finished run's per-term statistics and return the typed diagnostics, in `TAGS` order.
 
     `term_stats`   {row name -> {"min": .., "mean": .., "max": ..}} — the per-step contribution of
@@ -174,10 +201,17 @@ def diagnose(term_stats, success_rate, ep_len, *, horizon=None):
     `success_rate` fraction in [0, 1]. Refused outside it: every composition rule is conditioned on
                    the run failing, so a percentage passed by mistake (86.0 for 0.86) would suppress
                    all of them and report perfect health for a catastrophic run.
-    `ep_len`       mean episode length in steps, used to state per-episode totals in the messages.
-    `horizon`      optional `max_episode_steps`, for context in the message only. No rule is
-                   conditioned on it; a rule this module cannot compute must say so rather than
-                   substitute a default.
+    `ep_len`       optional mean episode length in steps, used to state per-episode totals.
+    `horizon`      optional `max_episode_steps`.
+
+    `ep_len` and `horizon` are both CONTEXT and are treated identically: each is printed when
+    supplied and simply absent when not, and NO RULE is conditioned on either. `ep_len` used to be
+    mandatory while doing strictly less than the optional `horizon` — it reaches exactly one message
+    fragment — so a caller with no reliable mean episode length had to fabricate one, which is
+    precisely the silent substitution the "a rule this module cannot compute must say so" principle
+    exists to prevent (2026-08-13 review, finding 6). SUPPLIED, either must be a positive number: a
+    zero, a negative or a string is a caller bug and is refused, because absent and nonsense are
+    different facts and only the first one is honest.
 
     Returns `[]` only when every row was readable, every row varied, and nothing about the
     composition is worth saying at this success rate. An empty list from an empty `term_stats` would
@@ -191,10 +225,8 @@ def diagnose(term_stats, success_rate, ep_len, *, horizon=None):
         raise ValueError(f"success_rate is a fraction in [0, 1], got {success_rate!r} — a percentage "
                          f"here would silently suppress every composition check, because they are "
                          f"conditioned on the run failing")
-    length = _number(ep_len)
-    if length is None or length <= 0:
-        raise ValueError(f"ep_len is the mean episode length in steps and must be positive, got "
-                         f"{ep_len!r}")
+    # Both context arguments, validated the same way — see the docstring.
+    length, span = _optional_steps("ep_len", ep_len), _optional_steps("horizon", horizon)
 
     terms = [_read_term(name, raw) for name, raw in term_stats.items()]
     order = {t.name: i for i, t in enumerate(terms)}
@@ -204,7 +236,7 @@ def diagnose(term_stats, success_rate, ep_len, *, horizon=None):
     found += _structural(terms)
     found += _unreadable(terms)
     if rate < _FAILING:
-        found += _composition(terms, rate, length, horizon)
+        found += _composition(terms, rate, length, span)
     return sorted(found, key=lambda d: (TAGS.index(d.tag), order.get(d.row, len(order))))
 
 
@@ -253,10 +285,11 @@ def _unreadable(terms):
     if not terms:
         out.append(Diagnostic(
             "incomplete", WHOLE_REWARD,
-            f"no per-term contributions were logged for this run, so none of the "
-            f"{len(TAGS)} patterns the reward diagnostics check for could be ruled out. This empty "
-            f"result is NOT a clean bill of health — it is the absence of the measurement. Log the "
-            f"per-step min/mean/max of every reward row alongside the success rate."))
+            f"{_WHOLE_FOLD_PHRASE} went unmeasured: no per-term contributions were logged for this "
+            f"run, so none of the {len(TAGS)} patterns the reward diagnostics check for could be "
+            f"ruled out. This empty result is NOT a clean bill of health — it is the absence of the "
+            f"measurement. Log the per-step min/mean/max of every reward row alongside the success "
+            f"rate."))
     return out
 
 
@@ -267,6 +300,21 @@ def _composition(terms, rate, length, horizon):
     # Farmable = the policy has some choice about it. A constant or dead row is excluded from every
     # rule here: it cannot be farmed instead of finishing the task, because it pays the same whatever
     # the policy does. Calling it "flooding" would be wrong, not merely noisy.
+    #
+    # A row whose variation was NEVER LOGGED (`varies is None` — no min/max, or min above max) is
+    # admitted, deliberately, and the rule is WHICH NUMBER A VERDICT READS. `constant`/`dead` are
+    # claims about the SPREAD, so an unlogged spread withholds them. `flooding`/`hacking` are claims
+    # about a MEAN against the other means, and those means WERE read — withholding a verdict the
+    # data does support would render "not measured" as "nothing to say", which is the exact failure
+    # the `incomplete` tag exists to prevent. The unknown is never silent either way: the same row is
+    # already carrying an `incomplete` telling the author to log min/max, so a reader sees the
+    # accusation and its caveat together. `sparse` obeys the same rule from the other side — it fires
+    # only when NO row is farmable, so an unknown-variation earner suppresses it, because its
+    # variation is unknown rather than absent.
+    #
+    # Pinned in test_diagnose.py (`{"a": {"mean": 1.0}}` and the min>max row at 0.02 success are each
+    # exactly ["flooding", "incomplete"], nothing more and nothing less) so that flipping this
+    # boundary fails a test instead of changing the semantics silently.
     farmable = [t for t in terms if t.earns and t.varies is not False]
     earned = sum(t.mean for t in terms if t.earns)
 
@@ -297,13 +345,17 @@ def _composition(terms, rate, length, horizon):
         captured = collected / available
         if captured >= _CAPTURED:
             top = max(climbable, key=lambda t: t.mean)
-            episode = f", i.e. {_n(collected * length)} per {_n(length)}-step episode"
-            if horizon:
-                episode += f" against a horizon of {horizon}"
+            # Two independent context clauses, each printed only if its number was supplied. Neither
+            # is defaulted; an absent one narrows the sentence rather than inventing a figure.
+            context = ""
+            if length is not None:
+                context += f", i.e. {_n(collected * length)} per {_n(length)}-step episode"
+            if horizon is not None:
+                context += f" against a horizon of {_n(horizon)}"
             out.append(Diagnostic(
                 "hacking", top.name,
                 f"the policy has already collected {_pct(captured)} of the shaping this reward has "
-                f"to offer ({_n(collected)} of {_n(available)} per step{episode}) while only "
+                f"to offer ({_n(collected)} of {_n(available)} per step{context}) while only "
                 f"{_pct(rate)} of episodes succeed; {top.name} is the largest earner at "
                 f"{_n(top.mean)}/step. Shaping is maxed out and the task is still not being done, so "
                 f"the reward's optimum is not the task's optimum — this is a mis-specified "
@@ -317,8 +369,9 @@ def _composition(terms, rate, length, horizon):
     if readable and not farmable:
         out.append(Diagnostic(
             "sparse", WHOLE_REWARD,
-            f"no reward row offers varying positive shaping ({len(terms)} row(s): "
-            f"{', '.join(t.name for t in terms)}), and only {_pct(rate)} of episodes succeed. There "
+            f"{_WHOLE_FOLD_PHRASE} offers no varying positive shaping — not one of its "
+            f"{len(terms)} row(s) ({', '.join(t.name for t in terms)}) both varies and pays "
+            f"positively, and only {_pct(rate)} of episodes succeed. There "
             f"is nothing for the policy to climb — it has to find the success bonus by chance. The "
             f"fully sparse alternative was measured at 178M from-scratch steps at 0% success "
             f"(move_to_target_env.py:199-203). Add one shaping row over a measure that improves as "

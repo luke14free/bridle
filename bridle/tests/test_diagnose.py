@@ -122,8 +122,23 @@ def run_checks():
           every and all(d.tag in TAGS for d in every))
     check("every diagnostic addresses a row the author can look up, or the whole fold",
           every and all(d.row in addresses for d in every))
-    check("every diagnostic's message repeats the address it is about",
-          every and all(d.row in d.message for d in every))
+
+    # SPLIT BY WHAT THE ADDRESS IS, because one check could not bite on both halves (2026-08-13
+    # review, finding 1). `d.row in d.message` is a real test for a row named `pull_xy`, and no test
+    # at all for the whole-fold rows, whose address is the bare English word "reward": both
+    # whole-fold messages were rewritten to address nothing while leaving "reward" in the prose as an
+    # ordinary noun ("check your reward document") and the single combined check reported 0 failures.
+    row_addressed = [d for d in every if d.row != WHOLE_REWARD]
+    whole_fold = [d for d in every if d.row == WHOLE_REWARD]
+    check("every row-addressed diagnostic repeats that row's own name in its message",
+          row_addressed and all(d.row in d.message for d in row_addressed))
+    # The phrase is spelled out here rather than imported from diagnose.py: importing it would make
+    # this check follow a rename instead of catching one, and the point is that the whole-fold
+    # messages say WHICH THING they are about in words the author reads, not that two constants match.
+    check("every whole-fold diagnostic says `the reward fold as a whole` in prose — the bare word "
+          "`reward` is satisfiable by accident, so it is not what is demanded here",
+          whole_fold and all("the reward fold as a whole" in d.message for d in whole_fold))
+
     check("every diagnostic says what to DO about it, not just that it happened",
           every and all(prescribes(d.message) for d in every))
     check("every diagnostic quotes at least one number rather than being pure prose",
@@ -178,12 +193,29 @@ def run_checks():
           "constant" not in tags(partial) and "dead" not in tags(partial))
     check("...and is NOT claimed sparse either — its variation is unknown, not absent",
           "sparse" not in tags(partial))
+
+    # ── an unlogged SPREAD withholds the spread verdicts and ONLY those (finding 2) ───────────────
+    # The withholding above stops at constant/dead/sparse, and stopping there left the other half of
+    # the boundary unpinned: this row IS accused of flooding. That is the intended semantics — the
+    # split is by which number a verdict reads, and flooding reads the mean, which was logged (see
+    # the comment on `farmable` in diagnose.py). Pinned as exact equality, in both directions, so
+    # moving the boundary either way fails here instead of changing the feedback silently.
+    check("...and IS still tagged flooding — the spread was never logged, but the mean was read",
+          "flooding" in tags(partial))
+    check("...and exactly those two, nothing further inferred from the mean alone",
+          tags(partial) == ["flooding", "incomplete"])
     check("a run that logged no per-term stats at all is incomplete, not healthy",
           tags(diagnose({}, 0.02, 40)) == ["incomplete"])
     check("...even when the run succeeded — an empty result would read as a clean bill of health",
           tags(diagnose({}, 0.93, 40)) == ["incomplete"])
-    check("min above max is reported as unreadable rather than folded into a verdict",
-          "incomplete" in tags(diagnose({"r": stats(min=5.0, mean=1.0, max=0.0)}, 0.02, 40)))
+    # The old label here read "...rather than folded into a verdict", which its body never checked
+    # and which was not even true — flooding fires on this row, on purpose. Same boundary as
+    # `partial` above, reached by the other unreadable-spread route (a logging bug, not a missing
+    # key), and pinned the same exact way.
+    check("min above max makes the SPREAD unreadable — incomplete, plus the mean-based verdict, "
+          "and no spread verdict",
+          tags(diagnose({"r": stats(min=5.0, mean=1.0, max=0.0)}, 0.02, 40))
+          == ["flooding", "incomplete"])
     # `== ["incomplete"]` and not `in`: with nothing readable, "there is no shaping to climb" is a
     # claim the data does not support, so `sparse` must NOT fire alongside it.
     check("a run whose every mean is unreadable is ONLY incomplete — no verdict is inferred",
@@ -207,6 +239,37 @@ def run_checks():
     check("a term_stats that is not a mapping is refused", refuses(lambda: diagnose([], 0.5, 60)))
     check("success_rate=0.0 and 1.0 are legal, not off-by-one refusals",
           not refuses(lambda: diagnose({}, 0.0, 60)) and not refuses(lambda: diagnose({}, 1.0, 60)))
+
+    # ── ep_len and horizon are both CONTEXT, so they are optional the same way (finding 6) ───────
+    # ep_len was mandatory while doing strictly less than the optional horizon: it reaches exactly
+    # one message fragment and no rule reads it, so a caller with no measured mean episode length had
+    # to invent one — the substitution the "a rule this module cannot compute must say so" principle
+    # exists to prevent. Resolved by making ep_len optional, not by making horizon mandatory.
+    check("the call is legal with ep_len left out altogether",
+          not refuses(lambda: diagnose(hacking_stats(), 0.01)))
+    no_len = diagnose(hacking_stats(), 0.01)
+    check("omitting ep_len leaves this run's verdict identical — no rule reads it",
+          tags(no_len) == ["hacking"] and tags(no_len) == tags(hacking))
+    check("...the per-step numbers survive and only the per-episode total is absent",
+          "per step" in no_len[0].message and "-step episode" not in no_len[0].message)
+    check("...and supplying ep_len is what adds that per-episode total back",
+          "-step episode" in diagnose(hacking_stats(), 0.01, 64)[0].message)
+    check("omitting BOTH leaves no horizon clause either",
+          "horizon of" not in no_len[0].message)
+    check("...and supplying horizon alone states it without fabricating an episode length",
+          "horizon of 64" in diagnose(hacking_stats(), 0.01, horizon=64)[0].message
+          and "-step episode" not in diagnose(hacking_stats(), 0.01, horizon=64)[0].message)
+    check("ep_len=None and horizon=None are legal — 'not available' is an answer",
+          not refuses(lambda: diagnose(hacking_stats(), 0.01, None, horizon=None)))
+    # Absent and nonsense are different facts, and only the first is honest. A supplied value still
+    # has to be a positive number, for BOTH arguments — a `0` horizon used to be silently swallowed
+    # by an `if horizon:` truthiness test, which is a default by another name.
+    for label, bad in (("ep_len", 0), ("ep_len", -3), ("ep_len", "60"), ("ep_len", True)):
+        check(f"a supplied {label}={bad!r} is refused, not read as absent",
+              refuses(lambda b=bad: diagnose(hacking_stats(), 0.01, b)))
+    for bad in (0, -3, "64", True):
+        check(f"a supplied horizon={bad!r} is refused, not read as absent",
+              refuses(lambda b=bad: diagnose(hacking_stats(), 0.01, 64, horizon=b)))
 
     # ── the output is stable enough to diff between refinement rounds ───────────────────────────
     mixed = {"row1": stats(min=0.0, mean=84.0, max=200.0),
