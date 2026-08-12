@@ -147,6 +147,64 @@ def cmd_relaunch(a):
     return 0
 
 
+def cmd_lineage(a):
+    """Assert every record that claims to describe the deployed environment agrees with it.
+
+    THE RULE IS AGREEMENT BETWEEN RECORDS, NOT TIDINESS WITHIN ONE. Repeated assignment is not
+    reported: a drop-in overriding the base unit is the systemd mechanism working as designed, and
+    playground-coord.service.d/deploy-widegrab.conf assigns GRAB_COORD_REFRESH_R and
+    DINO_GRAB_CORNER_COORD twice on purpose, as a chronological log where a later line reverts an
+    earlier decision with the measurement preserved inline. Flagging either would report correct
+    code as broken, and a checker that fires on correct code gets ignored.
+
+    What IS a violation (live on 2026-08-12): scripts/_pgenv.sh says in its header that it mirrors
+    playground-coord.service, and carries the SHADOWED COORD_CKPT_grab — so every offline test run
+    through it loaded a different grab policy than the live service.
+    """
+    import glob
+    import subprocess
+
+    from bridle.lineage import compare_records, resolve_env
+    from bridle.store import Store
+
+    store = Store(a.store)
+    bad = []
+
+    # 1. Resolve the service environment the way systemd does: `systemctl cat` already emits the
+    #    base unit followed by its drop-ins in application order, so a single ordered pass is the
+    #    same resolution systemd performs.
+    unit = subprocess.run(["systemctl", "--user", "cat", "playground-coord.service"],
+                          capture_output=True, text=True)
+    if unit.returncode != 0:
+        print("SKIP       playground-coord.service not installed; cannot resolve the live env")
+        effective = {}
+    else:
+        effective = resolve_env([("playground-coord.service", unit.stdout.splitlines())])
+
+    # 2. Every record that claims to mirror it must agree.
+    pgenv = os.path.join(a.cwd, "scripts/_pgenv.sh")
+    if effective and os.path.isfile(pgenv):
+        claimed = resolve_env([(pgenv, open(pgenv).read().splitlines())])
+        for m in compare_records(effective, claimed, "scripts/_pgenv.sh", prefix="COORD_CKPT_"):
+            print(f"MISMATCH   {m.record}: {m.key} claims {m.claimed}, live env resolves to "
+                  f"{m.effective}")
+            bad.append(m.key)
+
+    # 3. Every app's ckpt exists, and where the live env pins that primitive, they agree.
+    for path in sorted(glob.glob(os.path.join(os.path.expanduser(a.store), "*.yaml"))):
+        m = store._load_text(open(path).read()) or {}
+        ck = m.get("ckpt")
+        if not ck:
+            continue
+        full = ck if os.path.isabs(ck) else os.path.join(a.cwd, ck)
+        if not os.path.isfile(full):
+            print(f"MISSING    {m.get('name')}: ckpt does not exist: {ck}")
+            bad.append(m.get("name"))
+
+    print(f"\n{len(bad)} violation(s)")
+    return 1 if bad else 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="bridle", description=__doc__.split("\n")[0])
     ap.add_argument("--store", default=os.environ.get(
@@ -183,6 +241,10 @@ def main(argv=None):
     r.add_argument("--cwd", default="/home/luca/lego-arm")
     r.add_argument("--dry-run", action="store_true")
     r.set_defaults(fn=cmd_relaunch)
+
+    lg = sub.add_parser("lineage", help="check deployed records against the live environment")
+    lg.add_argument("--cwd", default="/home/luca/lego-arm")
+    lg.set_defaults(fn=cmd_lineage)
 
     a = ap.parse_args(argv)
     return a.fn(a)
