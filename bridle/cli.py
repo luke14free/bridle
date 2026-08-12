@@ -173,30 +173,65 @@ def cmd_lineage(a):
     # 1. Resolve the service environment the way systemd does: `systemctl cat` already emits the
     #    base unit followed by its drop-ins in application order, so a single ordered pass is the
     #    same resolution systemd performs.
-    unit = subprocess.run(["systemctl", "--user", "cat", "playground-coord.service"],
-                          capture_output=True, text=True)
-    if unit.returncode != 0:
-        print("SKIP       playground-coord.service not installed; cannot resolve the live env")
+    #
+    #    An unperformed check is a violation, not a pass: if this fails for ANY reason (systemctl
+    #    missing from PATH, the service stopped/renamed/uninstalled), `effective` stays {} and
+    #    steps 2-3 below cannot compare against a live env. Printing "0 violation(s)" in that case
+    #    would be indistinguishable from a genuine clean run, so every such path prints a distinct
+    #    UNVERIFIED line and counts toward the nonzero exit — "cannot verify" must never render as
+    #    "verified".
+    try:
+        unit = subprocess.run(["systemctl", "--user", "cat", "playground-coord.service"],
+                              capture_output=True, text=True)
+    except FileNotFoundError as e:
+        print(f"UNVERIFIED systemctl not found on PATH ({e}); cannot resolve the live env")
+        bad.append("systemctl")
         effective = {}
     else:
-        effective = resolve_env([("playground-coord.service", unit.stdout.splitlines())])
+        if unit.returncode != 0:
+            print("UNVERIFIED playground-coord.service: `systemctl --user cat` exited "
+                  f"{unit.returncode} ({unit.stderr.strip() or 'no stderr'}); cannot resolve the "
+                  "live env")
+            bad.append("playground-coord.service")
+            effective = {}
+        else:
+            effective = resolve_env([("playground-coord.service", unit.stdout.splitlines())])
 
-    # 2. Every record that claims to mirror it must agree.
+    # 2. Every record that claims to mirror it must agree. This must run — and be reported as
+    #    UNVERIFIED if it can't — independent of whether step 1 succeeded: a missing _pgenv.sh is
+    #    its own unperformed check even when the live env resolved fine.
     pgenv = os.path.join(a.cwd, "scripts/_pgenv.sh")
-    if effective and os.path.isfile(pgenv):
+    if not os.path.isfile(pgenv):
+        print(f"UNVERIFIED scripts/_pgenv.sh not found at {pgenv}; cannot check it against the "
+              "live env")
+        bad.append("scripts/_pgenv.sh")
+    elif not effective:
+        print("UNVERIFIED scripts/_pgenv.sh: live env did not resolve (see above); comparison "
+              "skipped")
+        bad.append("scripts/_pgenv.sh")
+    else:
         claimed = resolve_env([(pgenv, open(pgenv).read().splitlines())])
         for m in compare_records(effective, claimed, "scripts/_pgenv.sh", prefix="COORD_CKPT_"):
             print(f"MISMATCH   {m.record}: {m.key} claims {m.claimed}, live env resolves to "
                   f"{m.effective}")
             bad.append(m.key)
 
-    # 3. Every app's ckpt exists, and where the live env pins that primitive, they agree.
+    # 3. Every app's ckpt exists, and where the live env pins that primitive, they agree. One
+    #    unparsable manifest, or one with a malformed `ckpt` field, must not abort the scan of
+    #    every other manifest — it is reported as its own violation and the scan continues.
     for path in sorted(glob.glob(os.path.join(os.path.expanduser(a.store), "*.yaml"))):
-        m = store._load_text(open(path).read()) or {}
-        ck = m.get("ckpt")
-        if not ck:
+        try:
+            m = store._load_text(open(path).read()) or {}
+            ck = m.get("ckpt")
+            if not ck:
+                continue
+            if not isinstance(ck, str):
+                raise TypeError(f"ckpt must be a string, got {type(ck).__name__}: {ck!r}")
+            full = ck if os.path.isabs(ck) else os.path.join(a.cwd, ck)
+        except Exception as e:
+            print(f"UNVERIFIED {path}: {type(e).__name__}: {e}; manifest could not be checked")
+            bad.append(path)
             continue
-        full = ck if os.path.isabs(ck) else os.path.join(a.cwd, ck)
         if not os.path.isfile(full):
             print(f"MISSING    {m.get('name')}: ckpt does not exist: {ck}")
             bad.append(m.get("name"))

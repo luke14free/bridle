@@ -106,7 +106,19 @@ def require_known(overrides: dict, readable) -> None:
 
 
 def _assignments(lines):
-    """(key, value) for every `Environment=K=V`, `export K=V` or bare `K=V` line, in order."""
+    """(key, value) for every `Environment=K=V`, `export K=V` or bare `K=V` line, in order.
+
+    ⚠ DOES NOT IMPLEMENT THE FULL `Environment=` GRAMMAR — two documented gaps, neither exercised
+    by any unit in this repo today:
+    (1) Multiple space-separated assignments on one `Environment=` line (systemd's
+        `Environment=FOO=bar BAZ=qux` sets both FOO and BAZ) are NOT split apart: the whole
+        remainder after the first `=` is taken as one value, so `Environment=FOO=bar BAZ=qux`
+        yields `{'FOO': 'bar BAZ=qux'}` and BAZ is silently lost.
+    (2) A bare `Environment=` line with nothing after it is systemd's documented reset — "clear
+        all prior assignments" — but here it strips to `k == ""`, fails `k.isidentifier()`, and is
+        just dropped: it is treated as a no-op, not a clear, so assignments from earlier sources in
+        `resolve_env` are NOT cleared the way systemd would clear them.
+    Do not assume either case is handled without checking here first."""
     out = []
     for raw in lines:
         s = raw.strip()
