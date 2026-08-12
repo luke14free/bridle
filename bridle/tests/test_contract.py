@@ -106,8 +106,31 @@ def run_checks():
         s, release=dataclasses.replace(s.release, destination_top_rule="vibes")))
     rejects("negative release height rejected", lambda: dataclasses.replace(
         s, release=dataclasses.replace(s.release, height_above_resting=-0.01)))
-    rejects("success tolerance TIGHTER than the release gate rejected", lambda: dataclasses.replace(
-        s, release=dataclasses.replace(s.release, success_tolerance=0.01)))
+    # success_height_band < height_above_resting IS a genuine impossibility (the reward's own
+    # hover attractor would sit outside the region training scores as success) and stays a hard
+    # invariant. Kept right next to the two checks below to show only ONE raise was removed, not
+    # this one.
+    rejects("success_height_band below height_above_resting still rejected (genuine impossibility)",
+             lambda: dataclasses.replace(
+                 Contract.stack(),
+                 release=dataclasses.replace(Contract.stack().release, success_height_band=0.001)))
+    # ── success_tolerance vs centering_tolerance is NOT a hard invariant (see validate()) ────────
+    # There is no physical law ordering these two numbers, and both orderings are real,
+    # in-service configurations — construction must succeed for both, not just one.
+    deployed_lineage = dataclasses.replace(
+        Contract.stack(),
+        release=dataclasses.replace(Contract.stack().release,
+                                     success_tolerance=0.025, centering_tolerance=0.035))
+    deployed_lineage.validate()
+    check("deployed descend-coordv3g config (success 0.025 < gate 0.035, "
+          "composer/store/apps/place_coord_v3.yaml) validates clean", True)
+    stack_baseline = dataclasses.replace(
+        Contract.stack(),
+        release=dataclasses.replace(Contract.stack().release,
+                                     success_tolerance=0.045, centering_tolerance=0.035))
+    stack_baseline.validate()
+    check("Contract.stack()'s own baseline (success 0.045 > gate 0.035, "
+          "the recorded defect) validates clean", True)
     rejects("zero budget rejected", lambda: dataclasses.replace(
         c, execution=dataclasses.replace(c.execution, budget=0)))
 

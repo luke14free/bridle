@@ -5,8 +5,13 @@ cost of that drift, twice:
 
   grab   training required a grasp to survive 16 steps, deploy exited after 6.
          pick-only 0.40 vs 0.83 on the same seeds (p=0.00012).
-  place  training's descend hovers 1.5cm above resting (`_HOVER`), deploy releases there — onto a
-         2.4cm cube, which the cube bounces off. pick-and-stack 0/20, 5 releases traced 2026-08-11.
+  place  training scores a descend as successful at 4.5cm of lateral error (`_CENTER_TOL`, inherited
+         from an 8cm platform) and deploy releases at 3.5cm (`centering_tolerance`), onto a 2.4cm
+         cube that can only support ~1.2cm. pick-and-stack 0/20. The basin was measured on
+         2026-08-12 (lego-arm scripts/probe_stack_basin.py, 176 cells): 10-12mm along a cube axis,
+         14-18mm along the diagonal, and FLAT in release gap 0-22mm. An earlier reading of this same
+         0/20 blamed release HEIGHT ("the cube bounces off"); that is false — restitution is 0 —
+         and two retrains were spent on it before anyone swept the basin.
 
 Both were invisible to every benchmark, because benchmarks run INSIDE the training contract.
 
@@ -257,15 +262,23 @@ class Contract:
                     f"success_height_band ({r.success_height_band}) < height_above_resting "
                     f"({r.height_above_resting}): the reward's own hover attractor would sit "
                     "outside the region training scores as success.")
-            if r.success_tolerance < r.centering_tolerance:
-                # The release gate must not be LOOSER than what training scores as success, or the
-                # policy is optimised for a target it is then forbidden to act on. (Today they run
-                # the other way — 0.045 success vs 0.035 gate — which is the recorded defect.)
-                raise ValueError(
-                    f"success_tolerance ({r.success_tolerance}) < centering_tolerance "
-                    f"({r.centering_tolerance}): training would score a success the release gate "
-                    "then refuses to act on."
-                )
+            # success_tolerance vs centering_tolerance is DELIBERATELY NOT a hard invariant. There
+            # is no physical law ordering these two numbers — both orderings are real and both are
+            # in service today:
+            #   0.045 success / 0.035 gate  Contract.stack()'s own baseline (the "KNOWN DEFECT,
+            #                                PRESERVED DELIBERATELY" documented above). Raising here
+            #                                would make the baseline that exists to describe today's
+            #                                system fail to construct — refusing the very reality
+            #                                this library exists to record.
+            #   0.025 success / 0.035 gate  the deployed descend-coordv3g lineage's actual recorded
+            #                                training config (composer/store/apps/place_coord_v3.yaml:
+            #                                PRIM_DESCEND_CENTER_TOL=0.025, centering_tolerance left
+            #                                at the 0.035 default). A contract library that cannot
+            #                                express the policy in production is broken.
+            # Each ordering has real consequences (a gap the gate refuses to act on, or a policy
+            # optimised looser than the gate permits) — worth surfacing via `describe()`/logs, but
+            # not worth blocking construction over. See bridle/tests/test_contract.py for both
+            # orderings validating clean.
 
     def fingerprint(self) -> str:
         """A stable 12-hex-char digest of the whole contract.

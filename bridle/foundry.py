@@ -89,10 +89,11 @@ def contract_env(contract) -> dict:
             "PRIM_DESCEND_HOVER": repr(r.height_above_resting),
             "PRIM_DESCEND_LOW_BAND": repr(r.success_height_band),
             "PRIM_DESCEND_CENTER_TOL": repr(r.success_tolerance),
-            # The deploy-side gate travels WITH the training tolerance. They are the same physical
-            # quantity, and shipping one without the other produces an incoherent contract —
-            # Contract.validate() rejects it, which is how this omission was caught before three
-            # GPU-hours rather than after.
+            # The deploy-side gate travels WITH the training tolerance because both are read off
+            # the SAME Contract object, not because Contract.validate() enforces any particular
+            # ordering between them (it deliberately does not — see contract.py's validate()).
+            # Routing both through here is what stops the two from drifting apart via someone's
+            # memory, which is the actual failure mode this app was built to kill.
             "PRIM_DESCEND_RELEASE_TOL": repr(r.centering_tolerance),
         })
     g = getattr(contract, "grasp", None)
