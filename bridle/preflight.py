@@ -97,18 +97,19 @@ def _tightens(authored: Assert, floor: Assert) -> bool:
 def merge(kind, authored) -> tuple:
     """Kind floors plus authored asserts. An authored assert on the same path may only tighten."""
     floors = KIND_ASSERTS.get(kind or "", ())
-    by_path = {a.path: a for a in floors}
+    by_path = {a.path: i for i, a in enumerate(floors)}
     out = list(floors)
     for a in authored:
-        floor = by_path.get(a.path)
-        if floor is None:
+        idx = by_path.get(a.path)
+        if idx is None:
             out.append(a)
             continue
+        floor = out[idx]
         if not _tightens(a, floor):
             raise Loosened(
                 f"authored assert `{a.describe()}` weakens what kind={kind} requires "
                 f"(`{floor.describe()}`). A kind assert is a floor: tighten it or drop it.")
-        out[out.index(floor)] = replace(a, source=f"authored (tightens kind={kind})")
+        out[idx] = replace(a, source=f"authored (tightens kind={kind})")
     return tuple(out)
 
 

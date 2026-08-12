@@ -42,6 +42,9 @@ def run_checks():
     check("max fails above", not Assert("m", DYNAMIC, max=0.99).holds(1.0))
     check("expect matches exactly", Assert("p", STATIC, expect=True).holds(True))
     check("expect rejects a truthy non-match", not Assert("p", STATIC, expect=True).holds(1))
+    check("expect=False holds on False", Assert("p", STATIC, expect=False).holds(False))
+    check("expect=False fails on True", not Assert("p", STATIC, expect=False).holds(True))
+    check("expect=0 holds on 0", Assert("p", STATIC, expect=0).holds(0))
     check("a None observation never holds", not Assert("m", DYNAMIC, min=0.5).holds(None))
 
     # ── kind supplies the carry gotchas; the author does not have to know them ──
