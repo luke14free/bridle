@@ -18,6 +18,8 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 
+from bridle.rig import Rig
+
 LATCH_RULES = ("target", "any", "none")
 GRASP_SIGNALS = ("privileged", "proprio")
 TOP_RULES = ("detected_half", "assumed_half", "platform_constant")
@@ -186,12 +188,18 @@ class Contract:
     execution: Execution
     grasp: Grasp | None = None
     release: Release | None = None
+    #: The rig this contract assumes. None means "unspecified" — legal, and exactly as dangerous as
+    #: it sounds: a skill with no declared rig cannot be checked against yours, so `resolve` has
+    #: nothing to compare and must fall back to RETRAIN. Declaring it is what buys the check.
+    rig: "object | None" = None
     #: Free-form label for the primitive this contract governs ("grab", "stack"). Part of the
     #: fingerprint: two primitives with coincidentally identical numbers are still different
     #: contracts, and a ckpt should not silently cross between them.
     name: str = ""
 
     def validate(self) -> None:
+        if self.rig is not None:
+            self.rig.validate()
         e = self.execution
         if e.budget <= 0:
             raise ValueError(f"budget must be > 0, got {e.budget}")
@@ -301,6 +309,7 @@ class Contract:
         """
         return cls(
             name="grab",
+            rig=Rig.so101(cameras=("base", "wrist")),
             actuation=Actuation(gripper_dim=5, action_lo=-1.0, action_hi=1.0),
             execution=Execution(budget=28, gripper="zero_after_latch",
                                 terminate=("sustained_grasp",), hold_steps=16),
@@ -317,7 +326,7 @@ class Contract:
         )
 
     @classmethod
-    def for_prim(cls, name, budget, *, carry=False, grasp_latch=False, latch_on="target",
+    def for_prim(cls, name, budget, *, rig=None, carry=False, grasp_latch=False, latch_on="target",
                  latch_linger=None, stop_at_goal=False, goal_tolerance=None,
                  stop_on_grasp=False, force_threshold=None, linger_pre_step=False) -> "Contract":
         """The contract for one deployed primitive rollout, built from the same knobs `run_prim`
@@ -342,6 +351,7 @@ class Contract:
         gripper = "zero_always" if carry else ("zero_after_latch" if grasp_latch else "free")
         return cls(
             name=name,
+            rig=rig,
             actuation=Actuation(gripper_dim=5, action_lo=-1.0, action_hi=1.0),
             execution=Execution(budget=int(budget), gripper=gripper, terminate=tuple(terminate),
                                 terminate_pre_step=tuple(pre),
@@ -375,6 +385,7 @@ class Contract:
         """
         return cls(
             name="stack",
+            rig=Rig.so101(cameras=("base",)),
             actuation=Actuation(gripper_dim=5, action_lo=-1.0, action_hi=1.0),
             # gripper zero_always: a carry prim must never re-open mid-carry. terminate=() : today's
             # descend burns its full budget and the macro checks alignment only afterwards.
