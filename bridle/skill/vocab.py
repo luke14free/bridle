@@ -740,8 +740,11 @@ def vocab_document() -> str:
     add("- `max_shaping_below: success_bonus` — per-step shaping maxima must stay below the success "
         "value (move_to_target: 1.5 < 5.0 < 50.0) — the fully-sparse alternative measured 178M "
         "steps at 0% success.")
-    add("- `attractor_setpoint_not_at: contact` — a DistancePull setpoint over a SIGNED measure must "
-        "not peak at the contact surface (descend's hover, 0.015, never 0) — peaking at contact is "
-        "the 16/16 grasp-loss failure mode.")
+    add("- `attractor_setpoint_not_at: contact` — a DistancePull setpoint over a SIGNED measure "
+        "whose zero IS a resting surface must not peak at that zero (descend's hover, 0.015, never "
+        "0) — peaking at contact is the 16/16 grasp-loss failure mode. Two signed measures are "
+        "outside this rule because their zero is not a surface and a setpoint of 0 over them is a "
+        "legal thing to ask for: `gripper_qpos` (0 is a fully open jaw; closed is ~-0.73) and "
+        "`joint_qpos` (0 is a joint's zero angle, held in free space).")
 
     return "\n".join(lines)

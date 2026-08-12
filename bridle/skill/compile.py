@@ -22,11 +22,25 @@ THREE PROPERTIES, AND THE MEASUREMENT BEHIND EACH:
      PYTHONHASHSEED, so a checkpoint stamped with it is unverifiable on the next run — which is the
      one thing the stamp exists to do. Same rule as `Contract.fingerprint()`/`Rig.fingerprint()`.
 
-WHAT IT REFUSES BEYOND `spec.py`, AND WHY THE LIST IS NOT "EXTRA": a parameter the fold cannot honour
-is REFUSED, never quietly dropped. `kernel: one_minus_tan`, `scope: all`, `axes: xy`,
-`predicate_ref: whenever` all pass the schema (those fields carry no `choices` in the vocabulary) and
-would otherwise train a reward the author did not write, log clean, and contribute nothing — the exact
-shape of the crush penalty that silently vanished over an unsigned measure and cost 16/16 grasps.
+WHAT IT REFUSES BEYOND `spec.py`, AND WHERE THE TIER BOUNDARY IS. Two tiers refuse a bad parameter
+value, and they own different questions:
+
+  SCHEMA TIER (`spec.py` reading `Param.choices` from `vocab.py`) owns "is this a legal value for
+  this parameter at all". `kernel: one_minus_tan`, `mode: multiply`, `predicate_ref: whenever`,
+  `side`, `norm` — every closed set the vocabulary can enumerate — are refused there, as
+  `SpecError`, before this module runs. Those five carried no `choices` until 2026-08-12 and were
+  caught here instead; the `_HONOURED` entries that used to do it have been DELETED rather than kept,
+  because a refusal branch that can never fire advertises a check that never runs.
+
+  COMPILE TIER (`_HONOURED` / `_UNIMPLEMENTED` below) owns "this value is legal in the vocabulary but
+  THIS FOLD does not implement it" — `scope: all`, `body: tcp`, `axes: xy`, `gamma: 0.99`. The
+  vocabulary leaves those sets open on purpose (a scope the fold learns tomorrow is not an illegal
+  scope today), so nothing upstream can catch them, and accepting one silently folds a reward the
+  author did not write: it trains, it logs clean, and it contributes nothing — the exact shape of the
+  crush penalty that vanished over an unsigned measure and cost 16/16 grasps.
+
+  The boundary moved once and will move again, so `test_skillcompile.py` asserts each refusal AT the
+  tier that raises it, with that tier's exception type, rather than accepting either.
 
 THE HORIZON IS AN ARGUMENT, NOT A DOCUMENT FIELD. `SkillSpec` has no `execution:` block, so
 `compile_spec(spec, *, horizon=None, terminate_on_success=None)` takes it from the caller. With
@@ -41,12 +55,14 @@ import hashlib
 import json
 import math
 import re
-import warnings
 from types import MappingProxyType
+from warnings import warn      # `warn`, not `warnings`: `RewardPlan.warnings` is a FIELD of this
+                               # module's central type, and one `warnings` in one file reading as
+                               # both the stdlib module and a plan attribute is a reader-trap.
 
 from bridle.skill.expr import Expr
 from bridle.skill.spec import ROW_TERMS, SkillSpec
-from bridle.skill.vocab import MEASURES, TERMS
+from bridle.skill.vocab import MEASURES, TERMS, Sign
 
 __all__ = [
     "CompileError", "FloodingError", "Op", "RewardPlan", "UNBOUNDED",
@@ -152,6 +168,16 @@ def _param_value(path, name, spec_params):
 
 def _bind_number(path, value, spec_params):
     """A numeric field: either already a number, or exactly `params.X` naming one."""
+    if value is None:
+        # UNREACHABLE TODAY and defensive on purpose. `spec.py` refuses a null on a required numeric
+        # field, and every optional one this is called with carries a numeric default
+        # (`RewardScale.divisor` defaults to 12.0, so `reward_scale: {}` still binds 12.0). But the
+        # only promise this module makes its callers is that they catch `CompileError`, and
+        # `float(None)` is a bare `TypeError` that walks straight past it — one changed default
+        # upstream and the contract breaks in the caller, not here.
+        raise CompileError(path, "this field needs a number and none was supplied — write the "
+                                 "number, or a `params.X` reference to one",
+                           legal=[f"params.{n}" for n in spec_params])
     if isinstance(value, str):
         if not value.startswith("params."):
             raise CompileError(path, f"{value!r} is not a number and not a `params.X` reference to "
@@ -182,22 +208,28 @@ def _bind_text(path, text, spec_params):
 
 
 # ── values the fold can honour ──────────────────────────────────────────────────────────────────
-# A closed set per (term, parameter), checked here rather than in the schema because these are the
-# values THIS COMPILER implements, not the values the vocabulary describes. The vocabulary documents
-# `kernel: one_minus_tanh | neg_linear | gaussian` in prose and carries no `choices`, so a typo
-# reaches this module intact; accepting it and silently folding the default is how a row comes to
-# train, log, and mean something nobody wrote.
+# THE COMPILE TIER of the two-tier refusal (module docstring). ONLY parameters whose legal set the
+# VOCABULARY LEAVES OPEN belong in this table: `spec.py` already refuses anything outside a
+# `Param.choices`, so an entry that merely restates one is a branch that can never fire. `kernel`,
+# `mode`, `predicate_ref`, `side` and `norm` gained `choices` on 2026-08-12 and were deleted from here
+# for exactly that reason — their refusals now read `SpecError`, one tier earlier, same message shape.
+# What is left is the residue: values that ARE legal in the vocabulary and that this fold does not
+# implement.
+
+#: How each legal `scope` reaches back into the fold. `preceding` means "the accumulator", which is
+#: what `evaluate_plan` combines a replace/floor row against; there is no second entry because there
+#: is no second behaviour in the fold. ONE table, read both by `_HONOURED` below (what compiles) and
+#: by `evaluate_plan` at the bottom of this file (what runs), so a scope cannot be declared legal
+#: without stating what it actually reaches. The alternative is the failure this whole tier exists to
+#: stop: `scope: all` accepted and quietly folded as `preceding`.
+_SCOPE_REACH = {
+    "preceding": lambda acc: acc,
+}
 
 _HONOURED = {
-    ("DistancePull", "kernel"): ("one_minus_tanh", "neg_linear", "gaussian"),
-    ("HingePenalty", "side"): ("above", "below"),
-    ("ActionPenalty", "norm"): ("l2",),
     ("VelocityPenalty", "body"): ("held",),
-    ("SuccessBonus", "mode"): ("add", "replace", "floor"),
-    ("SuccessBonus", "scope"): ("preceding",),
-    ("SuccessBonus", "predicate_ref"): ("per_step", "latched"),
-    ("PredicateBonus", "mode"): ("add", "replace", "floor"),
-    ("PredicateBonus", "scope"): ("preceding",),
+    ("SuccessBonus", "scope"): tuple(_SCOPE_REACH),
+    ("PredicateBonus", "scope"): tuple(_SCOPE_REACH),
 }
 
 #: Parameters the vocabulary declares but this fold does not implement, with the only value that is
@@ -356,11 +388,36 @@ assert set(_PER_STEP_MAXIMUM) == set(ROW_TERMS) | {"expr", "custom"}, (
 #: 0 on any of these measures IS the surface the object rests on, so a peaked attractor at setpoint=0
 #: pulls a GRASPED object into it. That is not a hypothetical: descend's pre-2026-06-04 hover was
 #: `2.5*(1-tanh(6*dz))`, peaking at dz=0, and broke 16/16 grasps while low; the fix was to peak at
-#: _HOVER=0.015 instead. `gripper_qpos` is deliberately NOT here — its 0 is "fully open", not a
-#: contact surface — and `object_to_goal_z` is a free 3D goal (move_to_3d peaks at 0 on purpose).
-_CONTACT_SURFACE_MEASURES = frozenset({
-    "height_above_seat_live", "height_above_seat_static_goal", "height_above_resting",
-})
+#: _HOVER=0.015 instead.
+#:
+#: DERIVED FROM THE VOCABULARY, not hand-listed. `vocab_document()` hands the authoring model this
+#: rule over SIGNED measures, and a hand-listed set silently stops matching that promise the day a
+#: signed measure is added — the same drift `_PER_STEP_MAXIMUM`'s assert exists to stop for terms. So
+#: a new SIGNED measure is IN the check by default and taking it out costs one line below, with its
+#: reason. (The list this replaced named three of the five signed measures and justified the gap by
+#: citing `object_to_goal_z`, which is MAGNITUDE and was never a candidate, while `joint_qpos` — a
+#: real and correct exclusion — went unmentioned.)
+_ZERO_IS_NOT_A_CONTACT_SURFACE = {
+    "gripper_qpos": "0 is a fully OPEN jaw, not a surface: closed is ~-0.73 and the jaw-creep hinge "
+                    "sits at -0.6, so a pull peaked at 0 asks the gripper to open — a legal request",
+    "joint_qpos": "0 is a joint's zero angle, a pose the arm holds in free space; nothing is "
+                  "resting on anything",
+}
+_CONTACT_SURFACE_MEASURES = frozenset(
+    name for name, measure in MEASURES.items()
+    if measure.sign is Sign.SIGNED and name not in _ZERO_IS_NOT_A_CONTACT_SURFACE)
+
+assert set(_ZERO_IS_NOT_A_CONTACT_SURFACE) <= set(MEASURES), (
+    "an exclusion naming a measure the vocabulary does not have is a line that stopped meaning "
+    "anything at a rename and now silently excludes nothing")
+assert all(MEASURES[n].sign is Sign.SIGNED for n in _ZERO_IS_NOT_A_CONTACT_SURFACE), (
+    "an exclusion only means something for a SIGNED measure — an unsigned one can never enter this "
+    "set — so a MAGNITUDE name here is a stale line pretending to carry a decision")
+assert {"height_above_seat_live", "height_above_seat_static_goal",
+        "height_above_resting"} <= _CONTACT_SURFACE_MEASURES, (
+    "the three measures whose 0 is a seat or resting surface must stay checked: this is the "
+    "16/16-grasp rule, and `height_above_seat` -> `height_above_seat_live` already renamed once "
+    "(phase2-decisions §2), so a rename must fail loudly here rather than delete the check")
 _PEAKED_KERNELS = frozenset({"one_minus_tanh", "gaussian"})
 
 
@@ -490,9 +547,17 @@ def _row_maximum(op):
     return _PER_STEP_MAXIMUM[op.fn_key](op.params)
 
 
+#: A note's two levels. `_ACT` also goes out through the `warnings` module — the caller has something
+#: to DO (pass a horizon, bound a row, lower a weight). `_FYI` is stored in `plan.warnings` only.
+#: The split exists because emitting on EVERY successful compile made `python -W error` unable to
+#: compile any document at all, which turns a channel meant to carry signal into one a careful caller
+#: must switch off wholesale.
+_FYI, _ACT = "note", "act"
+
+
 def _check_flooding(ops, *, horizon, terminate_on_success):
     """Refuse when per-step shaping can out-earn completing the task. Warn — never refuse — on the
-    horizon-integrated number. Returns the warnings; raises `FloodingError`.
+    horizon-integrated number. Returns `(level, text)` notes; raises `FloodingError`.
 
     WHY THE REFUSAL IS PER-STEP AND THE HORIZON IS ONLY A WARNING (user decision, 2026-08-12; the
     original amendment proposed refusing on the integrated ratio):
@@ -511,7 +576,11 @@ def _check_flooding(ops, *, horizon, terminate_on_success):
       printed with BOTH numbers, and left to a human.
 
     WHAT COUNTS AS SHAPING: rows that ACCUMULATE (`kind == "add"`), excluding the SuccessBonus rows —
-    those are the completion side of the comparison. Rows that replace or floor do not accumulate.
+    those are the completion side of the comparison. Rows that replace or floor do not accumulate,
+    and are therefore OUTSIDE this comparison entirely — a gap the notes state out loud whenever such
+    a row is present, because a `PredicateBonus{mode: floor, weight: 100.0, scope: preceding}` over an
+    easy predicate measures 99.998/step against descend's success value of 12.0 and does not trip
+    anything here.
 
     WHAT AN UNBOUNDED ROW DOES: it makes this check INCOMPLETE and say so. Treating it as zero would
     render "not checked" as "checked and clean", which is how `bridle lineage` came to print
@@ -522,6 +591,8 @@ def _check_flooding(ops, *, horizon, terminate_on_success):
     notes = []
     shaping = [(i, op) for i, op in enumerate(ops) if op.kind == "add" and op.fn_key != "SuccessBonus"]
     bonuses = [(i, op) for i, op in enumerate(ops) if op.fn_key == "SuccessBonus"]
+    overriding = [(i, op) for i, op in enumerate(ops)
+                  if op.kind != "add" and op.fn_key != "SuccessBonus"]
 
     bounded, unbounded = [], []
     for i, op in shaping:
@@ -530,18 +601,30 @@ def _check_flooding(ops, *, horizon, terminate_on_success):
     total = sum(m for _, _, m in bounded)
 
     if unbounded:
-        notes.append(
+        notes.append((_ACT,
             f"flooding check INCOMPLETE: {len(unbounded)} reward row(s) state no per-step maximum "
             f"this document can bound — "
             f"{'; '.join(f'reward[{i}] {op.fn_key} UNBOUNDED' for i, op, _ in unbounded)}. The "
             f"bounded rows sum to {_num(total)}/step, which is a LOWER bound on the shaping, not a "
-            f"verdict: the check could not conclude and this is not a pass.")
+            f"verdict: the check could not conclude and this is not a pass."))
+
+    if overriding:
+        # Stated in the note, not only in a code comment: a reader of the output has no way to know
+        # which rows the sum above left out, and the omission is large enough to invert the verdict.
+        notes.append((_ACT,
+            f"KNOWN GAP, this check does not cover "
+            f"{'; '.join(f'reward[{i}] {op.fn_key} mode={op.kind}' for i, op in overriding)}: a "
+            f"`replace` or `floor` row does not ACCUMULATE, so it is outside the per-step sum by "
+            f"construction and no weight on it can trip the refusal. Measured: a "
+            f"`PredicateBonus{{mode: floor, weight: 100.0, scope: preceding}}` over `grasped` folds "
+            f"to 99.998/step against descend's success value of 12.0 and compiles clean. Compare "
+            f"those rows' levels against the success value by hand."))
 
     if not bonuses:
-        notes.append(
+        notes.append((_ACT,
             "flooding check INCOMPLETE: this reward has no SuccessBonus row, so there is no "
             f"completion value for the {_num(total)}/step of shaping to be compared against. That "
-            "is not a pass — it is a reward whose ceiling this compiler cannot locate.")
+            "is not a pass — it is a reward whose ceiling this compiler cannot locate."))
         return notes
 
     # One document, one completion value. With more than one SuccessBonus row the largest is the
@@ -561,21 +644,32 @@ def _check_flooding(ops, *, horizon, terminate_on_success):
             f"above {_num(total)}")
 
     notes.extend(_integrated_note(total, value, ops=bonuses, horizon=horizon,
-                                  terminate_on_success=terminate_on_success))
+                                  terminate_on_success=terminate_on_success,
+                                  partial=bool(unbounded)))
     return notes
 
 
-def _integrated_note(total, value, *, ops, horizon, terminate_on_success):
+def _integrated_note(total, value, *, ops, horizon, terminate_on_success, partial):
     """The horizon-integrated ratio: a WARNING with both numbers, or an explicit "could NOT be
-    computed" when no horizon was supplied. Never a refusal, and never silence."""
+    computed" when no horizon was supplied. Never a refusal, and never silence.
+
+    `partial` says unbounded rows were partitioned out upstream, so `total` is a lower bound and this
+    line has to say so. Without it the pair of notes contradicts itself: `_check_flooding` prints
+    "INCOMPLETE ... this is not a pass" and then this line prints a clean-looking figure computed from
+    the bounded subset, and the second one is the one that reads like a verdict.
+    """
+    at_least = "at least " if partial else ""
+    caveat = (" That shaping figure is a LOWER bound and not a verdict: the unbounded rows named "
+              "above are not in it, so the real total is higher by an amount this document does not "
+              "state." if partial else "")
     if horizon is None:
-        return [
+        return [(_ACT,
             "the horizon-integrated shaping check could NOT be computed: no `horizon=` was passed to "
             "compile_spec, and this compiler does not substitute a default. NOT VERIFIED is not the "
             "same as verified — `bridle lineage` once printed `0 violation(s)` and exited 0 on a "
             "machine with no `systemctl`, reporting a clean bill of health for checks it had not "
-            f"run. Pass horizon=<max_episode_steps> to compare {_num(total)}/step against the "
-            f"success value {_num(value)} over a real episode."]
+            f"run. Pass horizon=<max_episode_steps> to compare {at_least}{_num(total)}/step against "
+            f"the success value {_num(value)} over a real episode.")]
 
     latched = any(op.params.get("predicate_ref") == "latched" for _, op in ops)
     if terminate_on_success is True:
@@ -590,17 +684,20 @@ def _integrated_note(total, value, *, ops, horizon, terminate_on_success):
         steps, why = 1, "termination was not stated (`terminate_on_success=None`), so the bonus is "\
                         "conservatively counted once"
     earned, paid = total * horizon, value * steps
-    # Emitted whether or not it exceeds: the decision was that this ratio is COMPUTED AND PRINTED
-    # with both numbers, so the reader sees the comparison rather than inferring it from silence.
+    # Computed whether or not it exceeds — the decision was that this ratio is COMPUTED AND PRINTED
+    # with both numbers, so the reader sees the comparison rather than inferring it from silence. It
+    # reaches the `warnings` module only when it exceeds or when it is a lower bound; a clean ratio is
+    # kept in `plan.warnings`, which is the channel `bridle plan` prints and the one nothing dedupes.
+    exceeds = earned >= paid
     head = ("WARNING (not a refusal): shaping out-earns completion over the episode — "
-            if earned >= paid else "note: ")
-    return [
-        f"{head}integrated over the episode, shaping pays {_num(earned)} "
+            if exceeds else "note: ")
+    return [(_ACT if (exceeds or partial) else _FYI,
+        f"{head}integrated over the episode, shaping pays {at_least}{_num(earned)} "
         f"({_num(total)}/step x {horizon} steps) against {_num(paid)} for completing it "
-        f"({_num(value)} x {steps} step(s) — {why}). Printed, never refused: the deployed "
+        f"({_num(value)} x {steps} step(s) — {why}).{caveat} Printed, never refused: the deployed "
         f"descend_to_target lineage integrates to ~27x its success value and is measured at 0.85 "
         f"success, so a gate on this number would refuse a working reward. The refusal is the "
-        f"per-step comparison, not this one."]
+        f"per-step comparison, not this one.")]
 
 
 # ── the plan ────────────────────────────────────────────────────────────────────────────────────
@@ -614,9 +711,14 @@ class RewardPlan:
     path and the fold this plan describes is the UNSCALED one. Any parity comparison against
     `compute_dense_reward` compares the unscaled fold.
 
-    `warnings` is a field, not just an stderr line, because a warning that cannot be read back cannot
-    be asserted on, printed by `bridle plan`, or attached to a run. `compile_spec` also emits each one
-    through the `warnings` module, so a caller who does nothing still sees them.
+    `warnings` is the AUTHORITATIVE channel and always carries every note, including the clean ones:
+    a warning that cannot be read back cannot be asserted on, printed by `bridle plan`, or attached to
+    a run. `compile_spec` re-emits through the stdlib `warnings` module only the notes a caller can
+    ACT on — because emitting on every successful compile meant `python -W error` could not compile
+    any document at all, and because that module's default filter is once per (message, location), so
+    a second identical compile in one process prints nothing. This field is the record that neither
+    limitation touches. (Field named `warnings` while the module is imported as `warn` — see the
+    import.)
     """
 
     ops: tuple
@@ -698,10 +800,13 @@ def compile_spec(spec: SkillSpec, *, horizon=None, terminate_on_success=None) ->
                                                    "at scale")
 
     notes = _check_flooding(ops, horizon=horizon, terminate_on_success=terminate_on_success)
-    for note in notes:
-        # Emitted as well as stored: the decision was that the integrated ratio is PRINTED, and a
-        # warning only reachable through an attribute is one nobody reads.
-        warnings.warn(note, stacklevel=2)
+    for level, note in notes:
+        # Stored unconditionally, emitted selectively. A clean integrated ratio is a fact about the
+        # document, not a request: raising it made every successful compile a `UserWarning` and made
+        # `-W error` refuse legal specs, so a careful caller's only option was to silence the channel
+        # — and then the notes that DO need action go with it.
+        if level == _ACT:
+            warn(note, stacklevel=2)
 
     measures = set()
     for op in ops:
@@ -709,7 +814,7 @@ def compile_spec(spec: SkillSpec, *, horizon=None, terminate_on_success=None) ->
     return RewardPlan(
         ops=ops, scale=scale, measures_needed=frozenset(measures),
         state_slots=tuple(op.params["slot"] for op in ops if op.stateful),
-        warnings=tuple(notes))
+        warnings=tuple(note for _, note in notes))
 
 
 # ── the stdlib evaluator ────────────────────────────────────────────────────────────────────────
@@ -723,8 +828,12 @@ _SUCCESS_KEY = {"per_step": "success", "latched": "success_latched"}
 
 def _read(values, key, what):
     if key not in values:
-        raise CompileError("evaluate_plan", f"no value supplied for {what} {key!r} — the plan needs "
-                                            f"{sorted(values)} plus this one",
+        # The list is what WAS supplied, and says so. It used to be introduced as "the plan needs
+        # ... plus this one", which named the caller's own dict as the requirement — backwards, in a
+        # module whose premise is that the error message is the API.
+        raise CompileError("evaluate_plan",
+                           f"no value supplied for {what} {key!r}; the plan needs it in `values`, "
+                           f"and what WAS supplied is {sorted(values)}",
                            suggestion=_suggest(key, values))
     return values[key]
 
@@ -825,6 +934,12 @@ _CONDITION_LEVEL = {
     "SuccessBonus": lambda p, values: (_success(p, values), p["value"]),
     "PredicateBonus": lambda p, values: (_read(values, p["predicate"], "predicate"), p["weight"]),
 }
+assert set(_CONDITION_LEVEL) == {t for t in ROW_TERMS
+                                 if any(p.name == "mode" for p in TERMS[t].params)}, (
+    "a term that declares `mode` can be lowered to a replace/floor Op, and the fold looks its "
+    "(condition, level) split up here — a term gaining a `mode` in the vocabulary with no entry "
+    "would KeyError mid-fold, inside the adapter on a GPU, instead of at import on a laptop. Same "
+    "guard as `_VALUE` and `_PER_STEP_MAXIMUM` carry")
 
 
 def evaluate_plan(plan: RewardPlan, values: dict):
@@ -845,8 +960,12 @@ def evaluate_plan(plan: RewardPlan, values: dict):
             acc = acc + _VALUE[op.fn_key](op.params, values)
             continue
         condition, level = _CONDITION_LEVEL[op.fn_key](op.params, values)
+        # What the row's mode operates OVER comes from `_SCOPE_REACH`, the same table `_HONOURED`
+        # builds its legal scope set from — so a scope this fold cannot implement is refused at
+        # compile time instead of arriving here and being folded as `preceding` anyway.
+        reached = _SCOPE_REACH[op.scope](acc)
         if op.kind == "replace":
-            acc = _where(condition, level, acc)
+            acc = _where(condition, level, reached)
         else:
-            acc = _where(condition, _max(acc, level), acc)
+            acc = _where(condition, _max(reached, level), acc)
     return acc

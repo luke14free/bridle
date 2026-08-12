@@ -22,6 +22,25 @@ WHY THIS EXISTS, property by property, with the measurement each one was paid fo
                  with no `systemctl`. The same rule is why `horizon=None` says NOT COMPUTED rather
                  than substituting a default.
 
+  TWO TIERS      a bad parameter value is refused either by the SCHEMA (`spec.py` reading a
+                 `Param.choices` from `vocab.py`, raising `SpecError`) or by the COMPILER
+                 (`_HONOURED`/`_UNIMPLEMENTED`, raising `CompileError`), and which one is not
+                 cosmetic — it is the difference between "no document may say this" and "this fold
+                 does not implement it yet". Every refusal below is asserted AT the tier that raises
+                 it, with that tier's exception type. When `choices` arrived for kernel, mode,
+                 predicate_ref, side and norm (2026-08-12) three checks here went red; the fix was to
+                 move those assertions to the schema tier and delete the compile-tier entries that
+                 had become unreachable, NOT to widen the accepted exception type — a check that
+                 accepts either can no longer tell you which tier refuses anything, and a compile-tier
+                 branch that can never fire advertises a check that never runs.
+
+  BATCH-SAFE     the fold must evaluate over 4096 environments at once, so `_where`/`_max`/`_relu`/
+                 `_clamp` are written branch-free and `tanh`/`exp` dispatch to the value's own method.
+                 A suite of scalar floats cannot see any of that: a Python `if c: a else: b` returns
+                 the right answer for every scalar and takes ONE branch for a whole batch. `Vec`
+                 below is a 3-element duck-typed stand-in for the tensor Task 5's adapter folds, and
+                 it raises on `bool()` so a branch on a batched value is a failure, not a coin flip.
+
   FINGERPRINT    sha256 over canonical JSON, never `hash()`. `hash()` is salted per process, so a
                  checkpoint stamped with it is unverifiable on the next run — which is exactly what
                  the stamp exists to prevent. An in-process comparison cannot tell the two apart, so
@@ -37,6 +56,7 @@ document, every weight is a trained number, and two copies would drift.
 """
 import json
 import math
+import operator
 import os
 import re
 import subprocess
@@ -47,7 +67,12 @@ from pathlib import Path
 from bridle.skill.compile import (
     CompileError, FloodingError, Op, RewardPlan, compile_spec, evaluate_plan,
 )
-from bridle.skill.spec import parse_spec
+from bridle.skill.compile import (
+    _bind_number, _CONTACT_SURFACE_MEASURES, _HONOURED, _SCOPE_REACH,
+    _ZERO_IS_NOT_A_CONTACT_SURFACE,
+)
+from bridle.skill.spec import SpecError, parse_spec
+from bridle.skill.vocab import MEASURES, TERMS, Sign, vocab_document
 from bridle.tests.test_skillspec import descend_doc, doc_with, row_edited
 
 FAILS = []
@@ -71,6 +96,51 @@ def check(name, cond):
 
 def close(a, b, tol=1e-12):
     return isinstance(a, (int, float)) and abs(a - b) < tol
+
+
+class Vec:
+    """A 3-element batch, duck-typed: every operator the fold uses, applied element-wise.
+
+    Stands in for the torch tensor Task 5's adapter folds over up to 4096 environments at once, on
+    stdlib only. It exists because vectorisation is this phase's binding constraint and a suite of
+    scalar floats cannot test it — `_where`'s branch-free `c*a + (1-c)*b` and a plain `if c: a else:
+    b` agree on every scalar and disagree on every batch, where the `if` takes ONE branch for all
+    4096 environments. `__bool__` therefore RAISES: a fold that branches on a batched value fails
+    here instead of quietly returning one environment's answer for all of them.
+    """
+
+    def __init__(self, xs):
+        self.xs = tuple(float(x) for x in xs)
+
+    def _zip(self, other, f, flip=False):
+        o = other.xs if isinstance(other, Vec) else (float(other),) * len(self.xs)
+        return Vec(f(b, a) if flip else f(a, b) for a, b in zip(self.xs, o))
+
+    def __add__(self, o): return self._zip(o, operator.add)
+    def __radd__(self, o): return self._zip(o, operator.add, flip=True)
+    def __sub__(self, o): return self._zip(o, operator.sub)
+    def __rsub__(self, o): return self._zip(o, operator.sub, flip=True)
+    def __mul__(self, o): return self._zip(o, operator.mul)
+    def __rmul__(self, o): return self._zip(o, operator.mul, flip=True)
+    def __truediv__(self, o): return self._zip(o, operator.truediv)
+    def __gt__(self, o): return self._zip(o, lambda a, b: float(a > b))
+    def __lt__(self, o): return self._zip(o, lambda a, b: float(a < b))
+    def __abs__(self): return Vec(abs(x) for x in self.xs)
+    def __neg__(self): return Vec(-x for x in self.xs)
+    def tanh(self): return Vec(math.tanh(x) for x in self.xs)
+    def exp(self): return Vec(math.exp(x) for x in self.xs)
+    def __repr__(self): return f"Vec{self.xs}"
+
+    def __bool__(self):
+        raise AssertionError("the fold called bool() on a batch — a Python `if` on a batched "
+                             "condition takes one branch for all 4096 environments, which is a "
+                             "different reward, not a slower one")
+
+
+def close_all(got, expected, tol=1e-12):
+    """Element-wise `close` over a Vec against a list of scalars."""
+    return (isinstance(got, Vec) and len(got.xs) == len(expected)
+            and all(close(a, b, tol) for a, b in zip(got.xs, expected)))
 
 
 # ── fixtures ────────────────────────────────────────────────────────────────────────────────────
@@ -155,6 +225,26 @@ def potential_doc():
     }
 
 
+def ungated_doc():
+    """reach's shape on the `approach` chassis — the one place `_gate`'s absent-gate path is
+    reachable. Every carry-family chassis hands a DistancePull `gate: grasped` when the row omits
+    one, so deleting a `gate:` key from the descend fixture does not produce an ungated row;
+    `approach`'s DistancePull default carries no gate because at reach time there is nothing held to
+    gate on."""
+    return {
+        "name": "reach", "kind": "approach", "contract": "stack", "env_id": "SO100Reach-v1",
+        "scene": {"held": {"type": "cube", "half": 0.014}},
+        "reward": [
+            {"term": "DistancePull", "weight": 1.5, "measure": "tcp_to_object",
+             "kernel": "one_minus_tanh", "k": 4.0,
+             "why": "reach's entire dense signal, ungated: nothing is held yet."},
+            {"term": "SuccessBonus", "value": 9.0, "mode": "add", "why": "terminal +9.0."},
+            {"term": "ActionPenalty", "weight": 0.001, "why": "same 0.001/l2."},
+        ],
+        "success": "above_z(z=0.06)",
+    }
+
+
 def ramp_doc(weight, cap, normalize):
     """compact_grasp vs lift, the 25x bug as a document: lift's Ramp is normalized (max = weight),
     compact_grasp's is not (max = weight*(cap-floor) = 10.0*0.04 = 0.4)."""
@@ -186,8 +276,25 @@ def error_from(fn, *a, **kw):
 
 
 def refuses(label, doc, *fragments, kind=CompileError, **kw):
+    """A COMPILE-TIER refusal: the value is legal in the vocabulary and this fold does not implement
+    it. `kind` stays pinned to a single exception type on purpose — widening it to "SpecError or
+    CompileError" is how a suite stops being able to say which tier refuses a value, which is the
+    whole content of these checks now that the boundary has moved once."""
     exc = error_from(plan_of, doc, **kw)
     check(f"{label}: refused with {kind.__name__}", isinstance(exc, kind))
+    msg = str(exc) if exc is not None else "<nothing raised>"
+    for frag in fragments:
+        check(f"{label}: message says {frag!r}", frag in msg)
+    return exc
+
+
+def refuses_at_schema(label, doc, *fragments):
+    """A SCHEMA-TIER refusal: the value is outside a `Param.choices`, so `parse_spec` refuses it and
+    the compiler never sees it. Asserted here, in the COMPILER's suite, because "which tier owns
+    this" is a fact about the compiler too — and because the compile-tier entries that used to catch
+    these were deleted, and a deleted check with nothing behind it is worse than no check."""
+    exc = error_from(parse_spec, doc)
+    check(f"{label}: refused with SpecError, before the compiler runs", isinstance(exc, SpecError))
     msg = str(exc) if exc is not None else "<nothing raised>"
     for frag in fragments:
         check(f"{label}: message says {frag!r}", frag in msg)
@@ -199,11 +306,17 @@ def compiles(label, doc, **kw):
 
     The mirror of `refuses`, and the same reason test_skillspec has `accepts`: a plausible regression
     here REFUSES a legal document, and an uncaught CompileError at that point would abort the run and
-    hide every check after it — which is exactly what a mutation test must not do.
+    hide every check after it — which is exactly what a mutation test must not do. Compiles ONCE:
+    doing it twice to report and then return doubles every warning and every side effect the compiler
+    has, in a helper whose job is to observe one.
     """
-    exc = error_from(plan_of, doc, **kw)
-    check(f"{label}: compiles", exc is None)
-    return plan_of(doc, **kw) if exc is None else None
+    try:
+        plan = plan_of(doc, **kw)
+    except BaseException as exc:      # noqa: BLE001 — see `error_from`
+        check(f"{label}: compiles (raised {type(exc).__name__}: {exc})", False)
+        return None
+    check(f"{label}: compiles", True)
+    return plan
 
 
 def folded(plan, vals):
@@ -217,6 +330,10 @@ def folded(plan, vals):
 
 def slots(plan):
     return getattr(plan, "state_slots", ())
+
+
+def param_of(term, name):
+    return [p for p in TERMS[term].params if p.name == name][0]
 
 
 def warning_text(plan):
@@ -302,6 +419,17 @@ def run_checks():
           close(folded(plan_of(high_doc, horizon=HORIZON), values()),
                 9.0 - 0.001 * ACTION_NORM))
 
+    # `_gate` returns 1.0 for an ABSENT gate. Every other fixture writes a gate, so nothing exercised
+    # the default and `return 0.0 if gate is None` used to pass the whole suite. Deleting descend's
+    # `gate:` is NOT enough — the carry chassis supplies `gate: grasped` to any DistancePull that
+    # omits one — so this needs the `approach` chassis, whose DistancePull default has no gate.
+    ungated = compiles("reach's ungated DistancePull", ungated_doc(), horizon=HORIZON)
+    check("...and the row really did compile with no gate at all, chassis included",
+          ungated is not None and ungated.ops[0].params["gate"] is None)
+    check("an absent gate multiplies the row by 1.0, not by 0.0",
+          close(folded(ungated, values(tcp_to_object=0.03)),
+                1.5 * (1.0 - math.tanh(4.0 * 0.03)) - 0.001 * ACTION_NORM))
+
     # ── reward_scale is carried, NOT folded in (phase2-decisions §4) ────────────────────────────
     check("reward_scale is carried as `scale`, not divided into the fold", close(plan.scale, 12.0))
     check("the fold itself is UNSCALED — parity is against compute_dense_reward, not the "
@@ -317,13 +445,35 @@ def run_checks():
     check("descend needs no state slots", plan.state_slots == ())
     pplan = compiles("the stateful move_to_target spec", potential_doc(), horizon=HORIZON)
     check("a stateful row asks for exactly one slot", len(slots(pplan)) == 1)
+    slot = slots(pplan)[0] if slots(pplan) else "<no slot>"
+    # `"reward[2]"`, not `"2"`: the property is that the slot names the ROW (two potentials over one
+    # measure must not share a buffer, or each reads the other's previous value), and `"2"` also
+    # passes for a slot that merely happens to contain the digit.
     check("the slot names the row and the measure it buffers",
-          bool(slots(pplan)) and "object_to_goal_xy" in slots(pplan)[0]
-          and "2" in slots(pplan)[0])
+          "object_to_goal_xy" in slot and "reward[2]" in slot)
+
+    def pvals(**over):
+        """One step of move_to_target, with the potential's buffer holding last step's 5cm."""
+        return dict(values(**over), **{slot: 0.05})
+
+    pbase = (0.3 + 1.5 * (1.0 - math.tanh(3.0 * 0.02)) + 5.0 * (0.05 - 0.02)
+             - 0.001 * ACTION_NORM)
     check("ProgressPotential folds as weight*(prev - measure)*gate",
-          close(folded(pplan, dict(values(), **{slots(pplan)[0]: 0.05} if slots(pplan) else {})),
-                0.3 + 1.5 * (1.0 - math.tanh(3.0 * 0.02)) + 5.0 * (0.05 - 0.02)
-                - 0.001 * ACTION_NORM))
+          close(folded(pplan, pvals()), pbase))
+
+    # `predicate_ref: latched` reads `success_latched`; `per_step` reads `success`. BOTH DIRECTIONS,
+    # because the fixture sets both keys to 0.0 and never overrode the latch — so mutating
+    # `_SUCCESS_KEY["latched"]` to `"success"` used to pass every check in this file. The distinction
+    # is the reason the parameter exists: a latched bonus wired to the per-step signal stops paying
+    # the moment success flickers off, and move_to_target's +50 is paid on a latch for exactly that.
+    check("a latched SuccessBonus pays off `success_latched`",
+          close(folded(pplan, pvals(success_latched=1.0)), pbase + 50.0))
+    check("...and a latched bonus does NOT pay off the per-step `success`",
+          close(folded(pplan, pvals(success=1.0)), pbase))
+    check("the converse: descend's per_step bonus pays on `success`...",
+          close(folded(plan, values(success=1.0)), 12.0 - 0.001 * ACTION_NORM))
+    check("...and does NOT pay on a latch it never asked for",
+          close(folded(plan, values(success_latched=1.0)), off))
 
     # ── FLOODING: refused per-step ──────────────────────────────────────────────────────────────
     check("the deployed descend spec passes the flooding check",
@@ -345,6 +495,22 @@ def run_checks():
                      FloodingError))     # 1.0 + 8.5 + 2.5 == 12.0
     check("one notch under the success value is accepted",
           error_from(plan_of, row_edited(1, weight=8.4), horizon=HORIZON) is None)
+
+    # THE KNOWN GAP, stated in the output and not only in a code comment. `replace`/`floor` rows do
+    # not accumulate, so they are outside the per-step sum by construction and no weight on one can
+    # trip the refusal — a reader of a clean compile has no way to know which rows were left out.
+    gap_rows = descend_doc()["reward"]
+    gap_rows.insert(7, {"term": "PredicateBonus", "weight": 100.0, "predicate": "grasped",
+                        "mode": "floor", "scope": "preceding",
+                        "why": "an easy predicate floored far above the success value."})
+    gap = plan_of(doc_with(reward=gap_rows), horizon=HORIZON)
+    check("a floor row at weight 100 out-earns the 12.0 success value and still compiles",
+          close(folded(gap, values()), 100.0 - 0.001 * ACTION_NORM)
+          and close(folded(gap, values(success=1.0)), 12.0 - 0.001 * ACTION_NORM))
+    check("...so the notes say so, naming the row and the mode the sum could not cover",
+          all(f in warning_text(gap) for f in ("KNOWN GAP", "reward[7]", "mode=floor", "99.998")))
+    check("...and a document with no such row makes no such claim",
+          "KNOWN GAP" not in warning_text(plan))
 
     # ── the per-step maximum table: Ramp.normalize is 25x, not cosmetic ─────────────────────────
     check("a normalized Ramp's maximum IS its weight (10.0 + 1.0 >= the 9.0 success value)",
@@ -368,6 +534,32 @@ def run_checks():
     check("the warning is emitted through the warnings module, not only stored",
           any("320.0" in str(w.message) for w in caught))
 
+    # WHICH notes reach the `warnings` module: only the ones a caller can act on. Emitting on EVERY
+    # successful compile made `python -W error` unable to compile any document at all, so a careful
+    # caller's only defence was to silence the channel — taking the actionable notes with it.
+    with warnings.catch_warnings(record=True) as quiet:
+        warnings.simplefilter("always")
+        clean = compile_spec(parse_spec(descend_doc()), horizon=HORIZON,
+                             terminate_on_success=False)
+    check("a compile with nothing to act on emits no warning at all", len(quiet) == 0)
+    check("...but the ratio is still RECORDED, both numbers, on the plan",
+          "320.0" in warning_text(clean) and "against 768.0" in warning_text(clean))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        werror = error_from(compile_spec, parse_spec(descend_doc()), horizon=HORIZON,
+                            terminate_on_success=False)
+    check("...so a caller under `-W error` can compile a legal document", werror is None)
+    with warnings.catch_warnings(record=True) as loud:
+        warnings.simplefilter("always")
+        compile_spec(parse_spec(potential_doc()), horizon=HORIZON)
+    check("a note there IS something to do about still reaches the warnings module",
+          any("INCOMPLETE" in str(w.message) for w in loud))
+    # `plan.warnings` is the channel nothing dedupes: the stdlib filter is once per (message,
+    # location), so a second identical compile in one process prints nothing.
+    check("a repeated identical compile still carries the ratio on its plan",
+          all("320.0" in warning_text(plan_of(descend_doc(), horizon=HORIZON,
+                                              terminate_on_success=False)) for _ in range(2)))
+
     none_text = warning_text(plan_of(descend_doc()))
     check("with no horizon the integrated check says it could NOT be computed",
           "could NOT be computed" in none_text)
@@ -382,7 +574,9 @@ def run_checks():
     stay_text = warning_text(plan_of(descend_doc(), horizon=HORIZON, terminate_on_success=False))
     check("terminate_on_success=True pays the bonus once: 320.0 against 12.0",
           "320.0" in term_text and "against 12.0" in term_text and "WARNING" in term_text)
-    check("terminate_on_success changes the horizon used — a repeating bonus integrates too",
+    # The label used to read "terminate_on_success changes the horizon used", which nothing here
+    # does: the horizon is 64 either way. What changes is how many steps the BONUS is paid over.
+    check("terminate_on_success=False pays the bonus every remaining step: 12.0 x 64 = 768.0",
           "against 768.0" in stay_text and "320.0" in stay_text)
     check("...and with the bonus repeating there is nothing left to warn about",
           "WARNING" not in stay_text)
@@ -393,6 +587,14 @@ def run_checks():
     check("...and the check says it could not conclude, rather than passing",
           "not a pass" in ptext or "could not conclude" in ptext)
     check("...and still quotes the bounded part it CAN state", "1.8" in ptext)
+    # The two notes have to agree with each other: `_check_flooding` says INCOMPLETE and "not a
+    # pass", then the integrated line computes its figure from the bounded subset alone. Without the
+    # qualifier the second line reads like a verdict and is the one a reader believes.
+    ptail = ptext.split("integrated over the episode")[-1]
+    check("...and the integrated line carries the qualifier the INCOMPLETE line earned",
+          "at least" in ptail and "LOWER bound" in ptail)
+    check("...while a fully bounded document's integrated line claims no such caveat",
+          "at least" not in text.split("integrated over the episode")[-1])
 
     # A tier-2 row may name a DECLARED PARAM (`hover`) instead of a literal — spec.py says the param
     # shadows a measure of the same name. Its number has to travel with the expression, or the
@@ -468,19 +670,72 @@ def run_checks():
     check("...but DOES change the fingerprint (order is semantic under an ordered fold)",
           reordered.fingerprint() != fp)
 
-    # ── refusals for a value the fold cannot honour ─────────────────────────────────────────────
-    # Silently ignoring an authored parameter is the "trains, logs, contributes nothing" failure
-    # this whole phase exists to stop, so every one of these is a refusal, not a default.
-    refuses("an unknown kernel", row_edited(1, kernel="one_minus_tan"),
-            "one_minus_tan", "one_minus_tanh", "reward[1]", horizon=HORIZON)
+    # ── refusals, each asserted AT THE TIER THAT OWNS IT ────────────────────────────────────────
+    # Silently ignoring an authored parameter is the "trains, logs, contributes nothing" failure this
+    # whole phase exists to stop, so every one of these is a refusal, not a default. WHICH tier
+    # refuses is the part that moved: `kernel`, `mode` and `predicate_ref` gained `Param.choices` on
+    # 2026-08-12 and are now schema-tier, which made three compile-tier checks here fail. They are
+    # re-asserted as SpecError rather than accepted as "SpecError or CompileError", and the dead
+    # `_HONOURED` entries behind them were deleted — a refusal branch that can never fire is a check
+    # the module advertises and does not perform.
+    #
+    # SCHEMA TIER — "no document may say this": the vocabulary enumerates the legal set.
+    refuses_at_schema("an unknown kernel", row_edited(1, kernel="one_minus_tan"),
+                      "one_minus_tan", "one_minus_tanh", "reward[1]")
+    refuses_at_schema("a mode outside the vocabulary's three", row_edited(7, mode="multiply"),
+                      "multiply", "replace")
+    refuses_at_schema("a predicate_ref that is neither per_step nor latched",
+                      row_edited(7, predicate_ref="whenever"), "predicate_ref", "latched")
+    refuses_at_schema("a side outside above/below", row_edited(3, side="beside"),
+                      "beside", "below")
+    check("...and the compiler no longer keeps a dead branch for any of them",
+          not any(key in _HONOURED for key in
+                  (("DistancePull", "kernel"), ("SuccessBonus", "mode"), ("HingePenalty", "side"),
+                   ("SuccessBonus", "predicate_ref"), ("PredicateBonus", "mode"),
+                   ("ActionPenalty", "norm"))))
+
+    # COMPILE TIER — "legal in the vocabulary, not implemented by this fold". `scope` and `axes`
+    # carry no `choices`, so nothing upstream can catch them and these are the compiler's own.
     refuses("a scope the fold does not implement", row_edited(7, scope="all"),
             "scope", "preceding", horizon=HORIZON)
-    refuses("a mode the fold does not implement", row_edited(7, mode="multiply"),
-            "multiply", "replace", horizon=HORIZON)
     refuses("an `axes` restriction nothing implements", row_edited(1, axes="xy"),
             "axes", "object_to_goal_xy", horizon=HORIZON)
-    refuses("a predicate_ref that is neither per_step nor latched",
-            row_edited(7, predicate_ref="whenever"), "predicate_ref", "latched", horizon=HORIZON)
+    check("...and those two really are open in the vocabulary, which is why the compiler owns them",
+          not param_of("SuccessBonus", "scope").choices
+          and not param_of("DistancePull", "axes").choices)
+
+    # The legal scope set is not a literal: it is `tuple(_SCOPE_REACH)`, the same table the fold
+    # dispatches through. Teaching the table a second scope must therefore CHANGE THE FOLD — the
+    # thing that cannot happen is a new legal scope quietly continuing to mean `preceding`. The
+    # accumulator here is 9.0 and the floor's level is 4.0, so `preceding` (reach = 9.0, floor is a
+    # no-op) and `nothing` (reach = 0.0, floor lands) give different numbers.
+    scoped_rows = [
+        {"term": "PredicateBonus", "weight": 9.0, "predicate": "grasped",
+         "why": "an accumulator already above the floor's level."},
+        {"term": "PredicateBonus", "weight": 4.0, "predicate": "grasped", "mode": "floor",
+         "scope": "nothing", "why": "a floor whose scope reaches nothing, not the preceding rows."},
+        descend_doc()["reward"][8]]
+    check("the legal scope set IS the fold's dispatch table, not a literal beside it",
+          _HONOURED[("SuccessBonus", "scope")] == tuple(_SCOPE_REACH)
+          and _HONOURED[("PredicateBonus", "scope")] == tuple(_SCOPE_REACH))
+    _SCOPE_REACH["nothing"] = lambda acc: 0.0 * acc
+    # `_HONOURED` snapshots the keys at import, so the legal set is patched alongside — the property
+    # under test is that the FOLD dispatches through this table, which is what makes a scope added to
+    # it mean something other than `preceding`.
+    patched = dict(_HONOURED)
+    _HONOURED[("PredicateBonus", "scope")] = tuple(_SCOPE_REACH)
+    try:
+        scoped = folded(plan_of(doc_with(reward=scoped_rows), horizon=HORIZON), values())
+        check("a scope in `_SCOPE_REACH` compiles and the fold uses ITS reach, not `preceding`",
+              close(scoped, 4.0 - 0.001 * ACTION_NORM))
+        check("...and that is a DIFFERENT number from what `preceding` would have folded",
+              not close(scoped, 9.0 - 0.001 * ACTION_NORM))
+    finally:
+        del _SCOPE_REACH["nothing"]
+        _HONOURED.update(patched)
+    check("...and with the table restored the same scope is refused again",
+          isinstance(error_from(plan_of, row_edited(7, scope="nothing"), horizon=HORIZON),
+                     CompileError))
 
     # ── params.X is BOUND at compile time ───────────────────────────────────────────────────────
     check("a params.X reference is bound to its number, not left as a string",
@@ -497,6 +752,58 @@ def run_checks():
     zero["hover"]["value"] = 0.0
     refuses("...including when it arrives through params.X", doc_with(params=zero),
             "16/16", horizon=HORIZON)
+    refuses("...and over height_above_resting, which the hardcoded set only happened to include",
+            row_edited(2, measure="height_above_resting", setpoint=0.0), "16/16", horizon=HORIZON)
+
+    # THE SET IS DERIVED FROM THE VOCABULARY, and the vocabulary's prose has to describe the same
+    # rule: `vocab_document()` is where this refusal is ADVERTISED to the authoring model. Code,
+    # comment and document used to state three different rules — the code checked 3 of the 5 SIGNED
+    # measures, the comment justified the gap by citing `object_to_goal_z` (MAGNITUDE, never a
+    # candidate), and the document promised the rule over every SIGNED measure.
+    signed = {n for n, m in MEASURES.items() if m.sign is Sign.SIGNED}
+    check("every SIGNED measure is either checked or excluded with a stated reason",
+          signed == set(_CONTACT_SURFACE_MEASURES) | set(_ZERO_IS_NOT_A_CONTACT_SURFACE)
+          and all(_ZERO_IS_NOT_A_CONTACT_SURFACE.values()))
+    check("no MAGNITUDE measure is in the set — move_to_3d peaks at object_to_goal_z == 0 on purpose",
+          not any(MEASURES[n].sign is Sign.MAGNITUDE for n in _CONTACT_SURFACE_MEASURES)
+          and error_from(plan_of, row_edited(1, setpoint=0.0), horizon=HORIZON) is None)
+    check("a peaked pull at gripper_qpos == 0 is 'open the jaw', not a contact failure",
+          error_from(plan_of, row_edited(2, measure="gripper_qpos", setpoint=0.0),
+                     horizon=HORIZON) is None)
+    bullet = [ln for ln in vocab_document().splitlines() if "attractor_setpoint_not_at" in ln][0]
+    check("the document advertises the rule over exactly the measures the compiler applies it to",
+          {n for n in signed if n in bullet} == set(_ZERO_IS_NOT_A_CONTACT_SURFACE))
+
+    # ── the fold over a BATCH, not a scalar ─────────────────────────────────────────────────────
+    # Vectorisation is this phase's binding constraint: one fold runs over up to 4096 environments at
+    # once, which is why `_where`/`_max`/`_relu`/`_clamp` are branch-free and `tanh`/`exp` dispatch to
+    # the value's own method. Scalar floats cannot test any of that — `c*a + (1-c)*b` and
+    # `a if c else b` agree on every scalar and disagree on every batch. Three environments, one
+    # fold, per-environment success and per-environment geometry.
+    def batched(p, over):
+        """(the fold over a 3-element batch, the three scalar folds it has to equal)."""
+        batch = {k: Vec([v] * 3) for k, v in values().items()}
+        batch.update({k: Vec(col) for k, col in over.items()})
+        scalar = [values(**{k: col[i] for k, col in over.items()}) for i in range(3)]
+        return folded(p, batch), [folded(p, s) for s in scalar]
+
+    for label, bplan, over in (
+            ("the descend fold (_where on a per-env success, _tanh, _relu on the crush hinge)",
+             plan, {"success": [0.0, 1.0, 0.0],
+                    "height_above_seat_live": [0.012, 0.012, -0.004]}),
+            ("a gaussian kernel (_exp dispatching to the value's own method)",
+             plan_of(row_edited(1, kernel="gaussian"), horizon=HORIZON),
+             {"object_to_goal_xy": [0.02, 0.06, 0.20]}),
+            ("a `floor` row (_max)", fplan,
+             {"grasped": [1.0, 0.0, 1.0], "not_grasped": [0.0, 1.0, 0.0]}),
+            ("a normalized `Ramp` (_clamp = _min + _max, and a divide)",
+             plan_of(ramp_doc(1.0, 0.04, True), horizon=HORIZON),
+             {"object_z": [-0.01, 0.02, 0.09]}),
+    ):
+        got, want = batched(bplan, over)
+        check(f"{label} folds element-wise over a 3-element batch", close_all(got, want))
+    check("...and a Python `if` on a batch is a failure here, not a silent one-branch",
+          isinstance(error_from(bool, Vec([0.0, 1.0, 0.0])), AssertionError))
 
     # ── the evaluator's own contract ────────────────────────────────────────────────────────────
     missing = values()
@@ -504,9 +811,19 @@ def run_checks():
     exc = error_from(evaluate_plan, plan, missing)
     check("a missing value is a CompileError naming it, never a bare KeyError",
           isinstance(exc, CompileError) and "gripper_qpos" in str(exc))
+    check("...and the message labels the list as what WAS supplied, not as what the plan needs",
+          "what WAS supplied" in str(exc))
     exc = error_from(evaluate_plan, plan_of(cdoc, horizon=HORIZON), values())
     check("the stdlib evaluator refuses a custom row instead of guessing it",
           isinstance(exc, CompileError) and "custom" in str(exc))
+
+    # `_bind_number(None)` is unreachable through any document today — `RewardScale.divisor` defaults
+    # to 12.0, so even an empty block binds a number — but the module's only promise to a caller is
+    # that they catch `CompileError`, and `float(None)` is a bare `TypeError` that walks past it.
+    check("`reward_scale: {}` still binds the inherited divisor rather than a None",
+          close(plan_of(doc_with(reward_scale={}), horizon=HORIZON).scale, 12.0))
+    check("a numeric field handed None is a CompileError, not a raw TypeError",
+          isinstance(error_from(_bind_number, "reward_scale.divisor", None, {}), CompileError))
 
 
 def test_bridle():
