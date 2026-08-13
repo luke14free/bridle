@@ -742,8 +742,13 @@ def run_checks():
     check("json_schema declares draft 2020-12",
           js.get("$schema") == "https://json-schema.org/draft/2020-12/schema")
     check("json_schema requires the load-bearing fields",
-          {"name", "kind", "contract", "env_id", "scene", "reward", "success"}
-          <= set(js["required"]))
+          {"name", "kind", "contract", "env_id", "reward", "success"} <= set(js["required"]))
+    # `scene:` IS NOT ONE OF THEM (2026-08-13). It describes an env it does not create and nothing
+    # hashes it, so requiring it forced every document to carry a second, unenforced description of
+    # something that already exists in code; a document may now own the reward and leave the
+    # environment to Python. It is still a legal, shape-checked field.
+    check("json_schema does not require `scene:`, and still knows about it",
+          "scene" not in js["required"] and "scene" in js["properties"])
     check("json_schema refuses unknown top-level fields", js.get("additionalProperties") is False)
     check("json_schema's kind enum is the chassis list",
           js["properties"]["kind"]["enum"] == sorted(CHASSIS))

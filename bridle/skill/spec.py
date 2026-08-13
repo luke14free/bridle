@@ -623,8 +623,14 @@ def _freeze(value):
     return value
 
 
-_REQUIRED_FIELDS = ("name", "kind", "contract", "env_id", "scene", "reward", "success")
-_OPTIONAL_FIELDS = ("init", "params", "reward_scale", "preflight")
+#: `scene:` IS NOT REQUIRED (2026-08-13). It used to be, and requiring it was incoherent: the block
+#: DESCRIBES an environment it does not create — nothing synthesises a body from it and nothing
+#: hashes it — so a document was forced to carry a second, unenforced description of an env that
+#: already exists in code. Making it optional is what lets a document own the reward and the success
+#: criterion and leave the environment entirely to Python (`bridle.skill.author.Skill(env=<class>)`),
+#: which is one owner per thing. Present, it still parses and is still shape-checked.
+_REQUIRED_FIELDS = ("name", "kind", "contract", "env_id", "reward", "success")
+_OPTIONAL_FIELDS = ("scene", "init", "params", "reward_scale", "preflight")
 _FIELDS = _REQUIRED_FIELDS + _OPTIONAL_FIELDS
 
 _SEVERITIES = (RUN, ADAPT, RETRAIN)
@@ -668,6 +674,25 @@ def _parse_params(raw):
 
 
 def _parse_scene(raw):
+    """`scene:` — A DESCRIPTION, NOT A DEFINITION, and the distinction is the whole point of it.
+
+    WHAT IT IS: an optional, human-and-model-readable note of what the env contains — roles mapped
+    to objects, each with a `type`. It is parsed, shape-checked, and then it stops. Nothing
+    synthesises a body from it, nothing binds `scene.held` to `env.cube`, and
+    `RewardPlan.fingerprint` deliberately excludes it along with `env_id` and `contract`, because
+    the digest answers "is this the same reward function?" and a prop list is not part of that
+    answer. That exclusion is also why a wrong entry here is caught by no test at all: it is
+    documentation with a schema, and it should be read as documentation.
+
+    WHAT IT IS NOT: the environment. The environment is either an env already registered under
+    `env_id:`, or — with `bridle.skill.author` — a class handed to `Skill(env=...)` and defined in
+    the same file as the reward. Omit this block entirely when the code is the description; write it
+    when a reader (or an authoring model) needs to know what the scene holds without opening the env.
+
+    THE QUANTIFIER PREDICATES ARE THE MEASURE OF THAT LIMIT: `forall`/`for_n` quantify over a
+    COLLECTION, this block is the only place a collection is named, and because nothing enumerates
+    it both predicates are refused at compile time (`vocab.UNIMPLEMENTED_PREDICATE_REASON`).
+    """
     if not isinstance(raw, dict) or not raw:
         raise SpecError("scene", f"`scene:` is a non-empty mapping of role -> object, got "
                                  f"{type(raw).__name__}")
@@ -823,7 +848,7 @@ def parse_spec(doc: dict) -> SkillSpec:
     chassis = CHASSIS[kind]
 
     params = _parse_params(doc["params"]) if "params" in doc else {}
-    scene = _parse_scene(doc["scene"])
+    scene = _parse_scene(doc["scene"]) if "scene" in doc else {}
 
     init = doc.get("init", {})
     if not isinstance(init, dict):
