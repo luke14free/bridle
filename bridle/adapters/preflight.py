@@ -10,6 +10,7 @@ import os
 
 from bridle.preflight import DYNAMIC, NOT_MEASURED, STATIC
 from bridle.preflight import evaluate as _evaluate
+from bridle.preflight import parse_init_stat
 
 
 def _resolve(path: str):
@@ -196,9 +197,72 @@ def dynamic_metrics(env_id: str, module: str, ckpt=None, envs: int = 64, steps: 
     return out
 
 
+def init_metrics(env_id: str, module: str, paths, envs: int = 64, resets: int = 4,
+                 seed: int = 0) -> dict:
+    """WHERE THE EPISODE STARTS, summarised. `{path: value}` for every `init_*` path requested.
+
+    NO POLICY, NO STEP, NO CHECKPOINT — the measurement is taken on the `info` dict `reset()`
+    returns, before a single action, which is exactly what makes an initiation-distribution assert
+    STRUCTURAL rather than a competence bar (`bridle.preflight`, "the INITIATION DISTRIBUTION
+    tier"). Nothing here can be improved by training and nothing here can be flattered by a
+    warm-started checkpoint.
+
+    `resets` batches of `envs` are drawn rather than one, because an initiation set is a
+    DISTRIBUTION and a single reset of 64 envs is 64 samples of it; 4 x 64 costs a few hundred
+    milliseconds once the env exists and tightens every fraction reported. Seeds are `seed + i` so
+    the batches are different draws and the whole measurement is reproducible.
+
+    Only the keys the requested paths NAME are summarised — `parse_init_stat` says which — so a
+    document asserting one thing does not pay to describe every float in the info dict, and a path
+    naming a key the env does not publish is simply absent from the result, which `evaluate` then
+    reports as a failure rather than as a pass (missing is never a pass).
+    """
+    wanted = [(p, parse_init_stat(p)) for p in paths]
+    wanted = [(p, spec) for p, spec in wanted if spec]
+    if not wanted:
+        return {}
+
+    import gymnasium as gym
+    import torch
+    import mani_skill.envs  # noqa: F401  — registers the task envs
+    from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
+    importlib.import_module(module)          # registers THIS primitive's env id
+
+    # `max_episode_steps=400` for the same reason `dynamic_metrics` uses it (CLAUDE.md gotcha 1) —
+    # irrelevant to a probe that never steps, and kept identical so the two probes cannot build
+    # subtly different envs and be compared as if they had not.
+    raw = gym.make(env_id, num_envs=envs, obs_mode="state", sim_backend="physx_cuda",
+                   control_mode="pd_joint_target_delta_pos", max_episode_steps=400)
+    env = ManiSkillVectorEnv(raw, envs, auto_reset=False, ignore_terminations=True)
+    samples = {}
+    with torch.no_grad():
+        for i in range(max(1, resets)):
+            _, info = env.reset(seed=seed + i)
+            for key, value in (info or {}).items():
+                if torch.is_tensor(value) and value.dtype.is_floating_point \
+                        and value.numel() == envs:
+                    samples.setdefault(key, []).append(value.reshape(-1).float().cpu())
+    env.close()
+
+    out = {}
+    for path, (key, stat, arg) in wanted:
+        if key not in samples:
+            continue
+        col = torch.cat(samples[key])
+        if stat == "mean":
+            out[path] = float(col.mean())
+        elif stat == "min":
+            out[path] = float(col.min())
+        elif stat == "max":
+            out[path] = float(col.max())
+        elif stat == "frac_within":
+            out[path] = float((col <= arg).float().mean())
+    return out
+
+
 def collect(asserts, env_id: str, module: str, ckpt=None, envs: int = 64, steps: int = 64,
            from_scratch: bool = False, evaluate=_evaluate, measure=dynamic_metrics,
-           stop_on_static_failure: bool = True) -> dict:
+           init_measure=init_metrics, stop_on_static_failure: bool = True) -> dict:
     """Observed values for every assert. Static first: if static fails there is no point paying for
     the simulator, so by default a failing static tier short-circuits before `dynamic_metrics` ever
     builds one.
@@ -225,14 +289,27 @@ def collect(asserts, env_id: str, module: str, ckpt=None, envs: int = 64, steps:
     the callback this needs (`asserts, values, from_scratch=` -> failures), so there was nothing
     left to wrap. `measure` is injected the same way (defaulting to the real `dynamic_metrics`) so
     tests can exercise the short-circuit with a fake measurement and no simulator.
+
+    TWO MEASUREMENTS, NOT ONE, AND THE SPLIT IS THE POINT. `measure` rolls a policy for `steps` and
+    reports rates; `init_measure` resets and reports where the episode STARTS. They answer different
+    questions, one of them depends on a checkpoint and the other cannot, and an `init_*` path routed
+    through `dynamic_metrics` would simply be absent from its result and read as a missing
+    measurement. `collect` sorts the DYNAMIC tier by `parse_init_stat` and pays only for the probes
+    it actually needs — a document whose only dynamic asserts are initiation-distribution ones never
+    builds the rollout probe at all.
     """
     static_asserts = [a for a in asserts if a.tier == STATIC]
     dynamic_asserts = [a for a in asserts if a.tier == DYNAMIC]
+    init_paths = [a.path for a in dynamic_asserts if parse_init_stat(a.path)]
+    rollout_asserts = [a for a in dynamic_asserts if not parse_init_stat(a.path)]
     values = static_values([a.path for a in static_asserts])
     if dynamic_asserts:
         if (stop_on_static_failure and static_asserts
                 and evaluate(static_asserts, values, from_scratch=from_scratch)):
             values.update({a.path: NOT_MEASURED for a in dynamic_asserts})
             return values
-        values.update(measure(env_id, module, ckpt, envs, steps))
+        if rollout_asserts:
+            values.update(measure(env_id, module, ckpt, envs, steps))
+        if init_paths:
+            values.update(init_measure(env_id, module, init_paths, envs))
     return values

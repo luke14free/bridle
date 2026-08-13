@@ -12,7 +12,7 @@ import sys
 import bridle.preflight as preflight
 from bridle.preflight import (
     DYNAMIC, NOT_MEASURED, STATIC, Assert, DuplicateFloor, Loosened, evaluate, format_effective,
-    format_failures, merge,
+    format_failures, merge, parse_init_stat,
 )
 
 FAILS = []
@@ -212,6 +212,74 @@ def run_checks():
           "asserts would pass the real one", calls == [] and vals.get("is_grasped_at_end") is NOT_MEASURED)
     check("the injected evaluate receives exactly the static-tier asserts",
           seen_static == [static_ok])
+
+
+    # ── THE INITIATION-DISTRIBUTION TIER. Second incident, same shape as the one at the top of this
+    # file: on 2026-06-10 descend's initiation set was swapped for one whose cube starts mean 29.6 cm
+    # from the target (corrected: 8.4 cm), 0.000 of starts inside the 6 cm the re-centring reward was
+    # tuned for (corrected: 0.375). Every assert in the file passed — they covered tolerances and
+    # learned behaviour, and nothing covered the states the policy is handed. ──
+    check("a path names an info key, a statistic, and (where the statistic takes one) a bound",
+          parse_init_stat("init_cube_to_target_dist_frac_within_0.06")
+          == ("cube_to_target_dist", "frac_within", 0.06))
+    check("the argument-free statistics parse too",
+          parse_init_stat("init_cube_to_target_dist_mean") == ("cube_to_target_dist", "mean", None)
+          and parse_init_stat("init_x_max") == ("x", "max", None)
+          and parse_init_stat("init_x_min") == ("x", "min", None))
+    check("an ordinary dynamic metric is NOT an init path (this is what routes the two probes)",
+          parse_init_stat("is_grasped_at_end") is None
+          and parse_init_stat("descend_low_once") is None)
+    check("an info key containing a statistic's name still parses by its SUFFIX",
+          parse_init_stat("init_max_slip_mean") == ("max_slip", "mean", None))
+    check("a malformed bound is refused rather than silently read as the bare statistic",
+          parse_init_stat("init_x_frac_within_sixcm") is None)
+    check("a statistic with no info key is not a measure", parse_init_stat("init_mean") is None)
+
+    # An init assert is STRUCTURAL: measured at reset, before any action, so it cannot need a warm
+    # start and cannot be flattered by one. `evaluate` treats it like any other bound — the point
+    # of the check below is that a value BELOW the floor fails, which is what 0.000-inside-6cm was.
+    init_assert = (Assert("init_cube_to_target_dist_frac_within_0.06", DYNAMIC, min=0.15),)
+    check("the corrected initiation set (0.375 inside 6 cm) passes the floor",
+          evaluate(init_assert, {"init_cube_to_target_dist_frac_within_0.06": 0.375}) == [])
+    check("the swapped-in one (0.000 inside 6 cm) fails it",
+          len(evaluate(init_assert, {"init_cube_to_target_dist_frac_within_0.06": 0.0})) == 1)
+    check("...and it fails from-scratch too — a structural assert carries no needs=warm_start "
+          "escape",
+          len(evaluate(init_assert, {"init_cube_to_target_dist_frac_within_0.06": 0.0},
+                       from_scratch=True)) == 1)
+
+    # ── collect routes DYNAMIC asserts to the probe that can actually measure them ──────────────
+    init_calls, rollout_calls = [], []
+
+    def fake_init_measure(env_id, module, paths, envs=64):
+        init_calls.append(tuple(paths))
+        return {p: 0.375 for p in paths}
+
+    def counting_measure(env_id, module, ckpt, envs, steps):
+        rollout_calls.append(env_id)
+        return {"is_grasped_at_end": 0.859}
+
+    both = init_assert + (Assert("is_grasped_at_end", DYNAMIC, min=0.5),)
+    vals = collect(static_ok + both, "env", "mod", measure=counting_measure,
+                   init_measure=fake_init_measure)
+    check("an init path goes to the reset probe and an ordinary metric to the rollout probe",
+          init_calls == [("init_cube_to_target_dist_frac_within_0.06",)]
+          and rollout_calls == ["env"]
+          and vals["init_cube_to_target_dist_frac_within_0.06"] == 0.375)
+
+    init_calls.clear()
+    rollout_calls.clear()
+    vals = collect(static_ok + init_assert, "env", "mod", measure=counting_measure,
+                   init_measure=fake_init_measure)
+    check("a document whose only dynamic asserts are init ones never builds the rollout probe",
+          rollout_calls == [] and len(init_calls) == 1)
+
+    init_calls.clear()
+    vals = collect(static_bad + init_assert, "env", "mod", measure=counting_measure,
+                   init_measure=fake_init_measure)
+    check("the static short-circuit marks an init path NOT_MEASURED, not absent and not passed",
+          init_calls == []
+          and vals.get("init_cube_to_target_dist_frac_within_0.06") is NOT_MEASURED)
 
 
 def test_bridle():

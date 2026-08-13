@@ -83,6 +83,69 @@ class Assert:
         return f"{self.path} {' and '.join(parts)}"
 
 
+# ── the INITIATION DISTRIBUTION tier ────────────────────────────────────────────────────────────
+#
+# WHERE THE EPISODE STARTS IS A CHECKABLE PROPERTY OF A CONFIGURATION, and until 2026-08-13 nothing
+# checked it. A descend run trained from an initiation set whose cube sat mean 29.6 cm from the
+# target — with 0.000 of starts inside the ~6 cm its re-centring reward was tuned for, against a
+# 4.5 cm success tolerance in a 64-step episode — and every assert in the file passed: they covered
+# tolerances (STATIC) and learned behaviour (DYNAMIC competence bars) and nothing covered the
+# STATES THE POLICY IS HANDED. Two runs died on it, ~a day of GPU.
+#
+# AN INITIATION-DISTRIBUTION ASSERT IS STRUCTURAL, NOT A COMPETENCE BAR — the distinction this
+# module's docstring draws, and the strongest possible case of it: the measurement is taken at
+# `reset()`, before a single action, so it does not depend on the policy AT ALL. There is no
+# `needs="warm_start"` question to ask about one. A random policy, a warm-started one and no policy
+# whatsoever produce the same number, and only a broken CONFIGURATION moves it.
+#
+# THE NAMING IS A GENERAL MEASURE, NOT A DESCEND SPECIAL CASE. Any per-env float the env publishes
+# in its `info` dict can be summarised at reset:
+#
+#     init_<info_key>_mean          init_<info_key>_min / _max
+#     init_<info_key>_frac_within_<x>     fraction of starts with <info_key> <= x
+#
+# so `init_cube_to_target_dist_frac_within_0.06` is descend's, and a bin-drop skill asserting
+# `init_tcp_to_object_dist_max` or a reach skill asserting `init_obj_to_goal_dist_mean` costs no new
+# code. Parsing lives HERE (stdlib, tested on CPU, no simulator) and measuring lives in
+# `bridle.adapters.preflight.init_metrics` — the same MEASURES/DECIDES seam as the rest of the file.
+
+INIT_PREFIX = "init_"
+
+#: Suffix -> whether it takes a numeric argument. Order matters only for readability; the parse
+#: below is exact, not a prefix guess.
+INIT_STATS = {"mean": False, "min": False, "max": False, "frac_within": True}
+
+
+def parse_init_stat(path):
+    """`init_<info_key>_<stat>[_<arg>]` -> `(info_key, stat, arg)`, or None if `path` is not one.
+
+    Returning None (rather than raising) is what lets `collect` sort a mixed list of DYNAMIC asserts
+    into the two things that measure them, without either tier having to be told which is which.
+
+    The argument is parsed as a float and kept as one: `..._frac_within_0.06` is 6 cm, and the name
+    carries the unit of the underlying measure (metres here) because the info key does. A stat that
+    takes no argument refuses one — `init_x_mean_0.5` is a typo, not a bound, and reading it as
+    `mean` would silently drop the number the author wrote.
+    """
+    if not isinstance(path, str) or not path.startswith(INIT_PREFIX):
+        return None
+    rest = path[len(INIT_PREFIX):]
+    for stat, takes_arg in INIT_STATS.items():
+        token = "_" + stat
+        if takes_arg:
+            marker = token + "_"
+            if marker in rest:
+                key, _, tail = rest.rpartition(marker)
+                try:
+                    return (key, stat, float(tail)) if key else None
+                except ValueError:
+                    return None
+        elif rest.endswith(token):
+            key = rest[:-len(token)]
+            return (key, stat, None) if key else None
+    return None
+
+
 #: What a KIND means, physically. These are floors, not defaults: the author never states them and
 #: cannot weaken them. `carry` is the only kind Phase 0 needs; adding a kind is adding a row here
 #: plus a test, deliberately.
