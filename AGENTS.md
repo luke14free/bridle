@@ -30,6 +30,7 @@ the change is wrong, however convenient.
 | `Store` | apps on disk; `plan(app, rig)` → run / adapt / retrain / blocked |
 | `Foundry` | executes a recipe to build a skill for a rig |
 | `Orchestrator` | an LLM driving skills, with a BYO provider |
+| `bridle.skill` | what a skill *is*, before it is trained: `skill.yaml` — scene, reward, success — through `parse_spec` → `compile_spec` → `RewardPlan`, with a fingerprint. Stdlib only, no simulator. `bridle skill check\|compile\|vocab` |
 
 Everything above is importable from the top level: `from bridle import Contract, Rig, Store`.
 

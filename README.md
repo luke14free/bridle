@@ -195,9 +195,27 @@ over `urllib`, no SDK.
 
 ```bash
 bridle skills                              # what runs on this rig, and what doesn't
+bridle skill check primitives/descend_to_target/skill.yaml   # is this skill.yaml well-formed?
 bridle plan descend_to_target              # why a skill needs adapting or rebuilding
 bridle tui --model local:qwen3-32b         # agent TUI + simulator window
 ```
+
+**`skill` and `skills` are two different commands, and the `s` is the whole difference.**
+`bridle skills` (plural) LISTS the apps already trained and in the store, and says whether each one
+runs on this rig. `bridle skill` (singular) is the authoring side: a `skill.yaml` — scene, reward,
+success — that `bridle` compiles, checks and trains. Its three verbs are
+
+```bash
+bridle skill vocab                         # the document grammar + every term, measure and chassis
+bridle skill check  <skill.yaml>           # schema, then compile. Exit 1 on the first refusal
+bridle skill compile <skill.yaml>          # the resolved plan: every row in fold order, every
+                                           #   chassis default, and the plan fingerprint
+```
+
+Neither `check` nor `compile` starts a simulator, so a reward is fully checkable before a GPU-second
+is spent. `bridle skill vocab` prints the payload you put in the authoring model's prompt — the
+intended author of a skill document is a local 27–30B LLM, which is why the refusals name the dotted
+path, state the legal set and suggest the nearest match.
 
 `bridle tui` opens two things, because they answer different questions. The terminal is where you
 talk to the agent: typing while it runs queues guidance it sees before choosing its next skill, and
@@ -213,7 +231,8 @@ fingerprints; `resolve`; `checkpoint` stamp / verify / diff; `Runner`, `Rollout`
 `App` / `Recipe` / `Artifact` / `Store` on disk with `plan()`; `Foundry` stage planning, dry runs and
 result stamping; the provider interface, `Orchestrator` and the steerable `AgentSession`; the TUI and
 the viewer; the placement geometry, the proprioceptive grasp signal and the routine that fits its
-thresholds from recorded traces; and a ManiSkill adapter binding a live session to `Runner`.
+thresholds from recorded traces; `bridle.skill` — the `skill.yaml` document, its schema, its
+compiler and the plan fingerprint; and a ManiSkill adapter binding a live session to `Runner`.
 
 Known limits:
 
