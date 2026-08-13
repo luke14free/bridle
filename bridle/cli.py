@@ -5,6 +5,7 @@
     bridle plan descend_to_target             # why a skill needs adapting or rebuilding
     bridle skill vocab                        # AUTHOR a new one: the reward vocabulary (singular)
     bridle skill check primitives/x/skill.yaml   # schema -> compile, before a GPU-second is spent
+    bridle skill diagnose runs/<exp>/reward_terms.jsonl   # ...and what the GPU said afterwards
 
 The TUI and the viewer come up together: the terminal is where you talk to the agent, the browser
 window is where you watch the robot. Neither replaces the other.
@@ -412,13 +413,107 @@ def _skill_refusal(a, stage, error):
     return "\n".join(lines)
 
 
-def cmd_skill(a):
-    """`vocab` | `check <file>` | `compile <file>` — tiers 1 and 2 of the three feedback tiers.
+def _skill_diagnose(a):
+    """`bridle skill diagnose <reward_terms.jsonl>` — tier 3, read back after the GPU has spoken.
 
-    Tier 3 is preflight, which needs the simulator; nothing in this command starts one, so a clean
-    `check` says the document is well-formed and internally consistent, NOT that the reward trains.
+    THE VERB EXISTS BECAUSE THERE IS NOW SOMETHING TO READ. It was deliberately not added while
+    `diagnose` had no producer: a verb with no input is worse than no verb, because it advertises a
+    capability whose only possible output is "nothing to say". The input is the JSONL
+    `bridle.adapters.skill_telemetry` appends one record to per emission —
+    `<primitive>/runs/<exp>/reward_terms.jsonl` under `scripts/train_from_skill.py --train`.
+
+    THE LAST RECORD BY DEFAULT, because a window describes recent behaviour and the freshest one is
+    the question a reader has. `--index` reaches back (negative indices count from the end) and
+    `--list` prints the whole series' headline numbers, which is how a trend gets read without a
+    dashboard.
+
+    The record carries the diagnostics the run itself emitted; they are RE-DERIVED here from the
+    stored statistics rather than reprinted, so this command and the training loop cannot come to
+    disagree about what the same numbers mean. The stored copy is what `--stored` prints, for
+    exactly the case where they DO differ (the rules moved since the run).
+    """
+    import json
+
+    from bridle.skill.diagnose import diagnose, format_diagnostics
+
+    if not os.path.isfile(a.file):
+        print(f"skill diagnose FAILED — no diagnostics file at {a.file}\n\n"
+              f"  This reads the JSONL a training run writes, one record per emission:\n"
+              f"    <primitive>/runs/<exp>/reward_terms.jsonl\n"
+              f"  produced by `scripts/train_from_skill.py <skill.yaml> --train` (lego-arm). A run "
+              f"started with --no-diagnostics writes none.")
+        return 1
+    records = []
+    with open(a.file) as fh:
+        for n, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except ValueError as e:
+                print(f"  note: line {n} of {a.file} is not JSON ({e}) — skipped")
+    if not records:
+        print(f"skill diagnose — {a.file} holds no records yet. The first emission lands after "
+              f"`--diag-every` control steps of the training env (default 400 = one per eval).")
+        return 1
+
+    if a.list:
+        print(f"{len(records)} emission(s) in {a.file}")
+        print(f"  {'#':>4}  {'steps':>9}  {'episodes':>9}  {'success':>8}  {'ep_len':>7}  tags")
+        for i, r in enumerate(records):
+            rate = "n/a" if r.get("success_rate") is None else f"{r['success_rate']:.4f}"
+            ln = "n/a" if r.get("ep_len") is None else f"{r['ep_len']:.1f}"
+            tags = ",".join(sorted({d["tag"] for d in r.get("diagnostics") or []})) or "-"
+            print(f"  {i:>4}  {r.get('total_steps', 0):>9}  "
+                  f"{(r.get('window') or {}).get('episodes', 0):>9}  {rate:>8}  {ln:>7}  {tags}")
+        return 0
+
+    try:
+        r = records[a.index]
+    except IndexError:
+        print(f"skill diagnose FAILED — --index {a.index} is outside the {len(records)} record(s) "
+              f"in {a.file}; `--list` prints them all")
+        return 1
+
+    window = r.get("window") or {}
+    print(f"skill diagnose — {a.file}")
+    print(f"  record {a.index} of {len(records)}   {r.get('label') or ''}"
+          + (f"   plan@{r['plan']}" if r.get("plan") else ""))
+    print(f"  window: {window.get('steps')} control steps, {window.get('env_steps')} env-steps, "
+          f"{window.get('episodes')} episodes ended, at {r.get('total_steps')} total steps")
+    rate, ep_len = r.get("success_rate"), r.get("ep_len")
+    print(f"  success rate: " + ("NOT MEASURED — no episode ended in this window, so the "
+                                 "composition checks could not run" if rate is None else
+                                 f"{rate:.4f}   mean episode length {ep_len:.1f}"))
+    stats = r.get("term_stats") or {}
+    print(f"\n  {'row':<52}{'min':>12}{'mean':>12}{'max':>12}")
+    for name, s in stats.items():
+        print(f"  {name:<52}{s.get('min', float('nan')):>12.4f}"
+              f"{s.get('mean', float('nan')):>12.4f}{s.get('max', float('nan')):>12.4f}")
+    print()
+    if a.stored:
+        stored = r.get("diagnostics") or []
+        print(f"  AS EMITTED BY THE RUN ITSELF ({len(stored)}):")
+        for d in stored:
+            print(f"    [{d['tag']}] {d['row']}: {d['message']}")
+        return 0
+    print(format_diagnostics(diagnose(stats, rate, ep_len, horizon=r.get("horizon"))))
+    return 0
+
+
+def cmd_skill(a):
+    """`vocab` | `check <file>` | `compile <file>` | `diagnose <file>` — the three feedback tiers.
+
+    Tiers 1 and 2 (`check`, `compile`) need no simulator, so a clean `check` says the document is
+    well-formed and internally consistent, NOT that the reward trains. Tier 3 is what the GPU said
+    afterwards: `diagnose` reads the per-term statistics a training run logged and re-derives the
+    typed findings from them.
     """
     from bridle.skill.vocab import vocab_document
+
+    if a.skill_cmd == "diagnose":
+        return _skill_diagnose(a)
 
     if a.skill_cmd == "vocab":
         if getattr(a, "json_schema", False):
@@ -554,6 +649,26 @@ def main(argv=None):
                         help="does success end the episode? `unknown` counts the bonus once, which "
                              "is the conservative branch")
         sp.set_defaults(fn=cmd_skill)
+    #: TIER 3, and the reason it is a separate parser: its `file` is not a skill.yaml. It reads the
+    #: JSONL a training run writes (`scripts/train_from_skill.py --train`), so `--horizon` and
+    #: `--terminate-on-success` — which parameterise COMPILE-time checks — have no meaning here.
+    dg = sk_sub.add_parser("diagnose",
+                           help="read the per-term reward statistics a training run logged and "
+                                "print the typed diagnostics: which row is flooding the return, "
+                                "which is constant and unoptimizable, whether the policy is "
+                                "earning without succeeding")
+    dg.add_argument("file", help="path to a run's reward_terms.jsonl (written by "
+                                 "scripts/train_from_skill.py --train, under runs/<exp>/)")
+    dg.add_argument("--index", type=int, default=-1,
+                    help="which emission to read; negative counts from the end (default -1, the "
+                         "most recent window)")
+    dg.add_argument("--list", action="store_true",
+                    help="one line per emission — steps, episodes, success rate and tags — for "
+                         "reading the trend rather than one window")
+    dg.add_argument("--stored", action="store_true",
+                    help="print the diagnostics the RUN emitted instead of re-deriving them from "
+                         "the stored statistics. They differ only if the rules moved since.")
+    dg.set_defaults(fn=cmd_skill)
 
     lg = sub.add_parser("lineage", help="check deployed records against the live environment")
     lg.add_argument("--cwd", default="/home/luca/lego-arm")
