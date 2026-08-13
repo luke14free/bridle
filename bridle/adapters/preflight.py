@@ -198,7 +198,7 @@ def dynamic_metrics(env_id: str, module: str, ckpt=None, envs: int = 64, steps: 
 
 
 def init_metrics(env_id: str, module: str, paths, envs: int = 64, resets: int = 4,
-                 seed: int = 0) -> dict:
+                 seed: int = 0, sim_backend: str = "physx_cuda") -> dict:
     """WHERE THE EPISODE STARTS, summarised. `{path: value}` for every `init_*` path requested.
 
     NO POLICY, NO STEP, NO CHECKPOINT — the measurement is taken on the `info` dict `reset()`
@@ -231,7 +231,14 @@ def init_metrics(env_id: str, module: str, paths, envs: int = 64, resets: int = 
     # `max_episode_steps=400` for the same reason `dynamic_metrics` uses it (CLAUDE.md gotcha 1) —
     # irrelevant to a probe that never steps, and kept identical so the two probes cannot build
     # subtly different envs and be compared as if they had not.
-    raw = gym.make(env_id, num_envs=envs, obs_mode="state", sim_backend="physx_cuda",
+    #
+    # `sim_backend` IS A PARAMETER HERE AND NOT IN `dynamic_metrics`, because this probe never steps
+    # physics: it resets and reads the info dict, so `physx_cpu` (num_envs=1, more resets) measures
+    # the same distribution as `physx_cuda`. That is what lets the check run AT ALL while a training
+    # run owns the GPU — and a guard that cannot be run on a busy box is a guard that gets skipped
+    # on exactly the day it matters. A rollout probe has no such option, which is why the default
+    # stays on the GPU and the escape hatch is opt-in.
+    raw = gym.make(env_id, num_envs=envs, obs_mode="state", sim_backend=sim_backend,
                    control_mode="pd_joint_target_delta_pos", max_episode_steps=400)
     env = ManiSkillVectorEnv(raw, envs, auto_reset=False, ignore_terminations=True)
     samples = {}
