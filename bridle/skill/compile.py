@@ -746,6 +746,40 @@ def _check_flooding(ops, *, horizon, terminate_on_success):
       phase must prove equivalence against is measurably wrong, not strict. So the ratio is computed,
       printed with BOTH numbers, and left to a human.
 
+    WHY THE REFUSAL IS GATED ON THE SUCCESS ROW'S `mode` (C1, whole-branch review 2026-08-13; the
+    check previously compared shaping against the success value in every mode):
+
+      The un-gated comparison refused this compiler's OWN chassis default. `hold_and_ramp` ships
+      `PredicateBonus{weight=1.0, predicate=grasped}` + `Ramp{weight=8.0, normalize=True}` against
+      `SuccessBonus{value=9.0, mode=add}` — 1.0 + 8.0 = 9.0, landing exactly on `total >= value` —
+      and that is deployed `lift` verbatim (`primitives/lift/lift_env.py:84-92`):
+          reward = 1.0 * is_grasped
+          reward = reward + 8.0 * is_grasped * torch.clamp(cube_z / LIFT_TARGET_Z, 0.0, 1.0)
+          reward = reward + 9.0 * info["success"].float()
+      The chassis covers lift, sphere_lift and compact_grasp: three DEPLOYED primitives measured at
+      0.9-1.0 success. The section header a 27-30B author reads above it says "start here".
+
+      The comparison was wrong, not merely tight. In `mode: add` the success step pays shaping PLUS
+      the bonus, so completing always earns strictly more than not completing from the same state —
+      there is no choice to get wrong, and "shaping total vs success value" compares two quantities
+      the agent never has to trade against each other. The flooding pathology — preferring to farm
+      shaping rather than finish — needs the bonus to REPLACE (or floor) the shaping, which is what
+      forces the trade. So:
+        * `mode: replace` / `mode: floor` -> keep `total >= value`, and say in the refusal that the
+          row overwrites rather than adds. `>=` not `>`: at equality completion pays exactly what
+          maximal farming pays, the completing action carries zero advantage, and under `floor` the
+          row is vacuous outright (`max(shaping, value) == shaping`).
+        * `mode: add` -> the right quantity is the bonus's SIGN: refuse only `value <= 0`, where
+          completion adds nothing (or is penalised). The shaping-vs-value figure is still reported,
+          as a note, because going silent on the configuration this check got wrong would read as
+          "checked and clean".
+      The horizon-integrated number remains a warning in every mode; for `add` it is the number
+      actually worth reading, since terminating on success is what forgoes future shaping.
+
+      NOT DONE, deliberately: nudging the chassis default off 9.0/8.0/1.0 to clear the boundary.
+      Those values ARE the deployed reward; changing them to satisfy a check is how the record of
+      what was trained stops matching what was trained.
+
     WHAT COUNTS AS SHAPING: rows that ACCUMULATE (`kind == "add"`), excluding the SuccessBonus rows —
     those are the completion side of the comparison. Rows that replace or floor do not accumulate,
     and are therefore OUTSIDE this comparison entirely — a gap the notes state out loud whenever such
@@ -799,20 +833,73 @@ def _check_flooding(ops, *, horizon, terminate_on_success):
         return notes
 
     # One document, one completion value. With more than one SuccessBonus row the largest is the
-    # ceiling shaping has to stay under; a smaller sibling cannot make a flood safe.
+    # ceiling shaping has to stay under; a smaller sibling cannot make a flood safe. This is the
+    # figure the horizon-integrated note below compares against, whatever the modes are.
     value = max(_row_maximum(op) for _, op in bonuses)
-    if total >= value:
-        offenders = "; ".join(f"reward[{i}] {op.fn_key} max {_num(m)}"
-                              for i, op, m in bounded if m != 0.0)
+    offenders = "; ".join(f"reward[{i}] {op.fn_key} max {_num(m)}"
+                          for i, op, m in bounded if m != 0.0)
+
+    # WHICH COMPARISON IS RIGHT DEPENDS ON THE SUCCESS ROW'S `mode` — see this function's docstring,
+    # "WHY THE REFUSAL IS GATED ON THE SUCCESS ROW'S `mode`". `op.kind` IS that mode.
+    overriding_bonuses = [(i, op, _row_maximum(op)) for i, op in bonuses if op.kind != "add"]
+
+    # `add`: completion pays shaping PLUS the bonus, so it out-earns not-completing at the same
+    # state iff the bonus is strictly positive. That, and not "shaping vs value", is the quantity
+    # this mode has to satisfy — and it is authorable, `value` carries no positivity bound in
+    # `vocab.TERMS["SuccessBonus"]`, so this branch is reachable rather than decorative.
+    #
+    # THE AUTHORED VALUE, NOT `_row_maximum`: that helper clamps with `max(value, 0.0)` because it
+    # feeds the ceiling a shaping total must stay under, so it reports 0.0 for `value: -1.0` and a
+    # refusal quoting it would tell an author a number their document does not contain.
+    dead = [(i, op, float(op.params["value"])) for i, op in bonuses
+            if op.kind == "add" and float(op.params["value"]) <= 0.0]
+    if dead:
         raise FloodingError(
             "reward",
-            f"per-step shaping can out-earn completing the task: the additive rows sum to a maximum "
-            f"of {_num(total)} per step, which is >= the success value {_num(value)}. Offending "
-            f"rows: {offenders}. Every recorded incident here is a per-step comparison — "
-            f"move_to_target_env.py:205 chose weight 1.5 so the proximity maximum stays below the "
-            f"5.0 arrival bonus, and its lines 199-203 record what the sparse alternative cost: 178M "
-            f"from-scratch steps at 0% success. Lower a shaping weight, or raise the success value "
-            f"above {_num(total)}")
+            f"completing the task pays nothing: "
+            f"{'; '.join(f'reward[{i}] SuccessBonus value {_num(m)} mode=add' for i, _, m in dead)}. "
+            f"In `mode: add` the bonus is ADDED to the {_num(total)}/step of shaping already "
+            f"accumulated, so completion out-earns not-completing only while the value is strictly "
+            f"positive; at {_num(dead[0][2])} the success row is a no-op (or worse, a penalty for "
+            f"finishing) and the whole reward is its shaping. Give the SuccessBonus a positive "
+            f"value, or state `mode: replace` if the bonus is meant to override the shaping")
+
+    if overriding_bonuses:
+        # `replace`/`floor`: the bonus REPLACES (or floors) the shaping, so the agent is made to
+        # CHOOSE between farming and finishing, and shaping that reaches the bonus wins that choice.
+        # `>=` and not `>`: at exact equality completing pays exactly what maximal farming pays, so
+        # the completing action carries zero advantage and PPO has no gradient toward it; under
+        # `floor` the row is literally vacuous there (`max(shaping, value) == shaping`). Relaxing to
+        # `>` would also be relaxing a check so a document passes, which this phase forbids.
+        ceiling = max(m for _, _, m in overriding_bonuses)
+        modes = "; ".join(f"reward[{i}] SuccessBonus {_num(m)} mode={op.kind}"
+                          for i, op, m in overriding_bonuses)
+        if total >= ceiling:
+            raise FloodingError(
+                "reward",
+                f"per-step shaping can out-earn completing the task: the additive rows sum to a "
+                f"maximum of {_num(total)} per step, which is >= the success value "
+                f"{_num(ceiling)}. Offending rows: {offenders}. The success row {modes} does not "
+                f"ADD to that shaping, it overwrites it, so the agent has to choose between the two "
+                f"and this weighting makes farming the better choice. Every recorded incident here "
+                f"is a per-step comparison — move_to_target_env.py:205 chose weight 1.5 so the "
+                f"proximity maximum stays below the 5.0 arrival bonus, and its lines 199-203 record "
+                f"what the sparse alternative cost: 178M from-scratch steps at 0% success. Lower a "
+                f"shaping weight, or raise the success value above {_num(total)}")
+    elif total >= value:
+        # The case that used to refuse. It is deployed `lift`, so it is a note, and the note states
+        # the comparison it DID make rather than going quiet — silence here would read as "checked
+        # and clean" on the exact configuration this check was wrong about.
+        notes.append(Note(_FYI,
+            f"the per-step shaping maximum {_num(total)} reaches the success value {_num(value)}, "
+            f"and this is NOT refused because the success row is `mode: add`: at success the agent "
+            f"collects the shaping AND the bonus ({_num(total)} + {_num(value)}), so completing "
+            f"always pays strictly more than not completing and there is no choice to get wrong. "
+            f"The refusal is reserved for `mode: replace`/`floor`, where the bonus overwrites the "
+            f"shaping. Contributing rows: {offenders}. Deployed `lift` is exactly this shape — "
+            f"1.0 (grasped) + 8.0 (normalized ramp) = 9.0/step against a 9.0 `mode: add` success "
+            f"value (lift_env.py:84-92), measured at 0.9-1.0 success. The number worth reading here "
+            f"is the horizon-integrated one below."))
 
     notes.extend(_integrated_note(total, value, ops=bonuses, horizon=horizon,
                                   terminate_on_success=terminate_on_success,

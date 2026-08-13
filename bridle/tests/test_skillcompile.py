@@ -75,7 +75,9 @@ from bridle.skill.compile import (
     _relu, _SCOPE_REACH, _where, _ZERO_IS_NOT_A_CONTACT_SURFACE,
 )
 from bridle.skill.spec import SpecError, parse_spec
-from bridle.skill.vocab import MEASURES, TERMS, Frame, Measure, Sign, vocab_document
+from bridle.skill.vocab import (
+    CHASSIS, MEASURES, TERMS, Frame, Measure, Sign, base_term, vocab_document,
+)
 from bridle.tests.test_skillspec import descend_doc, doc_with, row_edited
 
 FAILS = []
@@ -301,9 +303,17 @@ def ungated_doc():
     }
 
 
-def ramp_doc(weight, cap, normalize):
+def ramp_doc(weight, cap, normalize, mode="add", value=9.0):
     """compact_grasp vs lift, the 25x bug as a document: lift's Ramp is normalized (max = weight),
-    compact_grasp's is not (max = weight*(cap-floor) = 10.0*0.04 = 0.4)."""
+    compact_grasp's is not (max = weight*(cap-floor) = 10.0*0.04 = 0.4).
+
+    `mode`/`value` REACH THE SUCCESS ROW because the flooding refusal is mode-aware (C1): the
+    per-step comparison applies where the bonus REPLACES the shaping, and `mode: add` — which is
+    what deployed lift ships — is refused only on a non-positive value. The un-parameterised version
+    of this fixture is what let C1 ship: the file only ever instantiated `ramp_doc(10.0, 0.04, ...)`,
+    which sits clear of the line, so nothing here ever evaluated `ramp_doc(8.0, 0.06, True)` — the
+    deployed lift, exactly ON it, which the compiler refused.
+    """
     return {
         "name": "grasp", "kind": "hold_and_ramp", "contract": "stack", "env_id": "SO100Lift-v1",
         "scene": {"held": {"type": "cube", "half": 0.014}},
@@ -314,11 +324,53 @@ def ramp_doc(weight, cap, normalize):
              "normalize": normalize, "gate": "grasped",
              "why": "lift ramps normalized to 8.0; compact_grasp's un-normalized seat bias maxes "
                     "at 0.4 and must not be rescaled to 10.0."},
-            {"term": "SuccessBonus", "value": 9.0, "mode": "add", "why": "terminal +9.0."},
+            {"term": "SuccessBonus", "value": value, "mode": mode, "why": "terminal +9.0."},
             {"term": "ActionPenalty", "weight": 0.001, "why": "same 0.001/l2."},
         ],
         "success": "above_z(z=0.06)",
     }
+
+
+def chassis_doc(kind):
+    """A minimal document instantiating one chassis's OWN defaults, unmodified.
+
+    Every other chassis check in the suite is LEXICAL — keys are declared params, names resolve, the
+    enum matches — so nothing ever ran `parse_spec -> compile_spec` over `CHASSIS[k].defaults` and
+    C1 shipped: `hold_and_ramp` (lift, sphere_lift, compact_grasp, all deployed at 0.9-1.0) was
+    refused by this compiler's own flooding check, from this compiler's own chassis (I8).
+
+    Every row is copied straight out of the chassis with `base_term` stripping the disambiguating
+    suffix (`DistancePull_xy` -> `DistancePull`), so it inherits nothing and asserts nothing about
+    inheritance — the point is that the numbers a chassis hands an author survive the checks that
+    author's document will be put through. `RewardScale` is skipped: it is a top-level
+    `reward_scale:` block, not a reward row.
+    """
+    rows = []
+    for key, row in CHASSIS[kind].defaults.items():
+        term = base_term(key)
+        if term == "RewardScale":
+            continue
+        rows.append(dict(row, term=term))
+    return {
+        "name": f"chassis_{kind}", "kind": kind, "contract": "stack",
+        "env_id": "SO100GraspCube-v1",
+        "scene": {"held": {"type": "cube", "half": 0.014}},
+        "reward": rows,
+        "success": _CHASSIS_SUCCESS[kind],
+    }
+
+
+#: One success criterion per chassis, in the vocabulary's own predicate language. Written here
+#: rather than taken from a chassis because a chassis declares a REWARD, not a success rule — the
+#: only requirement is that it parses, so the compile under test is the chassis's reward.
+_CHASSIS_SUCCESS = {
+    "approach": "above_z(z=0.06)",
+    "close_and_hold": "grasped",
+    "hold_and_ramp": "and_(grasped, above_z(z=0.06))",
+    "carry": "and_(grasped, within_radius(anchor=target_pos, radius_expr=0.05))",
+    "carry_with_potential": "latched(within_radius(anchor=target_pos, radius_expr=0.05))",
+    "release": "not_grasped",
+}
 
 
 def error_from(fn, *a, **kw):
@@ -627,13 +679,63 @@ def run_checks():
           "KNOWN GAP" not in warning_text(plan))
 
     # ── the per-step maximum table: Ramp.normalize is 25x, not cosmetic ─────────────────────────
+    # Observed through a `mode: replace` success row, because that is the mode the per-step refusal
+    # applies to (see MODE-AWARE below). The property under test is the MAXIMUM the table computes
+    # for a Ramp — 10.0 normalized against 10.0*(0.04-0.0) = 0.4 un-normalized — and the refusal is
+    # only how the suite gets to read it.
     check("a normalized Ramp's maximum IS its weight (10.0 + 1.0 >= the 9.0 success value)",
-          isinstance(error_from(plan_of, ramp_doc(10.0, 0.04, True), horizon=HORIZON),
-                     FloodingError))
+          isinstance(error_from(plan_of, ramp_doc(10.0, 0.04, True, mode="replace"),
+                                horizon=HORIZON), FloodingError))
     check("an un-normalized Ramp's maximum is weight*(cap-floor) = 0.4, and passes",
-          error_from(plan_of, ramp_doc(10.0, 0.04, False), horizon=HORIZON) is None)
+          error_from(plan_of, ramp_doc(10.0, 0.04, False, mode="replace"), horizon=HORIZON) is None)
     refuses("a Ramp whose cap is not above its floor", ramp_doc(10.0, 0.0, True),
             "cap", "floor", horizon=HORIZON)
+
+    # ── MODE-AWARE: which comparison the refusal makes depends on the success row's `mode` (C1) ──
+    # `ramp_doc(8.0, 0.06, True)` IS deployed lift (`primitives/lift/lift_env.py:84-92`): 1.0 for
+    # `grasped` + a ramp normalized to 8.0 = 9.0/step against a 9.0 `mode: add` success value.
+    # It is measured at 0.9-1.0 success, and the un-gated `total >= value` refused it — landing
+    # exactly on the line, which is why the 10.0 fixtures above never revealed it.
+    lift = ramp_doc(8.0, 0.06, True)
+    check("deployed lift (1.0 + 8.0 == the 9.0 `mode: add` success value) COMPILES",
+          error_from(plan_of, lift, horizon=HORIZON) is None)
+    lift_text = warning_text(plan_of(lift, horizon=HORIZON))
+    check("...and the note states the comparison it made rather than going silent",
+          all(f in lift_text for f in ("mode: add", "9.0", "lift_env.py:84-92", "0.9-1.0")))
+    check("the SAME weights with a `mode: replace` success row ARE refused",
+          isinstance(error_from(plan_of, ramp_doc(8.0, 0.06, True, mode="replace"),
+                                horizon=HORIZON), FloodingError))
+    check("...and `mode: floor` too — a floor at or below the shaping is vacuous",
+          isinstance(error_from(plan_of, ramp_doc(8.0, 0.06, True, mode="floor"),
+                                horizon=HORIZON), FloodingError))
+    check("the `replace` boundary is still `>=`, not `>`: exact equality refuses",
+          isinstance(error_from(plan_of, ramp_doc(8.0, 0.06, True, mode="replace", value=9.0),
+                                horizon=HORIZON), FloodingError)
+          and error_from(plan_of, ramp_doc(8.0, 0.06, True, mode="replace", value=9.1),
+                         horizon=HORIZON) is None)
+    # What `mode: add` IS refused on: the sign of the bonus. In add mode completion pays shaping
+    # PLUS the bonus, so it out-earns not-completing iff the bonus is strictly positive.
+    refuses("a `mode: add` success bonus of 0.0 pays nothing for finishing",
+            ramp_doc(8.0, 0.06, True, value=0.0),
+            "completing the task pays nothing", "mode=add", "reward[2]",
+            kind=FloodingError, horizon=HORIZON)
+    refuses("...and a negative one penalises finishing",
+            ramp_doc(1.0, 0.06, True, value=-1.0),
+            "completing the task pays nothing", "-1.0", kind=FloodingError, horizon=HORIZON)
+    check("a positive `mode: add` bonus under the shaping total is NOT refused on its sign",
+          error_from(plan_of, ramp_doc(8.0, 0.06, True, value=0.5), horizon=HORIZON) is None)
+
+    # ── EVERY CHASSIS'S OWN DEFAULTS COMPILE (I8) ────────────────────────────────────────────────
+    # The check that would have caught C1 the day the chassis landed. Lexical checks elsewhere
+    # confirm the keys are declared params and the names resolve; only this one runs the numbers
+    # through `parse_spec -> compile_spec`, which is what an author's document does.
+    check("all six chassis are covered by this check, not a subset",
+          sorted(_CHASSIS_SUCCESS) == sorted(CHASSIS) and len(CHASSIS) == 6)
+    for kind in CHASSIS:
+        err = error_from(plan_of, chassis_doc(kind), horizon=HORIZON)
+        if err is not None:                       # print WHAT it refused, not just that it did
+            print(f"        {type(err).__name__}: {str(err)[:240]}")
+        check(f"the '{kind}' chassis defaults parse and compile unmodified", err is None)
 
     # ── FLOODING: the horizon is a WARNING, never a refusal ─────────────────────────────────────
     text = warning_text(plan)
