@@ -502,6 +502,51 @@ def _skill_diagnose(a):
     return 0
 
 
+def _skill_env_check(a, spec):
+    """Does `env_id:` name an environment that exists? `(status, detail)`.
+
+    IT USED TO NAME ANYTHING. `env_id` was an unresolved free string, so a document with
+    `env_id: ThisEnvDoesNotExist-v9` reported `skill check OK, exit 0` and a stamped plan
+    fingerprint — the same defect class as the `success:` criterion that reached the GPU unchecked
+    (2026-08-13, review I2). The resolution itself lives in `bridle.adapters.env_ref` because it
+    needs the simulator's registry and `bridle.skill` is stdlib-only.
+
+    THE THIRD OUTCOME IS THE POINT. With no simulator importable the answer is `NOT CHECKED`, which
+    is printed as such and does NOT fail the run — this checker must never render "could not
+    verify" as "verified", and it must not refuse a document merely because the machine reading it
+    has no GPU stack installed.
+    """
+    if getattr(a, "no_env_check", False):
+        return "not_checked", "--no-env-check was passed, so `env_id` was not resolved"
+    try:
+        from bridle.adapters.env_ref import check_env_ref
+    except Exception as e:                                        # noqa: BLE001
+        return "not_checked", f"bridle.adapters.env_ref unavailable ({type(e).__name__}: {e})"
+    return check_env_ref(spec.env_id, search_dir=os.path.dirname(os.path.abspath(a.file)))
+
+
+def _skill_contract_check(spec):
+    """Does `contract:` name a `bridle.contract.Contract` factory? Reported, never refused.
+
+    ADVISORY ON PURPOSE, and the asymmetry with `env_id` above is deliberate rather than an
+    oversight. `Contract` exposes a handful of named factories (`stack`, `grab`, `for_prim`) and a
+    skill may legitimately name a contract this repo has no factory for — several existing documents
+    and fixtures do. A refusal would therefore reject working documents to catch a typo, so the
+    typo is printed instead and the reader decides.
+    """
+    try:
+        from bridle.contract import Contract
+    except Exception as e:                                        # noqa: BLE001
+        return f"NOT CHECKED — bridle.contract unavailable ({type(e).__name__}: {e})"
+    factory = getattr(Contract, spec.contract, None)
+    if callable(factory):
+        return f"{spec.contract} — resolves to Contract.{spec.contract}()"
+    named = sorted(n for n in dir(Contract)
+                   if not n.startswith("_") and callable(getattr(Contract, n, None)))
+    return (f"{spec.contract} — NOT a Contract factory (advisory, not a refusal). "
+            f"Named factories: {', '.join(named)}")
+
+
 def cmd_skill(a):
     """`vocab` | `check <file>` | `compile <file>` | `diagnose <file>` — the three feedback tiers.
 
@@ -562,8 +607,22 @@ def cmd_skill(a):
                           terminate_on_success=a.terminate_on_success))
         return 0
 
+    env_status, env_detail = _skill_env_check(a, spec)
+    contract_line = _skill_contract_check(spec)
+    if env_status == "unknown":
+        tail = (f"The reward compiled — plan@{plan.fingerprint()} — but a document that names an "
+                f"env nothing can build trains nothing. Fix `env_id:`, or point the check at an "
+                f"interpreter that can import the module registering it. `--no-env-check` skips "
+                f"this tier and says so.")
+        print("skill check FAILED — tier 1.5, the environment does not exist\n\n"
+              + wrap(env_detail, "  ") + "\n\n" + wrap(tail, "  "))
+        return 1
+
     print(f"skill check OK — {spec.name} ({spec.kind} chassis) — plan@{plan.fingerprint()}, "
           f"{len(plan.ops)} ops")
+    print(f"  env_id    {spec.env_id} — " + ("resolved: " + env_detail if env_status == "ok"
+                                             else "NOT CHECKED: " + env_detail))
+    print(f"  contract  {contract_line}")
     print(format_warnings(plan))
     print("\n" + wrap(
         "Passed tiers 1-2 of 3 (schema -> compile -> preflight). No simulator was started, so this "
@@ -648,6 +707,10 @@ def main(argv=None):
         sp.add_argument("--terminate-on-success", choices=tuple(_TERMINATION), default="unknown",
                         help="does success end the episode? `unknown` counts the bonus once, which "
                              "is the conservative branch")
+        sp.add_argument("--no-env-check", action="store_true",
+                        help="do not resolve `env_id` against the simulator registry. The check "
+                             "then reports NOT CHECKED rather than passing silently — and it "
+                             "imports no simulator, which is the reason to want it")
         sp.set_defaults(fn=cmd_skill)
     #: TIER 3, and the reason it is a separate parser: its `file` is not a skill.yaml. It reads the
     #: JSONL a training run writes (`scripts/train_from_skill.py --train`), so `--horizon` and
