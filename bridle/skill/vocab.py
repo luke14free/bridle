@@ -686,6 +686,24 @@ def vocab_document() -> str:
     local 27-30B model authoring a skill.yaml. Kept dense on purpose (design doc §8) — the audit
     budgeted 3,400-4,600 tokens for this whole payload, alongside a task description and one
     worked example, so every sentence here earns its place.
+
+    IT NOW OPENS WITH THE DOCUMENT'S OWN SHAPE, and until 2026-08-13 it did not (C2). The payload
+    was 25,875 characters of vocabulary with ZERO occurrences of `name:`, `kind:`, `scene:`,
+    `reward:`, `params.`, `severity`, `reward_scale`, `preflight`, `expr:`, `custom:`, `init:` or
+    `mode: floor` — not one top-level key, the three tiers unmentioned, `floor` a legal `choices`
+    value on two terms with its semantics nowhere, and the `params.hover` / bare-`hover` split
+    between tier 1 and tier 2 documented only inside the refusal an author gets for guessing wrong.
+    `spec.json_schema()` did carry the shape and had no consumer; `bridle skill vocab --json-schema`
+    is now that consumer.
+
+    THE BUDGET, HONESTLY: this string is ~29.7k characters, ~7.4k estimated tokens against the 8,000
+    ceiling `test_vocab.py` asserts. The document section cost ~840 of those and the mode-aware
+    rewrite of the flooding bullet ~120 more; nothing was deleted to pay for either. That leaves
+    ~570 tokens, which is NOT enough for the "task description and one worked example" this
+    docstring has always said sit alongside it. `bridle skill vocab` therefore NAMES the worked
+    example (`primitives/descend_to_target/skill.yaml`) rather than inlining it. The next thing
+    added here has to buy its space from a re-measurement of the ceiling, not from the rationale
+    prose — that prose is the evidence the "comments carry their measurement" rule protects.
     """
     lines = []
     add = lines.append
@@ -703,6 +721,83 @@ def vocab_document() -> str:
         "unsigned height_above_seat_live silently zeroes a crush penalty that exists because a "
         "signed version broke 16/16 grasps; a frame mismatch grades reward and success on two "
         "truths. A two-frame quantity carries its frame IN THE KEY; there is no bare spelling.")
+    add("")
+
+    # ── the document's own shape ────────────────────────────────────────────────────────────────
+    # WHY THIS SECTION EXISTS (C2, whole-branch review 2026-08-13). This payload described the
+    # authorable VOCABULARY in 25,875 characters and never once said what a document looks like:
+    # zero occurrences of `params.`, `reward_scale`, `severity`, `scene:`, `kind:`, `preflight`,
+    # `contract:`, `expr:`, `custom:`, `init:`, `- term:`, `name:`, `reward:` or `mode: floor`. Not
+    # one top-level key; the three tiers unmentioned; `floor` a legal `choices` value on two terms
+    # with its semantics nowhere. `json_schema()` carries the shape and marks `why` required, and
+    # has no consumer anywhere — so the only thing an author was actually handed was this string,
+    # and this string was a vocabulary list. `bridle skill vocab` prints it and calls it "the
+    # payload you put in the authoring model's prompt".
+    #
+    # The rules restated below are each policy stated in exactly one refusal message and nowhere an
+    # author reads BEFORE writing: every `scene:` entry declares `type` and every `params:` entry
+    # declares `severity` (phase2-decisions §3); `why:` is mandatory on every row; and the
+    # `params.hover` / bare-`hover` split between tier 1 and tier 2, which was fixed in the error
+    # message only. A refusal is a round trip; the payload is free.
+    add("## The document you are writing")
+    add("")
+    add("ONE YAML mapping. Required: `name`, `kind`, `contract`, `env_id`, `scene`, `reward`, "
+        "`success`. Optional: `params`, `init`, `reward_scale`, `preflight`. Any other top-level "
+        "key is refused.")
+    add("")
+    add("```yaml")
+    add("name: descend_to_target")
+    add("kind: carry                   # a chassis below; it supplies every weight you omit")
+    add("contract: stack               # an existing bridle contract, by name")
+    add("env_id: SO100DescendToTarget-v1   # an ALREADY REGISTERED env — `scene:` is parsed and")
+    add("scene:                            #   fingerprinted, never built, in this phase")
+    add("  held:   {type: cube, half: 0.014}   # EVERY scene object declares a `type`")
+    add("  target: {type: platform}")
+    add("params:                       # numbers the contract has no field for. EVERY one declares")
+    add("  hover:                      #   a `severity`: run (a ckpt still applies)|adapt|retrain")
+    add("    {value: 0.015, severity: retrain, doc: hover height above the seat}")
+    add("init: {}                      # free-form per-episode setup, passed through unread")
+    add("reward_scale: {divisor: 12.0, unnormalized: false}   # reward_ppo = dense / divisor")
+    add("reward:                       # an ORDERED list of rows")
+    add("  - term: DistancePull")
+    add("    measure: height_above_seat_live")
+    add("    setpoint: params.hover")
+    add("    why: MANDATORY, every row. Why this row, and why these numbers.")
+    add("success: all[grasped, within_radius(anchor=target_pos, radius_expr=params.center_tol)]")
+    add("preflight:                    # asserts before any GPU. Tiers `static`/`dynamic`, each")
+    add("  dynamic:                    #   `target: {min|max|expect, needs}`")
+    add("    descend_low_once: {min: 0.5, needs: warm_start}")
+    add("```")
+    add("")
+    add("ROW ORDER IS THE PROGRAM: the fold is `acc = row(acc)`, top to bottom. descend's "
+        "`SuccessBonus{mode: replace}` sits BEFORE its `ActionPenalty`, so a success step pays "
+        "`12.0 - 0.001*||a||`, not 12.0. Swapping two rows is a different reward with identical "
+        "weights and identical logs.")
+    add("")
+    add("THREE TIERS OF ROW — use tier 1 unless it cannot say what you mean:")
+    add("- 1 `- {term: Ramp, measure: object_z, weight: 8.0, why: ...}`: a term below. Each "
+        "parameter is your value, else the chassis default, else the term's.")
+    add("- 2 `- {expr: \"2.5 * (1 - tanh(6 * abs(height_above_seat_live - hover)))\", why: ...}`: "
+        "arithmetic over measures, predicates and params. No stateable per-step maximum, so the "
+        "flooding check reports INCOMPLETE instead of passing it.")
+    add("- 3 `- {custom: \"module.path:function\", why: ...}`: opaque Python; only the fingerprint "
+        "sees it.")
+    add("")
+    add("`params.` IS SPELLED TWO WAYS, on purpose: a tier-1 field and `success:` write "
+        "`params.hover`; an `expr:` writes the bare `hover`, because an expression is parsed and "
+        "`params.hover` reads as attribute access, which the grammar refuses outright.")
+    add("")
+    add("`why:` IS MANDATORY ON EVERY ROW and is never inherited. Write it before you choose the "
+        "number.")
+    add("")
+    add("`mode:` — what a row does to the accumulator (`SuccessBonus`, `PredicateBonus`):")
+    add("- `add` (default), `acc + x`: at success the agent collects the shaping AND the bonus, so "
+        "finishing always pays strictly more than not finishing.")
+    add("- `replace`, `where(condition, value, acc-over-scope)`: OVERWRITES what came before, so "
+        "the agent must CHOOSE between farming shaping and finishing. The mode the flooding "
+        "refusal below applies to.")
+    add("- `floor`, `max(acc, value)`: a lower bound; at or below the shaping it does nothing.")
+    add("`scope: preceding` (the rows above this one) is the only scope implemented.")
     add("")
 
     add("## Terms")
@@ -757,9 +852,17 @@ def vocab_document() -> str:
 
     add("## Constraints `compile()` checks before any GPU run")
     add("")
-    add("- `max_shaping_below: success_bonus` — per-step shaping maxima must stay below the success "
-        "value (move_to_target: 1.5 < 5.0 < 50.0) — the fully-sparse alternative measured 178M "
-        "steps at 0% success.")
+    # The wording is MODE-AWARE because the check is (C1): stated flatly, this bullet told the
+    # author that deployed lift — 1.0 + 8.0 against a 9.0 `mode: add` bonus, measured at 0.9-1.0 —
+    # breaks a rule it does not break.
+    add("- `max_shaping_below: success_bonus` — with a `mode: replace` or `mode: floor` success row, "
+        "the per-step shaping maxima must stay BELOW the success value (move_to_target: "
+        "1.5 < 5.0 < 50.0); at or above it the agent prefers farming to finishing, and the compiler "
+        "refuses. The fully-sparse alternative that avoids the question measured 178M steps at 0% "
+        "success. With `mode: add` the bonus is added to the shaping rather than replacing it, so "
+        "there is no such choice and no such refusal — deployed lift pays 1.0 + 8.0 = 9.0/step "
+        "against a 9.0 add bonus and is measured at 0.9-1.0 success. What `add` IS refused on is a "
+        "success value of zero or less, which pays nothing for finishing.")
     add("- `attractor_setpoint_not_at: contact` — a DistancePull setpoint over a SIGNED measure "
         "whose zero IS a resting surface must not peak at that zero (descend's hover, 0.015, never "
         "0) — peaking at contact is the 16/16 grasp-loss failure mode. It holds for EVERY kernel, "

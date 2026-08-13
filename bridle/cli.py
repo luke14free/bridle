@@ -358,6 +358,13 @@ def cmd_lineage(a):
 #: something about the env. Guessing here would put a number in a warning that nobody measured.
 _TERMINATION = {"yes": True, "no": False, "unknown": None}
 
+#: The one fully worked skill document in either repo, named by `bridle skill vocab` so the payload
+#: it prints is not the only thing an author has ever seen. A PATH and not an inlined copy: the
+#: prose payload is already near its token ceiling, and this file is ~400 lines of annotated YAML
+#: whose annotations (what each `why` was ported from, where the two files legitimately diverge) are
+#: most of its value. Not read by this process — `skill check` reads it when asked to.
+_WORKED_EXAMPLE = "/home/luca/lego-arm/primitives/descend_to_target/skill.yaml"
+
 
 def _skill_document(a):
     """`(doc, None)` or `(None, refusal text)`.
@@ -414,7 +421,23 @@ def cmd_skill(a):
     from bridle.skill.vocab import vocab_document
 
     if a.skill_cmd == "vocab":
+        if getattr(a, "json_schema", False):
+            # `spec.json_schema()` had NO consumer anywhere in the branch (2026-08-13 review, C2)
+            # while its own docstring called it "the machine-readable half of what a 27-30B author
+            # is handed" — a half nothing handed over. This flag is that consumer, and it is the
+            # payload for a constrained-decoding harness rather than for a prose prompt.
+            import json
+
+            from bridle.skill.spec import json_schema
+            print(json.dumps(json_schema(), indent=2))
+            return 0
         print(vocab_document())
+        # `vocab_document`'s budget always assumed "a task description and one worked example"
+        # ALONGSIDE it, and nothing in this branch supplied one, so the payload named no document
+        # an author could read. It is NAMED rather than inlined: the prose payload is already at
+        # ~7.4k of its 8k estimated-token ceiling, and the example is 400 lines of annotated YAML.
+        print(f"\n<!-- One fully worked, deployed example, annotated row by row: {_WORKED_EXAMPLE}\n"
+              f"     Its plan fingerprint is printed by `bridle skill compile`. -->")
         return 0
 
     from bridle.skill.compile import CompileError, compile_spec
@@ -510,9 +533,13 @@ def main(argv=None):
                                       "document, compile it to a plan. Trains nothing and lists "
                                       "nothing (singular; see `skills` for what is already trained)")
     sk_sub = sk.add_subparsers(dest="skill_cmd", required=True)
-    sk_sub.add_parser("vocab", help="print every term, parameter and measure a skill.yaml may use — "
-                                    "the payload you put in the authoring model's prompt"
-                      ).set_defaults(fn=cmd_skill)
+    vc = sk_sub.add_parser("vocab", help="print the document grammar plus every term, parameter, "
+                                         "measure and chassis a skill.yaml may use — the payload "
+                                         "you put in the authoring model's prompt")
+    vc.add_argument("--json-schema", action="store_true",
+                    help="emit `spec.json_schema()` instead: the same surface as JSON Schema, for a "
+                         "constrained-decoding harness rather than a prose prompt")
+    vc.set_defaults(fn=cmd_skill)
     for verb, helptext in (
             ("check", "validate one skill.yaml (schema, then compile) and print the first refusal "
                       "with its dotted path; exits 1 if it does not pass. No simulator, no training"),

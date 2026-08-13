@@ -271,17 +271,23 @@ def run_checks():
     # not the constraint." 8,000 tokens is therefore the ceiling: the largest payload the audit
     # costed and still called comfortable, applied to its largest single component.
     #
-    # WHY THE MARGIN IS WHAT IT IS. The document measures ~6,470 estimated tokens today (25,875
+    # WHY THE MARGIN IS WHAT IT IS. The document measures ~7,430 estimated tokens today (29,724
     # chars) — above the audit's 3,400-4,600 vocabulary line because that table prices no chassis at
     # all (the 6 presets with their `why` rationales are the audit's own §6 recommendation, costed
     # nowhere in its §5), plus amendment 1's added measures and terms, plus the 17th predicate and
-    # the `success:` grammar line added 2026-08-13 (+1,179 chars, +295 est. tokens over the 24,696 /
-    # ~6,174 measured before them). Against 8,000 that leaves ~1,530 tokens (~6,100 chars) of
-    # headroom — still room to add a rationale to every chassis row without touching this test,
-    # which is the point of the margin. A document that DOUBLED would estimate ~12,900 tokens and
-    # still fail, which is the point of there being a ceiling at all. If a future addition does not
-    # fit, say so — do not buy the space by deleting rationale prose, which is the evidence the
-    # "comments carry their measurement" rule exists to protect.
+    # the `success:` grammar line added 2026-08-13 (+1,179 chars over the 24,696 measured before
+    # them), plus the "## The document you are writing" section and the mode-aware rewrite of the
+    # flooding bullet added the same day for C2 (+3,849 chars, +962 est. tokens over 25,875).
+    #
+    # THAT LEAVES ~570 TOKENS, AND THAT IS TIGHT — SAID OUT LOUD RATHER THAN QUIETLY ACCEPTED. The
+    # ceiling is the worst case for the WHOLE authoring prompt, which the design assumed would be
+    # this document PLUS a task description PLUS one worked example; ~570 tokens does not hold the
+    # last two. `bridle skill vocab` therefore NAMES the worked example
+    # (`primitives/descend_to_target/skill.yaml`) instead of inlining it, and the next addition here
+    # has to come with a re-measured ceiling. What it must NOT come with is deleted rationale prose,
+    # which is the evidence the "comments carry their measurement" rule exists to protect. A
+    # document that DOUBLED would estimate ~14,900 tokens and still fail, which is the point of
+    # there being a ceiling at all.
     #
     # ~4 chars/token is the working conversion this repo already uses. It is an estimate, and the
     # ceiling is sized so that being 30% wrong about it does not change the verdict.
@@ -292,6 +298,56 @@ def run_checks():
     check(f"...and the ceiling still bites: a doubled document ({2 * est_tokens:.0f} est. tokens) "
           f"would fail it", 2 * est_tokens >= 8000)
     check("document is not a stub", len(doc) > 3000)
+
+    # ── the payload carries the DOCUMENT GRAMMAR, not only the vocabulary (C2) ───────────────────
+    # Measured 2026-08-13 on the 25,875-char payload: ZERO occurrences of `params.`, `reward_scale`,
+    # `severity`, `scene:`, `kind:`, `preflight`, `contract:`, `expr:`, `custom:`, `init:`,
+    # `- term:`, `name:`, `reward:` or `mode: floor`. Not one top-level key, the three tiers never
+    # mentioned, `floor` a legal `choices` value on two terms with its semantics nowhere. The author
+    # is a local 27-30B model that cannot introspect the API, `bridle skill vocab` prints this string
+    # and nothing else, and its own help calls it "the payload you put in the authoring model's
+    # prompt" — so a grammar that is not in here is a grammar the author was never given.
+    #
+    # Each group below is one thing an author cannot write the document without. Grouped rather than
+    # listed flat so a failure says WHICH rule went missing, not "a substring is absent".
+    grammar = {
+        "every top-level key, required and optional": [
+            "name:", "kind:", "contract:", "env_id", "scene:", "reward:", "success:",
+            "params:", "init:", "reward_scale", "preflight",
+        ],
+        "the two schema rules beyond the term vocabulary (phase2-decisions §3)": [
+            "EVERY scene object declares a `type`", "severity",
+        ],
+        "`why:` is mandatory and not inherited": [
+            "`why:` IS MANDATORY ON EVERY ROW", "never inherited",
+        ],
+        "the three row tiers, each with an example": [
+            "THREE TIERS OF ROW", "- {term:", "- {expr:", "- {custom:",
+        ],
+        "the tier-1 `params.hover` vs tier-2 bare-`hover` asymmetry": [
+            "`params.` IS SPELLED TWO WAYS", "params.hover", "bare `hover`",
+        ],
+        "all three `mode` values and what each does to the fold": [
+            "`add` (default), `acc + x`", "`replace`, `where(condition, value, acc-over-scope)`",
+            "`floor`, `max(acc, value)`", "scope: preceding",
+        ],
+        "the fold is ordered, so row order is part of the program": [
+            "ROW ORDER IS THE PROGRAM", "acc = row(acc)",
+        ],
+    }
+    for rule, fragments in grammar.items():
+        absent = [f for f in fragments if f not in doc]
+        check(f"the payload states {rule}"
+              + (f" — missing: {absent}" if absent else ""), not absent)
+
+    # The measured shape of the C2 defect, restated as one check: the whole reason it survived
+    # review is that every individual token above reads like an implementation detail, while their
+    # JOINT absence is "the document grammar is not in the document".
+    never_again = ["params.", "reward_scale", "severity", "scene:", "kind:", "preflight",
+                   "contract:", "expr:", "custom:", "init:", "- term:", "name:", "reward:"]
+    zero_again = [t for t in never_again if doc.count(t) == 0]
+    check("...and none of the 13 tokens whose count was zero on 2026-08-13 is zero again"
+          + (f" — zero again: {zero_again}" if zero_again else ""), not zero_again)
 
 
 def test_bridle():
