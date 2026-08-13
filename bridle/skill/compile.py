@@ -274,6 +274,13 @@ _UNIMPLEMENTED = {
              "silently pick one"),
     ("ProgressPotential", "terminal_zero"): (
         False, "forcing the potential to zero on the terminal step is not implemented"),
+    ("ProgressPotential", "reseed_on_restore"): (
+        True, "NOT re-seeding is what is unimplemented here, so `true` is the only honest value. "
+              "`skill_env.build_reset_fn` re-reads every stateful row's buffer from the post-reset "
+              "state for the resetting rows and does it unconditionally (its `anchor`, rows-only per "
+              "`ProgressPotential.doc`'s partial-reset rule); nothing reads this flag. `false` was "
+              "therefore accepted, hashed into the plan fingerprint, and folded as `true` anyway — "
+              "the silently-ignored parameter this whole tier exists to refuse. Delete the key"),
 }
 
 

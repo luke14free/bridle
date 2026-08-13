@@ -72,7 +72,7 @@ from bridle.skill.compile import (
 from bridle.skill.compile import (
     _bind_number, _clamp, _CONTACT_SURFACE_MEASURES, _derive_contact_surfaces,
     _derive_peaked_kernels, _HONOURED, _KERNEL_PEAK_IS_NOT_AT_SETPOINT, _max, _min, _PEAKED_KERNELS,
-    _relu, _SCOPE_REACH, _where, _ZERO_IS_NOT_A_CONTACT_SURFACE,
+    _relu, _SCOPE_REACH, _UNIMPLEMENTED, _where, _ZERO_IS_NOT_A_CONTACT_SURFACE,
 )
 from bridle.skill.spec import SpecError, parse_spec
 from bridle.skill.vocab import (
@@ -1062,8 +1062,8 @@ def run_checks():
           set(_HONOURED) == {("VelocityPenalty", "body"), ("SuccessBonus", "scope"),
                              ("PredicateBonus", "scope")})
 
-    # THE `_UNIMPLEMENTED` TABLE, ALL FOUR ENTRIES. Only `DistancePull.axes` above was exercised;
-    # the other three were a table nothing read. `gamma` is the one whose own comment says the two
+    # THE `_UNIMPLEMENTED` TABLE, ALL FIVE ENTRIES. Only `DistancePull.axes` above was exercised;
+    # the other four were a table nothing read. `gamma` is the one whose own comment says the two
     # readings of it (`prev - gamma*m` vs `gamma*(prev - m)`) are DIFFERENT REWARDS, so an entry
     # that silently stopped refusing would pick one of them on the author's behalf.
     def potential_row_edited(**changes):
@@ -1079,10 +1079,29 @@ def run_checks():
             "reward[2].gamma", "prev - gamma*m", "gamma*(prev - m)", horizon=HORIZON)
     refuses("a ProgressPotential `terminal_zero`", potential_row_edited(terminal_zero=True),
             "reward[2].terminal_zero", "terminal step", horizon=HORIZON)
+    # 2026-08-13 review, I3: `reseed_on_restore` was the one declared param with no `_HONOURED`
+    # entry, no `_UNIMPLEMENTED` entry and NO READER — `reseed_on_restore: false` compiled clean,
+    # landed in the Op's params, hashed into the plan fingerprint, and was folded as `true` anyway
+    # because `build_reset_fn` re-anchors every stateful row unconditionally. Note the polarity is
+    # the opposite of its four siblings: `true` is the safe value here, because re-seeding is what
+    # IS implemented, so a test that only asserted "some value is refused" would pass while the
+    # table refused the deployed default.
+    refuses("a ProgressPotential `reseed_on_restore: false` nothing implements",
+            potential_row_edited(reseed_on_restore=False),
+            "reward[2].reseed_on_restore", "unconditionally", "Delete the key", horizon=HORIZON)
     check("...and each entry's own OFF value still compiles, so these are refusals and not a ban",
-          error_from(plan_of, potential_row_edited(gamma=1.0, terminal_zero=False),
-                     horizon=HORIZON) is None
+          error_from(plan_of, potential_row_edited(gamma=1.0, terminal_zero=False,
+                                                   reseed_on_restore=True), horizon=HORIZON) is None
           and error_from(plan_of, row_edited(3, enabled_if=None), horizon=HORIZON) is None)
+    check("...and the DEFAULT ProgressPotential row (no key written) still compiles — the refusal "
+          "must not fire on the value the vocabulary hands the author",
+          error_from(plan_of, potential_doc(), horizon=HORIZON) is None)
+    check("...and every `_UNIMPLEMENTED` key is one of the five pinned above, so a sixth cannot "
+          "join the table untested",
+          set(_UNIMPLEMENTED) == {("DistancePull", "axes"), ("HingePenalty", "enabled_if"),
+                                  ("ProgressPotential", "gamma"),
+                                  ("ProgressPotential", "terminal_zero"),
+                                  ("ProgressPotential", "reseed_on_restore")})
 
     # The legal scope set is not a literal: it is `tuple(_SCOPE_REACH)`, the same table the fold
     # dispatches through. Teaching the table a second scope must therefore CHANGE THE FOLD — the
