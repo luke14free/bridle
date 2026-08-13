@@ -41,7 +41,7 @@ from enum import Enum
 
 __all__ = [
     "Sign", "Frame", "Measure", "MEASURES", "Param", "Predicate", "PREDICATES",
-    "Term", "TERMS", "Chassis", "CHASSIS", "vocab_document", "base_term",
+    "Term", "TERMS", "Chassis", "CHASSIS", "desugar_brackets", "vocab_document", "base_term",
 ]
 
 
@@ -301,6 +301,61 @@ PREDICATES = dict([
         ],
        "true iff at least `n` members of `over` satisfy `predicate` — forall's partial-credit sibling."),
 ])
+
+
+# ── the bracket sugar `success:` is written in ──────────────────────────────────────────────────
+# `all[a, b]` lowers to `and_(a, b)` and `any[...]` to `or_(...)`. It lives HERE, next to the
+# `and_`/`or_` it lowers to, and not in the adapter that evaluates it, because two tiers now read
+# it and each would otherwise keep its own copy: `spec._check_success` (schema tier, stdlib, no GPU)
+# and `skill_predicates._eval_predicate_text` (the evaluator). It was adapter-only until 2026-08-13,
+# which is exactly why `success:` reached the GPU unchecked — the schema tier could not name the
+# predicates in `all[grasped, centered_on_goal(0.045)]` without first undoing the brackets, so it
+# checked nothing at all and `centered_on_goal` (the design doc §4 example's own fake name) passed
+# `skill check` with exit 0 and a fingerprint. One desugarer, two readers, no second grammar.
+
+_BRACKET_SUGAR = {"all": "and_", "any": "or_"}
+
+
+def desugar_brackets(text):
+    """`all[a, b]` -> `and_(a, b)`, `any[...]` -> `or_(...)`.
+
+    The `success:` grammar is the one thing `spec.py` does not fully parse ("that grammar belongs to
+    whoever evaluates it"), and the document form in the design doc §4 and in the acceptance fixture
+    is the bracket one. It is sugar and nothing more: the bracket lowers to the `and_`/`or_` that
+    already exist in PREDICATES, so there is one set of semantics, not two.
+
+    THE MATCH IS ANCHORED AT A WORD BOUNDARY. It was not, and `all`/`any` are suffixes of ordinary
+    words: `overall[x]` rewrote to `overand_(x)` and `many[q]` to `mor_(q)` (measured 2026-08-13).
+    Neither is a legal predicate either way, so nothing was mis-EVALUATED — but the refusal named a
+    predicate the author never typed, and this file's whole premise is that the error message is the
+    API for an author who cannot introspect it.
+    """
+    out, depth_stack = [], []
+    i = 0
+    while i < len(text):
+        matched = None
+        # A sugar word only counts at the start of an identifier: `all[` yes, `overall[` no.
+        boundary = i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+        for word, replacement in (_BRACKET_SUGAR.items() if boundary else ()):
+            if text.startswith(word + "[", i):
+                matched = (word, replacement)
+                break
+        if matched:
+            out.append(matched[1] + "(")
+            depth_stack.append(len(out))
+            i += len(matched[0]) + 1
+            continue
+        char = text[i]
+        if char == "[":
+            depth_stack.append(None)
+            out.append(char)
+        elif char == "]":
+            opened = depth_stack.pop() if depth_stack else None
+            out.append(")" if opened is not None else "]")
+        else:
+            out.append(char)
+        i += 1
+    return "".join(out)
 
 
 # ── terms ────────────────────────────────────────────────────────────────────────────────────────

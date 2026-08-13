@@ -42,8 +42,11 @@ WHAT THIS MODULE DOES NOT DO — it is the schema tier, not the compiler (design
 tiers of feedback: schema -> compile -> preflight):
   - it does not check weight RELATIONSHIPS (shaping maxima below the success value, an attractor
     that must not peak at contact). Those need the horizon and the termination rule: `compile()`.
-  - it does not parse the `success:` criterion's grammar (`all[...]`, predicate calls) beyond its
-    `params.X` references. That grammar belongs to whoever evaluates it.
+  - it does not fully parse the `success:` criterion's grammar. It DOES refuse an unknown predicate
+    name in it (`_check_success`, 2026-08-13 review I2 — three malformed criteria used to reach the
+    GPU with `skill check OK, exit 0`), lowering the `all[...]`/`any[...]` sugar through the same
+    `vocab.desugar_brackets` the evaluator uses. Arity, argument types and the `ast` whitelist stay
+    with whoever evaluates it; duplicating them here is how two grammars start.
   - it does not resolve `contract:` to a real `Contract`, or `env_id` to a registered env.
 """
 import dataclasses
@@ -55,7 +58,9 @@ from bridle.preflight import DYNAMIC, STATIC
 from bridle.resolve import ADAPT, RETRAIN, RUN
 from bridle.skill.expr import Expr, ExprError
 from bridle.skill.expr import parse as parse_expr
-from bridle.skill.vocab import CHASSIS, MEASURES, PREDICATES, TERMS, Frame, Sign, base_term
+from bridle.skill.vocab import (
+    CHASSIS, MEASURES, PREDICATES, TERMS, Frame, Sign, base_term, desugar_brackets,
+)
 
 __all__ = [
     "SpecError", "Row", "SkillSpec", "parse_spec", "json_schema",
@@ -207,20 +212,56 @@ def _predicate_names(text):
     return set(_IDENT_RE.findall(text))
 
 
+def _check_predicate_names(path, text, declared_params, source=None):
+    """Refuse any identifier in a predicate expression that does not name a PREDICATES entry.
+
+    `text` is the expression whose names are read; `source` is what the AUTHOR wrote, which is what
+    a refusal quotes and what `params.X` is checked against. They differ for `success:`, where
+    `text` is the desugared form (`all[a, b]` -> `and_(a, b)`) and quoting it back would show the
+    author a line they did not type.
+
+    Shared by `reward[].predicate`/`gate` and by `success:` so the two cannot drift into two
+    different legal sets — the 2026-08-13 review's I2 is what happens when only one of them checks.
+    """
+    source = text if source is None else source
+    _check_param_refs(path, source, declared_params)
+    names = _predicate_names(text)
+    if not names:
+        raise SpecError(path, f"{source!r} names no predicate: a predicate field is a bare name "
+                              f"from the list below, or a call over them like "
+                              f"`and_(grasped, above_z(z=0.06))`", legal=PREDICATES)
+    for name in sorted(names):
+        if name not in PREDICATES:
+            raise _unknown(path, "predicate", name, PREDICATES)
+
+
 def _check_predicate(path, value, declared_params):
     if not isinstance(value, str) or not value.strip():
         raise SpecError(path, "a predicate is named by a non-empty string (a bare name, or a call "
                               "over existing names like `and_(grasped, above_z(z=0.06))`)",
                         legal=PREDICATES)
-    _check_param_refs(path, value, declared_params)
-    names = _predicate_names(value)
-    if not names:
-        raise SpecError(path, f"{value!r} names no predicate: a predicate field is a bare name from "
-                              f"the list below, or a call over them like "
-                              f"`and_(grasped, above_z(z=0.06))`", legal=PREDICATES)
-    for name in sorted(names):
-        if name not in PREDICATES:
-            raise _unknown(path, "predicate", name, PREDICATES)
+    _check_predicate_names(path, value, declared_params)
+
+
+def _check_success(text, declared_params):
+    """The `success:` criterion, checked for unknown predicate names BEFORE any GPU is spent.
+
+    UNTIL 2026-08-13 THIS RAN NO NAME CHECK AT ALL — only `_require_text` and `_check_param_refs`.
+    Measured on the deployed `descend_to_target/skill.yaml` with the criterion swapped:
+    `all[grasped, centered_on_goal(0.045)]`, `grasped and low` and `forall(grasped, over=bricks)`
+    each reported `skill check OK, exit 0` and produced a plan fingerprint. `centered_on_goal` is
+    the design doc §4 example's OWN name for a predicate that does not exist, so an author copying
+    the worked example got a clean check, a stamped plan, and the refusal at first evaluation on a
+    GPU. `reward[].predicate` was never exposed to this — `_check_predicate` has caught both
+    call-position and bare-operand typos since 2026-08-12; the gap was that `success:` may be
+    written with the bracket sugar, and undoing that was the adapter's private business.
+
+    It is the SAME check over the SAME desugaring the evaluator uses (`vocab.desugar_brackets`), so
+    a name this tier accepts is a name `skill_predicates` can look up. What it deliberately does NOT
+    do is validate arity, argument types or the `ast` whitelist: those belong to the evaluator, and
+    duplicating them here is how two grammars start.
+    """
+    _check_predicate_names("success", desugar_brackets(text), declared_params, source=text)
 
 
 def _check_param_refs(path, text, declared_params):
@@ -802,7 +843,7 @@ def parse_spec(doc: dict) -> SkillSpec:
     reward = tuple(_parse_row(i, row, chassis, params) for i, row in enumerate(rows))
 
     success = _require_text("success", doc["success"])
-    _check_param_refs("success", success, params)
+    _check_success(success, params)
 
     preflight = _parse_preflight(doc["preflight"]) if "preflight" in doc else {}
 

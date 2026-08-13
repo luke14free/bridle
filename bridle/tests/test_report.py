@@ -59,7 +59,11 @@ def reach_doc():
             {"term": "ActionPenalty",
              "why": "the same 0.001/l2 as all 15 audited primitives, inherited, applied last."},
         ],
-        "success": "within_radius(tcp_to_object, params.tol)",
+        # `anchor` names a POINT in the scene, not a measure. This read `within_radius(tcp_to_object,
+        # params.tol)` until 2026-08-13 — a measure in the anchor slot, which `_anchor_xy` would have
+        # refused at step 0 as "not an attribute of the env" and which no tier caught, because
+        # `success:` was checked by none (review I2).
+        "success": "within_radius(anchor=target_pos, radius_expr=params.tol)",
     }
 
 

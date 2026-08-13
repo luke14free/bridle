@@ -934,9 +934,34 @@ def run_checks():
     # IF EITHER OF THESE CHANGES, that is the finding — do not re-pin to make the suite green. Find
     # what moved, and state whether the rewards already trained under this compiler still hold.
     #
-    #   28f4a705d261  the deployed descend document's plan fingerprint (`skills/descend.yaml` as
+    #   904cf2b152a4  the deployed descend document's plan fingerprint (`skills/descend.yaml` as
     #                 `test_skillspec.descend_doc()` builds it). sha256 over the plan's canonical
     #                 JSON, truncated to 12 hex. It is the same digest a stamped checkpoint carries.
+    #
+    #                 IT MOVED ONCE, 2026-08-13, from `28f4a705d261`, and here is the whole account
+    #                 of why — because "re-pinned to make the suite green" is exactly what this
+    #                 comment forbids. NOTHING IN THE COMPILER CHANGED. The FIXTURE's `success:`
+    #                 line did: it read `centered_on_goal(params.center_tol)`, which is the design
+    #                 doc §4 example's own name for a predicate that is not in `vocab.PREDICATES`
+    #                 and never was (`test_skillspec.SECTION4_SUCCESS_VERBATIM` keeps the text and
+    #                 pins the refusal). Review I2 found `success:` was validated by NO tier before
+    #                 the GPU, so the primary 344-check fixture had been carrying an uncompilable
+    #                 criterion since it landed. It now writes the vocabulary's own name for the
+    #                 same test, `within_radius(anchor=target_pos, radius_expr=params.center_tol)`.
+    #                 The criterion is carried on the SuccessBonus op as `condition`
+    #                 (`_lower_term_row`) precisely so that changing it is a different digest, so
+    #                 this move is that mechanism working.
+    #
+    #                 THE EVIDENCE THAT ONLY THE CRITERION MOVED, and it is checked below, not
+    #                 asserted here: the fold pin did not move at all (4.79826020570353, unchanged
+    #                 across the edit), and swapping in a THIRD valid criterion moves the digest
+    #                 while leaving that fold identical. Nine weights, nine kernels and the fold
+    #                 order are therefore all provably untouched.
+    #
+    #                 NO TRAINED CHECKPOINT IS AFFECTED. This digest belongs to the test fixture.
+    #                 The digest of the document that actually ships,
+    #                 `primitives/descend_to_target/skill.yaml`, is `plan@95babe2a3cc5` and was
+    #                 re-checked through `bridle skill check` before and after: unmoved.
     #   4.79826020570353  the UNSCALED fold of that plan over `values()` — one non-success step of
     #                 descend: grasped, 3mm below the 0.015 hover setpoint, 2cm off centre, jaw at
     #                 -0.70, nothing crushed, ||a|| = 2.0. Unscaled because parity is against
@@ -944,14 +969,23 @@ def run_checks():
     #                 Nine rows fold into it, so the digits are load-bearing: a term dropped, a
     #                 kernel changed, or a weight rebound moves them.
     check("the descend plan's ABSOLUTE fingerprint is unchanged (a reward trained under this "
-          f"compiler is no longer reproducible if this moves) — got {fp}", fp == "28f4a705d261")
+          f"compiler is no longer reproducible if this moves) — got {fp}", fp == "904cf2b152a4")
     check("the descend plan's ABSOLUTE unscaled fold over one non-success step is unchanged — got "
           f"{off!r}", close(off, 4.79826020570353))
+    # The account above claims the 2026-08-13 move was the `success:` criterion and nothing else.
+    # This is that claim as an executable check rather than a comment: a THIRD valid criterion moves
+    # the digest and leaves the fold bit-identical, so the criterion is provably in the digest's
+    # input and provably not in this fold's — which is what makes the fold pin an independent
+    # witness that no weight, kernel or fold order moved with it.
+    other_criterion = plan_of(dict(descend_doc(), success="grasped"), horizon=HORIZON)
+    check("...and the digest tracks the success criterion while the fold does not, which is why the "
+          "unmoved fold pin is evidence that only the criterion moved",
+          other_criterion.fingerprint() != fp and close(folded(other_criterion, v_off), off))
     # ...and the two pins are not each other's alias: the fold is pinned to 1e-12, so a change too
     # small to move the digest's input still moves the number, and a `why`-only edit moves neither.
     check("...and a weight edit moves BOTH, so neither pin is a constant this file could satisfy "
           "by accident",
-          plan_of(row_edited(1, weight=1.6), horizon=HORIZON).fingerprint() != "28f4a705d261"
+          plan_of(row_edited(1, weight=1.6), horizon=HORIZON).fingerprint() != "904cf2b152a4"
           and not close(folded(plan_of(row_edited(1, weight=1.6), horizon=HORIZON), v_off),
                         4.79826020570353))
 

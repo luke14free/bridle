@@ -3,8 +3,10 @@
 WHAT THIS IS: a parser and evaluator, not an env adapter. A `gate:`, a `predicate:` and a `success:`
 line in a skill document are all the same little language — a bare vocabulary name, or a call over
 vocabulary names (`and_(grasped, above_z(z=0.06))`), plus the bracket sugar `all[...]`/`any[...]`
-the design doc §4 and the acceptance fixture write. This module owns that language end to end: the
-`ast` whitelist, the desugarer, argument resolution, and the seventeen predicates themselves.
+the design doc §4 and the acceptance fixture write. This module owns the EVALUATION of that
+language: the `ast` whitelist, argument resolution, and the seventeen predicates themselves. The
+bracket desugarer is `vocab.desugar_brackets` and is imported, not copied — the schema tier refuses
+against the same lowering this file evaluates (2026-08-13 review, I2).
 
 WHY IT IS NOT IN `skill_env.py`. It re-implements the whitelist discipline `bridle/skill/expr.py`
 already owns for reward expressions, for the same stated reason (the author is a 27-30B model, so
@@ -32,7 +34,7 @@ assert at the bottom runs in `bridle/tests/`.
 """
 import ast
 
-from bridle.skill.vocab import PREDICATES
+from bridle.skill.vocab import PREDICATES, desugar_brackets
 
 
 class SkillEnvError(Exception):
@@ -67,49 +69,12 @@ def _norm(v):
 _PRED_NODES = frozenset({ast.Expression, ast.Call, ast.Name, ast.Constant, ast.Load, ast.keyword,
                          ast.UnaryOp, ast.USub, ast.UAdd, ast.List, ast.Tuple})
 
-_BRACKET_SUGAR = {"all": "and_", "any": "or_"}
-
-
-def _desugar_brackets(text):
-    """`all[a, b]` -> `and_(a, b)`, `any[...]` -> `or_(...)`.
-
-    The `success:` grammar is the one thing `spec.py` explicitly does NOT parse ("that grammar
-    belongs to whoever evaluates it"), and the document form in the design doc §4 and in the
-    acceptance fixture is the bracket one. It is sugar and nothing more: the bracket lowers to the
-    `and_`/`or_` that already exist in PREDICATES, so there is one set of semantics, not two.
-
-    THE MATCH IS ANCHORED AT A WORD BOUNDARY. It was not, and `all`/`any` are suffixes of ordinary
-    words: `overall[x]` rewrote to `overand_(x)` and `many[q]` to `mor_(q)` (measured 2026-08-13).
-    Neither is a legal predicate either way, so nothing was mis-EVALUATED — but the refusal named a
-    predicate the author never typed, and this file's whole premise is that the error message is the
-    API for an author who cannot introspect it.
-    """
-    out, depth_stack = [], []
-    i = 0
-    while i < len(text):
-        matched = None
-        # A sugar word only counts at the start of an identifier: `all[` yes, `overall[` no.
-        boundary = i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
-        for word, replacement in (_BRACKET_SUGAR.items() if boundary else ()):
-            if text.startswith(word + "[", i):
-                matched = (word, replacement)
-                break
-        if matched:
-            out.append(matched[1] + "(")
-            depth_stack.append(len(out))
-            i += len(matched[0]) + 1
-            continue
-        char = text[i]
-        if char == "[":
-            depth_stack.append(None)
-            out.append(char)
-        elif char == "]":
-            opened = depth_stack.pop() if depth_stack else None
-            out.append(")" if opened is not None else "]")
-        else:
-            out.append(char)
-        i += 1
-    return "".join(out)
+#: THE DESUGARER MOVED UP A LAYER (2026-08-13 review, I2). It is `vocab.desugar_brackets` now, next
+#: to the `and_`/`or_` it lowers to, because the SCHEMA tier has to undo the brackets before it can
+#: name the predicates inside `all[...]` — and while this module was its only home, `success:` was
+#: checked by no tier before the GPU. Imported rather than copied: two desugarers is two grammars,
+#: and the one this file evaluates must be the one `spec.py` refused against.
+_desugar_brackets = desugar_brackets
 
 
 class _Args:

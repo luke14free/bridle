@@ -57,6 +57,15 @@ FAILS = []
 
 DROP = object()  # sentinel: remove this key rather than set it
 
+#: §4's success line EXACTLY as the design doc prints it. `centered_on_goal` is not in
+#: `vocab.PREDICATES` and never was — it is the worked example's own fake name, which is what makes
+#: it the worst possible thing to be silently accepted: an author copying §4 writes it. It is kept
+#: here as a constant rather than deleted because it is the input a refusal has to be demonstrated
+#: against, and because `scripts/probe_skill_env.py` (lego-arm, GPU) asserts on that refusal.
+#: Until 2026-08-13 this text was `descend_doc()`'s own success line and 344 checks passed over it.
+SECTION4_SUCCESS_VERBATIM = ("all[grasped, height_above_resting_in(params.low_band), "
+                             "centered_on_goal(params.center_tol)]")
+
 
 def check(name, cond):
     print(f"  {'PASS' if cond else 'FAIL'}  {name}")
@@ -120,8 +129,10 @@ def descend_doc():
             {"term": "ActionPenalty", "weight": 0.001, "norm": "l2",
              "why": "same 0.001/l2 as all 15 primitives; applied after the replace so it survives."},
         ],
+        # ...and §4's `centered_on_goal` is not a predicate either — see SECTION4_SUCCESS_VERBATIM
+        # below. `within_radius` is the vocabulary's name for the same test.
         "success": "all[grasped, height_above_resting_in(params.low_band), "
-                   "centered_on_goal(params.center_tol)]",
+                   "within_radius(anchor=target_pos, radius_expr=params.center_tol)]",
         "preflight": {
             "static": {"descend_env._CENTER_TOL": {"max": 0.030}},
             "dynamic": {"descend_low_once": {"min": 0.5, "needs": "warm_start"},
@@ -589,6 +600,52 @@ def run_checks():
             "lowband", "low_band", path="success")
     check("the success criterion's declared params.X references are accepted",
           parse_spec(descend_doc()).success.endswith("params.center_tol)]"))
+
+    # ── `success:` NAMES REAL PREDICATES (2026-08-13 review, I2) ─────────────────────────────────
+    # Until this landed, `success:` ran `_require_text` + `_check_param_refs` and NOTHING ELSE, so
+    # every criterion below reported `skill check OK, exit 0` against the deployed
+    # `descend_to_target/skill.yaml` and produced a plan fingerprint. The one that matters is the
+    # first: `centered_on_goal` is the design doc §4 worked example's OWN name, so the failure mode
+    # is an author copying the example we hand them and finding out at first GPU evaluation.
+    #
+    # The sugar is why this could not just reuse `_check_predicate`: `all[...]` has to be lowered
+    # before the names inside it can be read, and the desugarer lived in the adapter. It is
+    # `vocab.desugar_brackets` now — the SAME function the evaluator lowers with, so a name this
+    # tier accepts is a name `skill_predicates.PREDICATE_FNS` can look up.
+    refuses("§4's own success line, verbatim — a predicate that does not exist",
+            doc_with(success=SECTION4_SUCCESS_VERBATIM), "centered_on_goal", path="success")
+    refuses("...the same name outside the bracket sugar, so the check is not sugar-only",
+            doc_with(success="centered_on_goal(0.045)"), "centered_on_goal", path="success")
+    refuses("Python's `and` instead of the vocabulary's `and_`",
+            doc_with(success="grasped and low"), "and", path="success", suggestion="and_")
+    refuses("a bare operand typo inside `any[...]`, the OTHER sugar word",
+            doc_with(success="any[grasped, graspd]"), "graspd", path="success",
+            suggestion="grasped")
+    refuses("a typo in a nested call's operand, which is where a compound criterion puts them",
+            doc_with(success="all[grasped, not_(graspd)]"), "graspd", path="success")
+    refuses("a MEASURE where a predicate belongs — the two vocabularies are not interchangeable",
+            doc_with(success="height_above_seat_live"), "height_above_seat_live", path="success")
+    # The word-boundary property, at the tier that now reads it: `overall[` must not lower to
+    # `overand_(`, or the refusal names a predicate the author never typed.
+    exc = refuses("`overall[...]` is not the `all[...]` sugar", doc_with(success="overall[grasped]"),
+                  path="success")
+    check("...and the refusal names `overall`, not the `overand_` a boundary-blind desugarer makes",
+          "overall" in str(exc) and "overand_" not in str(exc))
+    # ...and it accepts, so this is a check and not a ban on writing a success line.
+    for legal in ("grasped",
+                  "all[grasped, below_resting_height(band=0.01)]",
+                  "any[grasped, not_grasped]",
+                  "latched(within_radius(anchor=target_pos, radius_expr=0.05))",
+                  "and_(terms=[grasped, above_z(z=0.06)])",
+                  "sustained(grasped, k=3, consecutive=False)"):
+        check(f"...and a legal criterion still parses: {legal!r}",
+              error_from(doc_with(success=legal)) is None)
+    # The refusal quotes what the AUTHOR wrote, never the desugared form — the whole premise is that
+    # the message is the API for a model that cannot introspect the desugarer.
+    empty = refuses("a success line with no identifier in it at all", doc_with(success="0.045"),
+                    path="success")
+    check("...and it quotes the author's own text, not the lowered form",
+          "'0.045'" in str(empty))
     refuses("a param with no value", doc_with(params={"hover": {"severity": "retrain"}}),
             "value", path="params.hover.value")
     refuses("a param with an unknown severity",
