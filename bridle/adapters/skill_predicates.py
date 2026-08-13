@@ -34,7 +34,9 @@ assert at the bottom runs in `bridle/tests/`.
 """
 import ast
 
-from bridle.skill.vocab import PREDICATES, desugar_brackets
+from bridle.skill.vocab import (
+    PREDICATES, QUANTIFIER_PREDICATES, UNIMPLEMENTED_PREDICATE_REASON, desugar_brackets,
+)
 
 
 class SkillEnvError(Exception):
@@ -341,13 +343,13 @@ def _p_latched(ctx, args):
     return latch.clone()
 
 
-def _unimplemented_quantifier(name, over_doc):
+def _unimplemented_quantifier(name):
+    """A PREDICATES entry that raises instead of evaluating. Same sentence `compile.py` refuses with
+    — `vocab.UNIMPLEMENTED_PREDICATE_REASON`, one text, so the tier that refuses first and the tier
+    that would raise second cannot describe the hole differently."""
     def fn(ctx, args):
-        raise SkillEnvError(
-            f"`{name}` quantifies over a COLLECTION ({over_doc}) and this phase does not build one: "
-            f"the `scene:` block is parsed and fingerprinted but is not synthesised into env objects "
-            f"(phase2-decisions, scope limit), so there is nothing to enumerate. Write the criterion "
-            f"over the single held object, or wait for the scene-generation phase")
+        raise SkillEnvError(f"`{name}` {UNIMPLEMENTED_PREDICATE_REASON}")
+    fn.unimplemented = True     # read by the coverage guard below, and CHECKED there by calling it
     return fn
 
 
@@ -367,14 +369,47 @@ PREDICATE_FNS = {
     "not_": _p_not,
     "sustained": _p_sustained,
     "latched": _p_latched,
-    "forall": _unimplemented_quantifier("forall", "e.g. 'bricks_in_bin'"),
-    "for_n": _unimplemented_quantifier("for_n", "e.g. 'bricks_in_bin'"),
+    "forall": _unimplemented_quantifier("forall"),
+    "for_n": _unimplemented_quantifier("for_n"),
 }
 
 assert set(PREDICATE_FNS) == set(PREDICATES), (
     f"PREDICATE_FNS and vocab.PREDICATES disagree: missing "
     f"{sorted(set(PREDICATES) - set(PREDICATE_FNS))}, extra "
     f"{sorted(set(PREDICATE_FNS) - set(PREDICATES))}")
+
+
+def _behaves_as_stub(fn):
+    """Does this entry RAISE by construction rather than evaluate anything?
+
+    CALLED, NOT ASKED. The assert above is set EQUALITY over KEYS, so it reported 17/17 coverage
+    while two of the seventeen were `_unimplemented_quantifier` — key presence is not behaviour, and
+    a guard that cannot tell an implemented predicate from a stub is the same defect class as the
+    advertised-but-unimplemented predicate it exists to prevent (2026-08-13 review, I4). So the
+    guard below invokes every entry with a null context: a real predicate reaches for `ctx.measure`
+    / `ctx.info` / `args` and dies of `AttributeError`, while a stub raises `SkillEnvError` before
+    touching either. Implementing `forall` for real therefore turns this red until the name is
+    removed from `vocab.QUANTIFIER_PREDICATES` — which is the direction the drift can safely run.
+
+    The `unimplemented` FLAG is checked too, and against the call rather than instead of it: a flag
+    alone is one more declaration free to disagree with the code, which is the whole finding.
+    """
+    try:
+        fn(None, None)
+    except SkillEnvError:
+        return True
+    except BaseException:      # noqa: BLE001 — anything else means it tried to do real work
+        return False
+    return False
+
+
+_STUBS = {name for name, fn in PREDICATE_FNS.items() if _behaves_as_stub(fn)}
+assert _STUBS == set(QUANTIFIER_PREDICATES) == {n for n, f in PREDICATE_FNS.items()
+                                                if getattr(f, "unimplemented", False)}, (
+    f"the coverage guard and the vocabulary disagree about which predicates are STUBS: called and "
+    f"found {sorted(_STUBS)}, vocabulary declares {sorted(QUANTIFIER_PREDICATES)}, flagged "
+    f"{sorted(n for n, f in PREDICATE_FNS.items() if getattr(f, 'unimplemented', False))}. "
+    f"{len(PREDICATE_FNS) - len(_STUBS)} of {len(PREDICATE_FNS)} predicates are evaluable")
 
 
 def _eval_predicate_node(ctx, node, source):

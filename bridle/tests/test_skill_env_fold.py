@@ -1105,6 +1105,26 @@ def run_checks():
           f"unaccounted: "
           f"{sorted(set(SE.PREDICATE_FNS) ^ (pinned_here | pinned_in_j | refuse_here))}")
 
+    # L1 THE COVERAGE GUARD ITSELF (2026-08-13 review, I4). The import-time assert in
+    # `skill_predicates` is set EQUALITY over KEYS, so it reported 17/17 for 15 evaluable predicates
+    # — it measured key presence, not behaviour, which is the same defect class as the
+    # advertised-but-unimplemented predicate it exists to prevent. It now CALLS every entry with a
+    # null context and partitions on what comes back. These checks are what stop that call being
+    # replaced by a flag lookup, which would put the declaration back where the drift was.
+    import bridle.adapters.skill_predicates as SP
+    check("L1 the guard finds the stubs by CALLING them, and finds exactly the two",
+          SP._STUBS == {"forall", "for_n"}, f"found {sorted(SP._STUBS)}")
+    check("...and it does not simply call everything a stub: 15 of the 17 are evaluable",
+          len(SP.PREDICATE_FNS) - len(SP._STUBS) == 15)
+    check("...and an evaluator dies of something OTHER than SkillEnvError on a null ctx, which is "
+          "the distinction the guard rests on",
+          not SP._behaves_as_stub(SP.PREDICATE_FNS["grasped"])
+          and SP._behaves_as_stub(SP.PREDICATE_FNS["forall"]))
+    check("...and a hand-written function that merely LOOKS unimplemented is judged by its "
+          "behaviour, not by its flag",
+          SP._behaves_as_stub(lambda ctx, args: (_ for _ in ()).throw(SP.SkillEnvError("no")))
+          and not SP._behaves_as_stub(lambda ctx, args: 1.0))
+
 
 def _run_and_collect():
     """Run the checks and turn an ABORT into a recorded failure.

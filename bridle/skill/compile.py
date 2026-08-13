@@ -61,8 +61,11 @@ from warnings import warn      # `warn`, not `warnings`: `RewardPlan.warnings` i
                                # both the stdlib module and a plan attribute is a reader-trap.
 
 from bridle.skill.expr import Expr
-from bridle.skill.spec import ROW_TERMS, SkillSpec
-from bridle.skill.vocab import MEASURES, TERMS, Sign
+from bridle.skill.spec import ROW_TERMS, SkillSpec, _predicate_names
+from bridle.skill.vocab import (
+    MEASURES, PREDICATES, QUANTIFIER_PREDICATES, TERMS, UNIMPLEMENTED_PREDICATE_REASON, Sign,
+    desugar_brackets,
+)
 
 __all__ = [
     "CompileError", "FloodingError", "Note", "Op", "RewardPlan", "UNBOUNDED",
@@ -282,6 +285,21 @@ _UNIMPLEMENTED = {
               "therefore accepted, hashed into the plan fingerprint, and folded as `true` anyway — "
               "the silently-ignored parameter this whole tier exists to refuse. Delete the key"),
 }
+
+
+#: The predicate half of the same tier. `_UNIMPLEMENTED` above covers PARAMETERS the vocabulary
+#: declares and this fold does not implement; `forall`/`for_n` are PREDICATES in exactly that
+#: position — legal names in `vocab.PREDICATES`, with a stub for an implementation. Before
+#: 2026-08-13 (review I4) a document using one passed both pre-GPU tiers and raised at the first
+#: control step, and the vocabulary's own text called `forall` "what 'all bricks in the bin' needs"
+#: with no caveat. The refusal is HERE and not in `spec.py` for the reason the module docstring
+#: gives: the schema tier owns "is this a legal name", the compile tier owns "legal, and this
+#: implementation does not do it".
+def _check_predicates_evaluable(path, text):
+    used = sorted(_predicate_names(desugar_brackets(text)) & set(QUANTIFIER_PREDICATES))
+    if used:
+        raise CompileError(path, f"`{used[0]}` {UNIMPLEMENTED_PREDICATE_REASON}",
+                           legal=sorted(set(PREDICATES) - set(QUANTIFIER_PREDICATES)))
 
 
 def _check_honoured(path, term, name, value):
@@ -594,6 +612,8 @@ def _lower_term_row(index, row, spec):
             elif isinstance(value, str):
                 value = _bind_text(f"{path}.{name}", value, spec.params)
         _check_honoured(path, term, name, value)
+        if name in ("predicate", "gate") and isinstance(value, str):
+            _check_predicates_evaluable(f"{path}.{name}", value)
         values[name] = value
 
     _check_row_semantics(path, term, values)
@@ -1058,6 +1078,11 @@ def compile_spec(spec: SkillSpec, *, horizon=None, terminate_on_success=None) ->
         raise CompileError("terminate_on_success",
                            f"terminate_on_success is True, False or None (unknown), got "
                            f"{terminate_on_success!r}", legal=["True", "False", "None"])
+
+    # `success:` is checked HERE and not on the SuccessBonus row that carries it as `condition`: a
+    # document with no SuccessBonus row still has a success criterion, and it is still what
+    # `build_success_fn` evaluates on the GPU.
+    _check_predicates_evaluable("success", spec.success)
 
     ops = tuple(_lower_row(i, row, spec) for i, row in enumerate(spec.reward))
 

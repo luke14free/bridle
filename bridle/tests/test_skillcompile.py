@@ -76,7 +76,8 @@ from bridle.skill.compile import (
 )
 from bridle.skill.spec import SpecError, parse_spec
 from bridle.skill.vocab import (
-    CHASSIS, MEASURES, TERMS, Frame, Measure, Sign, base_term, vocab_document,
+    CHASSIS, MEASURES, PREDICATES, QUANTIFIER_PREDICATES, TERMS, Frame, Measure, Sign, base_term,
+    vocab_document,
 )
 from bridle.tests.test_skillspec import descend_doc, doc_with, row_edited
 
@@ -1136,6 +1137,32 @@ def run_checks():
                                   ("ProgressPotential", "gamma"),
                                   ("ProgressPotential", "terminal_zero"),
                                   ("ProgressPotential", "reseed_on_restore")})
+
+    # THE PREDICATE HALF OF THE SAME TIER (2026-08-13 review, I4). `forall`/`for_n` are legal names
+    # in `vocab.PREDICATES` with a stub for an implementation, so before this they passed BOTH
+    # pre-GPU tiers and raised at the first control step — and the payload the author reads called
+    # `forall` "what 'all bricks in the bin' needs", with no caveat. Every position a predicate can
+    # occupy is checked, because a refusal that covers `success:` and not `gate:` is a hole in the
+    # shape of the one being closed.
+    refuses("`forall` in the success criterion", dict(descend_doc(), success="forall(grasped, "
+            "over=bricks)"), "forall", "COLLECTION", "scene-generation phase", horizon=HORIZON)
+    refuses("`for_n` inside the bracket sugar, which has to be lowered before it is visible",
+            dict(descend_doc(), success="all[grasped, for_n(grasped, over=bricks, n=2)]"),
+            "for_n", "COLLECTION", horizon=HORIZON)
+    refuses("`forall` in a row's `predicate:`", row_edited(0, predicate="forall(grasped, over=b)"),
+            "reward[0].predicate", "forall", horizon=HORIZON)
+    refuses("`forall` in a row's `gate:`", row_edited(1, gate="forall(grasped, over=b)"),
+            "reward[1].gate", "forall", horizon=HORIZON)
+    quantifier_msg = str(error_from(plan_of, dict(descend_doc(), success="forall(grasped, over=b)"),
+                                    horizon=HORIZON))
+    check("...and the refusal states a legal set that does NOT re-offer the two it just refused",
+          all(q not in quantifier_msg.split("legal values:")[-1] for q in ("forall", "for_n")))
+    check("...and a document that uses neither still compiles, so this is a refusal not a ban on "
+          "predicates", error_from(plan_of, descend_doc(), horizon=HORIZON) is None)
+    check("the compile tier's quantifier set IS the vocabulary's, not a second literal — deleting a "
+          "name there deletes the refusal here",
+          set(QUANTIFIER_PREDICATES) == {"forall", "for_n"}
+          and set(QUANTIFIER_PREDICATES) <= set(PREDICATES))
 
     # The legal scope set is not a literal: it is `tuple(_SCOPE_REACH)`, the same table the fold
     # dispatches through. Teaching the table a second scope must therefore CHANGE THE FOLD — the

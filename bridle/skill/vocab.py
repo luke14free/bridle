@@ -292,15 +292,40 @@ PREDICATES = dict([
             Param("predicate", "predicate", None, "predicate evaluated per member", True),
             Param("over", "str", None, "collection to quantify over, e.g. 'bricks_in_bin'", True),
         ],
-       "true iff `predicate` holds for every member of `over`. What 'all bricks in the bin' needs."),
+       "NOT IMPLEMENTED — every document using it is REFUSED at compile time, before any GPU. True "
+       "iff `predicate` holds for every member of `over`; needs the `scene:` block synthesised into "
+       "env objects, which this phase does not do. Do not write it: express the criterion over the "
+       "single held object instead."),
 
     _p("for_n", [
             Param("predicate", "predicate", None, "predicate evaluated per member", True),
             Param("over", "str", None, "the collection to quantify over", True),
             Param("n", "int", None, "minimum count of members satisfying predicate", True),
         ],
-       "true iff at least `n` members of `over` satisfy `predicate` — forall's partial-credit sibling."),
+       "NOT IMPLEMENTED — refused at compile time, same as `forall`. Would be true iff at least `n` "
+       "members of `over` satisfy `predicate`."),
 ])
+
+
+# ── the declared predicates nothing can evaluate ────────────────────────────────────────────────
+# THE VOCABULARY DECLARES THEM AND NO TIER COULD REFUSE THEM (2026-08-13 review, I4). Their
+# implementation is a stub that raises, and the import-time key-set assert in `skill_predicates` is
+# set EQUALITY, so it reported 17/17 coverage for 15 evaluable predicates — it measured key
+# presence, not behaviour, which is the same defect class as the advertised-but-unimplemented
+# predicate it exists to prevent. Three readers now share this one declaration: `compile.py` refuses
+# a document that uses one (before any GPU), `skill_predicates` raises the same sentence if one is
+# somehow reached, and its import-time guard CALLS every entry to check that exactly these two
+# behave as stubs. Deleting a name from here therefore forces the implementation to exist.
+
+QUANTIFIER_PREDICATES = ("forall", "for_n")
+
+UNIMPLEMENTED_PREDICATE_REASON = (
+    "quantifies over a COLLECTION and this phase does not build one: the `scene:` block is parsed "
+    "and fingerprinted but is NOT synthesised into env objects (phase2-decisions, scope limit), so "
+    "there is nothing to enumerate. Write the criterion over the single held object, or wait for "
+    "the scene-generation phase")
+
+assert all(name in PREDICATES for name in QUANTIFIER_PREDICATES)
 
 
 # ── the bracket sugar `success:` is written in ──────────────────────────────────────────────────
