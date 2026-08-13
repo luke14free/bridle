@@ -1169,6 +1169,72 @@ def run_checks():
           SP._behaves_as_stub(lambda ctx, args: (_ for _ in ()).throw(SP.SkillEnvError("no")))
           and not SP._behaves_as_stub(lambda ctx, args: 1.0))
 
+    # ── [M] DOCUMENT -> PLAN -> ADAPTER, end to end ──────────────────────────────────────────────
+    # THE INTERFACE CONTRACT NOTHING OWNED (2026-08-13 review, I8). Every other block in this file
+    # builds `Op`s by hand, deliberately — it is testing the FOLD, and hand-built ops are how a fold
+    # test stops being a compiler test. `test_skillcompile.py` never imports the adapter. So the one
+    # thing neither file could see was the seam BETWEEN them: what the compiler promises the adapter.
+    #
+    # `plan.measures_needed` is that promise. The adapter reads exactly the measures the plan names
+    # and hands them to the evaluator as its whole environment, so a measure the compiler forgets to
+    # name is not a slower fold, it is `ExprError: undefined name` at step 0. Measured: deleting the
+    # `expr` branch of `compile._measures_of` left ALL 21 test files green and produced exactly that
+    # at the first control step.
+    #
+    # The document below is the acceptance fixture plus one tier-2 row whose measure appears NOWHERE
+    # else in it — which M3 checks, because an expression over a measure some other row already
+    # needs cannot detect a dropped branch (tried first with `height_above_seat_live`: the fold was
+    # bit-identical with the branch deleted).
+    print("\n[M] document -> plan -> adapter")
+    from bridle.skill.compile import compile_spec
+    from bridle.skill.spec import parse_spec
+    from bridle.tests.test_skillspec import descend_doc
+    e2e_doc = dict(descend_doc())
+    e2e_doc["reward"] = list(e2e_doc["reward"]) + [
+        {"expr": "0.5 * (1 - tanh(4 * tcp_to_object))",
+         "why": "a tier-2 row whose only measure is named inside the expression — the shape that "
+                "`_measures_of` has a dedicated branch for."}]
+    with _warnings_off():
+        e2e_plan = compile_spec(parse_spec(e2e_doc), horizon=64)
+    check("M1 a real document compiles to a plan whose `measures_needed` includes a measure named "
+          "ONLY inside an `expr:` row", "tcp_to_object" in e2e_plan.measures_needed,
+          f"needed: {sorted(e2e_plan.measures_needed)}")
+    hand_written = {op.params.get("measure") for op in e2e_plan.ops}
+    check("M2 ...and that measure is reachable through no other row, so M1 cannot pass by accident",
+          "tcp_to_object" not in hand_written, f"named by a row: {sorted(n for n in hand_written if n)}")
+    def attempt(fn):
+        """The value, or whatever it raised — one broken call is one failed check, not an aborted
+        run. The mutation this block exists for RAISES, so catching it here is what lets the checks
+        after it still report."""
+        try:
+            return fn()
+        except BaseException as exc:      # noqa: BLE001 — see docstring
+            return exc
+
+    env_m, action_m = FakeEnv(), action_of(torch)
+    with _warnings_off():
+        folded_e2e = attempt(lambda: SE.build_reward_fn(e2e_plan, slots=SE.StateSlots())(
+            env_m, None, action_m, {}))
+    check("M3 the adapter FOLDS that plan without raising — the promise `measures_needed` makes is "
+          "kept end to end", torch.is_tensor(folded_e2e), f"{folded_e2e!r}")
+    if torch.is_tensor(folded_e2e):
+        with _warnings_off():
+            got_m, ref_m = fold_both(e2e_plan, FakeEnv(), action_m, {}, SE.StateSlots(),
+                                     SE.build_reward_fn(e2e_plan, slots=SE.StateSlots()))
+        check("M4 ...and it agrees with the stdlib evaluator on all 4 envs, so the document means "
+              "one thing on both sides of the seam", agree(got_m, ref_m),
+              f"max abs diff {gap(got_m, ref_m):.3e}, rewards {[round(float(x), 5) for x in got_m]}")
+    # The success criterion crosses the same seam and is what I2 found nothing checking. It is a
+    # STRING carried from the document through `_lower_term_row` into the adapter's predicate
+    # evaluator, so a name the schema tier accepts must be one this evaluator can look up.
+    with _warnings_off():
+        success_m = attempt(lambda: SE.build_success_fn(parse_spec(e2e_doc),
+                                                        slots=SE.StateSlots())(FakeEnv(), {}))
+    check("M5 ...and the document's own `success:` line evaluates through the adapter to a (N,) "
+          "boolean, with no env-published success to fall back on",
+          torch.is_tensor(success_m) and tuple(success_m.shape) == (N,)
+          and success_m.dtype == torch.bool, f"{success_m!r}")
+
 
 def _run_and_collect():
     """Run the checks and turn an ABORT into a recorded failure.
