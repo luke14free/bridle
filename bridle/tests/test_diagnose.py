@@ -240,6 +240,34 @@ def run_checks():
     check("success_rate=0.0 and 1.0 are legal, not off-by-one refusals",
           not refuses(lambda: diagnose({}, 0.0, 60)) and not refuses(lambda: diagnose({}, 1.0, 60)))
 
+    # ── success_rate=None: MEASURED ROWS, UNMEASURED OUTCOME ─────────────────────────────────────
+    # The caller is real: `bridle.adapters.skill_telemetry` emits per window of control steps, and a
+    # window in which no episode ended has every row's min/mean/max and no outcome at all. The two
+    # wrong answers are (a) refuse, so the free structural findings are lost, and (b) substitute 0.0,
+    # which licenses every composition rule on no evidence. Neither is taken.
+    none_flood = diagnose(flooding_stats(), None, 60)
+    check("an unmeasured success rate does NOT license the composition tags",
+          "flooding" not in tags(none_flood) and "hacking" not in tags(none_flood)
+          and "sparse" not in tags(none_flood))
+    check("...it is reported as incomplete against the whole fold, so 'not checked' is not 'clean'",
+          [(d.tag, d.row) for d in none_flood] == [("incomplete", WHOLE_REWARD)])
+    check("...and the message names the missing input and what supplying it would buy",
+          "success rate" in none_flood[0].message and "flooding" in none_flood[0].message
+          and "0.0 would license" in none_flood[0].message)
+    # The structural half is a statement about the ROW and holds at any success rate — including at
+    # none. Losing it was the whole cost of refusing.
+    none_const = diagnose({"a": stats(min=2.0, mean=2.0, max=2.0),
+                           "b": stats(min=0.0, mean=0.0, max=0.0)}, None)
+    check("the structural tags DO still run with no success rate — they are free and row-local",
+          tags(none_const) == ["constant", "dead", "incomplete"]
+          and rows_tagged(none_const, "constant") == ["a"]
+          and rows_tagged(none_const, "dead") == ["b"])
+    check("an EMPTY term_stats with no rate reports the stronger 'nothing was logged', once",
+          [(d.tag, d.row) for d in diagnose({}, None)] == [("incomplete", WHOLE_REWARD)]
+          and "no per-term contributions were logged" in diagnose({}, None)[0].message)
+    check("None is the ONLY non-fraction accepted — a string is still a caller bug",
+          refuses(lambda: diagnose(flooding_stats(), "unknown", 60)))
+
     # ── ep_len and horizon are both CONTEXT, so they are optional the same way (finding 6) ───────
     # ep_len was mandatory while doing strictly less than the optional horizon: it reaches exactly
     # one message fragment and no rule reads it, so a caller with no measured mean episode length had

@@ -198,9 +198,17 @@ def diagnose(term_stats, success_rate, ep_len=None, *, horizon=None):
                    `Diagnostic.row`, so a caller that labels them `reward[2] DistancePull` gets
                    feedback addressed in the same coordinates the document uses. Missing keys are
                    reported, never inferred.
-    `success_rate` fraction in [0, 1]. Refused outside it: every composition rule is conditioned on
-                   the run failing, so a percentage passed by mistake (86.0 for 0.86) would suppress
-                   all of them and report perfect health for a catastrophic run.
+    `success_rate` fraction in [0, 1], or `None` for NOT MEASURED. Refused outside that: every
+                   composition rule is conditioned on the run failing, so a percentage passed by
+                   mistake (86.0 for 0.86) would suppress all of them and report perfect health for
+                   a catastrophic run. `None` is a different fact from a low rate and is treated as
+                   one — the STRUCTURAL rules still run (they are statements about a row, true at any
+                   success rate) and an `incomplete` says out loud that the composition tier did not.
+                   It exists because the caller that has term statistics and no success rate is real:
+                   `bridle.adapters.skill_telemetry` emits per WINDOW of control steps, and a window
+                   in which no episode ended has measured every row and no outcome. Reporting the
+                   free findings and naming the missing input beats reporting nothing, and beats
+                   substituting a 0.0 that would license the whole composition block on no evidence.
     `ep_len`       optional mean episode length in steps, used to state per-episode totals.
     `horizon`      optional `max_episode_steps`.
 
@@ -215,16 +223,18 @@ def diagnose(term_stats, success_rate, ep_len=None, *, horizon=None):
 
     Returns `[]` only when every row was readable, every row varied, and nothing about the
     composition is worth saying at this success rate. An empty list from an empty `term_stats` would
-    mean "clean", so that case returns an `incomplete` instead.
+    mean "clean", so that case returns an `incomplete` instead — and so, for the same reason, does a
+    `success_rate` of None: a report with no verdicts in it must not be readable as a clean bill of
+    health when the input that buys the verdicts was never supplied.
     """
     if not isinstance(term_stats, Mapping):
         raise TypeError(f"term_stats is a mapping of row name -> {{min, mean, max}}, got "
                         f"{type(term_stats).__name__}")
-    rate = _number(success_rate)
-    if rate is None or not 0.0 <= rate <= 1.0:
-        raise ValueError(f"success_rate is a fraction in [0, 1], got {success_rate!r} — a percentage "
-                         f"here would silently suppress every composition check, because they are "
-                         f"conditioned on the run failing")
+    rate = None if success_rate is None else _number(success_rate)
+    if success_rate is not None and (rate is None or not 0.0 <= rate <= 1.0):
+        raise ValueError(f"success_rate is a fraction in [0, 1], or None for not-measured; got "
+                         f"{success_rate!r} — a percentage here would silently suppress every "
+                         f"composition check, because they are conditioned on the run failing")
     # Both context arguments, validated the same way — see the docstring.
     length, span = _optional_steps("ep_len", ep_len), _optional_steps("horizon", horizon)
 
@@ -235,7 +245,21 @@ def diagnose(term_stats, success_rate, ep_len=None, *, horizon=None):
     found = []
     found += _structural(terms)
     found += _unreadable(terms)
-    if rate < _FAILING:
+    if rate is None:
+        # Only when there ARE rows: with none, `_unreadable` has already said the stronger version of
+        # this ("no per-term contributions were logged"), and two whole-fold incompletes on one
+        # report is noise, not rigour.
+        if terms:
+            found.append(Diagnostic(
+                "incomplete", WHOLE_REWARD,
+                f"{_WHOLE_FOLD_PHRASE} was measured but its OUTCOME was not: no success rate came "
+                f"with these {len(terms)} row(s), so the composition checks (flooding, hacking, "
+                f"sparse) could not run — every one of them is conditioned on the run failing and "
+                f"there is nothing here that says whether it did. The structural checks above DID "
+                f"run and hold at any success rate. Supply the fraction of episodes that succeeded "
+                f"over the same window these statistics cover; a substituted 0.0 would license the "
+                f"whole composition block on no evidence at all."))
+    elif rate < _FAILING:
         found += _composition(terms, rate, length, span)
     return sorted(found, key=lambda d: (TAGS.index(d.tag), order.get(d.row, len(order))))
 
