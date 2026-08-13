@@ -505,6 +505,50 @@ def run_checks():
     check("E7 allocating an anchor at reset costs ONE sim read of the post-restore state, not two",
           env_c.cube_reads == 1, f"{env_c.cube_reads} read(s) of `cube` for one allocated anchor")
 
+    # E8-E12 `frame.prev_action` ACROSS AN EPISODE BOUNDARY (2026-08-13 review, I5). It is allocated
+    # by `_m_action_delta_norm` and advanced by `_advance_state`, and `build_reset_fn` re-anchored
+    # `*.tick`, `pred.*`, `success_latched`, four named `frame.*` slots and the `op.stateful` slots —
+    # none of which is this one, because `ActionPenalty` is `stateful=False`. So the first step of
+    # every new episode paid `||a_1 - a_last_of_the_previous_episode||`, and under `--partial-reset`
+    # the resetting rows paid it against the DYING episode's action. Measured before the fix with
+    # weight=1.0, an episode at a=1.0, a partial reset of rows [0, 2], and a new episode at a=5.0:
+    # ALL FOUR rows paid -10.583 = -||5-1|| * sqrt(7). `_action`'s own refusal exists to stop exactly
+    # this and covers only the stateful-row path.
+    #
+    # The buffer cannot be re-READ at reset (there is no action between steps), so the fix is a
+    # companion 0/1 mask and these checks are about the two sides of it: the resetting rows must pay
+    # ZERO, and the rows that did not reset must keep paying their REAL delta on the same step —
+    # a "fix" that zeroed the whole batch would satisfy the first half alone.
+    delta_plan = plan_of(op("add", "ActionPenalty", weight=1.0, norm="l2",
+                            measure="action_delta_norm"),
+                         measures=("action_delta_norm",))
+    env_d, slots_d = FakeEnv(), SE.StateSlots()
+    delta_reward = SE.build_reward_fn(delta_plan, slots=slots_d)
+    delta_reset = SE.build_reset_fn(delta_plan, slots=slots_d)
+    old_a, new_a = torch.full((N, 7), 1.0), torch.full((N, 7), 5.0)
+    first = [float(v) for v in delta_reward(env_d, None, old_a, {})]
+    delta_reward(env_d, None, old_a, {})
+    delta_reset(env_d, torch.tensor([0, 2]))
+    across = [float(v) for v in delta_reward(env_d, None, new_a, {})]
+    carried = -float(torch.linalg.norm(new_a[0] - old_a[0]))     # -10.583, the defect's own number
+    check("E8 the resetting rows pay NOTHING for the action gap across an episode boundary",
+          all(abs(across[i]) < 1e-7 for i in (0, 2)),
+          f"rows 0,2 -> {[round(across[i], 4) for i in (0, 2)]} (was {round(carried, 3)})")
+    check("E9 ...and the rows that did NOT reset still pay their real delta on that same step, so "
+          "this is a re-anchor and not a batch-wide mute",
+          all(abs(across[i] - carried) < 1e-4 for i in (1, 3)),
+          f"rows 1,3 -> {[round(across[i], 4) for i in (1, 3)]}")
+    after_reset = [float(v) for v in delta_reward(env_d, None, torch.full((N, 7), 6.0), {})]
+    expected = -float(torch.linalg.norm(torch.full((7,), 1.0)))
+    check("E10 ...and the NEXT step pays a real delta for every row, so the mask is one step wide",
+          all(abs(v - expected) < 1e-4 for v in after_reset),
+          f"{[round(v, 4) for v in after_reset]} vs {round(expected, 4)}")
+    check("E11 ...and the very first step of the very first episode was already zero (nothing to "
+          "diff against), which is why only the boundary was broken", all(abs(v) < 1e-7 for v in first))
+    check("E12 ...and a plan that never reads `action_delta_norm` allocates neither buffer, so the "
+          "reset stays free for the 15 primitives that do not use it",
+          not adapter_slots.has(SE._PREV_ACTION) and not adapter_slots.has(SE._PREV_ACTION_OK))
+
     # ── [F] tier 2 (`expr`) and tier 3 (`custom`) ────────────────────────────────────────────────
     print("\n[F] expr and custom")
     from bridle.skill import expr as E

@@ -562,14 +562,41 @@ def _m_action_norm(ctx):
     return _norm(_action(ctx))
 
 
+#: `frame.prev_action` cannot be RE-READ at reset — a reset happens between steps and there is no
+#: action to read (`_action`'s refusal). So the episode boundary is carried by a companion 0/1 mask
+#: instead: `build_reset_fn` clears the resetting rows, `_advance_state` sets every row once it has
+#: written a prev-action for this episode, and the measure multiplies by it. Both names are
+#: `frame.*` and neither is `.tick`/`pred.*`, so `build_reset_fn`'s generic loops leave them alone.
+_PREV_ACTION = "frame.prev_action"
+_PREV_ACTION_OK = "frame.prev_action_ok"
+
+
 def _m_action_delta_norm(ctx):
     """`||a_t - a_{t-1}||` — the jerk-LIKE variant nine source files describe as "the jerk penalty"
-    and none of them compute (no env has ever stored a previous action). Ships at chassis weight 0.0
-    so enabling it is a deliberate sweep, not a silent parity break; the buffer it needs is why it
-    could not just be added to the existing rows."""
+    and none of them compute (no env has ever stored a previous action). No chassis ships a row over
+    it, so writing it is a deliberate sweep; the buffer it needs is why it could not just be added
+    to the existing rows.
+
+    IT IS ZERO ON THE FIRST STEP OF AN EPISODE, and that is the whole content of the mask.
+    `build_reset_fn` re-anchors `*.tick`, `pred.*`, `success_latched`, four named `frame.*` slots and
+    the `op.stateful` slots — and `ActionPenalty` is `stateful=False`, so until 2026-08-13 (review
+    I5) this buffer was the one thing that survived a reset untouched. Measured on the fake env with
+    4 rows, `weight=1.0`, an episode of `a=1.0` followed by a partial reset of rows [0, 2] and a new
+    episode opening at `a=5.0`: every row paid -10.583 = `||5-1|| * sqrt(7)`, including the two that
+    had just restarted. Under `--partial-reset` that is every step, and the penalty a fresh episode
+    pays is a function of whatever the DYING one happened to be doing.
+    """
     action = _action(ctx)
-    previous = ctx.slots.slot("frame.prev_action", init=lambda: action, width=action.shape[-1])
-    return _norm(action - previous)
+    previous = ctx.slots.slot(_PREV_ACTION, init=lambda: action, width=action.shape[-1])
+    # Masked, not re-seeded: `previous` is one buffer shared by the batch and the rows that did not
+    # reset must keep paying their real delta on this same step.
+    have_previous = ctx.slots.slot(_PREV_ACTION_OK, init=lambda: _ones_like_rows(ctx))
+    return _norm(action - previous) * have_previous
+
+
+def _ones_like_rows(ctx):
+    import torch
+    return torch.ones(ctx.num_envs, dtype=torch.float32, device=ctx.device)
 
 
 def _yaw(q):
@@ -813,9 +840,14 @@ def _advance_state(ctx, plan):
         if op.stateful:
             slot = ctx.slots.slot(op.params["slot"], init=lambda o=op: ctx.measure(o.params["measure"]))
             slot.copy_(ctx.measure(op.params["measure"]))
-    if ctx.slots.has("frame.prev_action") and ctx.action is not None:
-        ctx.slots.slot("frame.prev_action", init=lambda: _action(ctx),
-                       width=_action(ctx).shape[-1]).copy_(_action(ctx))
+    if ctx.slots.has(_PREV_ACTION) and ctx.action is not None:
+        action = _action(ctx)
+        ctx.slots.slot(_PREV_ACTION, init=lambda: action, width=action.shape[-1]).copy_(action)
+        # ...and every row now HAS a previous action from this episode, including the ones that
+        # reset a moment ago. Written here rather than in the measure because the measure can be
+        # read twice in one control step (`evaluate()` and `compute_dense_reward()`) and this write
+        # must pair with the buffer write, not with a read.
+        ctx.slots.slot(_PREV_ACTION_OK, init=lambda: _ones_like_rows(ctx)).fill_(1.0)
 
 
 def _check_plan(plan):
@@ -1030,6 +1062,15 @@ def build_reset_fn(plan: RewardPlan, *, binding: EnvBinding = DEFAULT_BINDING, s
                 state.fill_rows(name, env_idx, -1.0)
             elif name.startswith("pred.") or name == "success_latched":
                 state.fill_rows(name, env_idx, 0.0)
+
+        # `frame.prev_action` is the one buffer that CANNOT be re-read here — a reset happens
+        # between steps, so there is no action (`_action`'s refusal, which covers only the stateful
+        # rows below). Its rows are invalidated instead, and `_m_action_delta_norm` pays 0 for a row
+        # with no previous action from THIS episode. Without it the first step of every new episode
+        # paid `||a_1 - a_last_of_the_previous_episode||`, measured at -10.583 on the fake env
+        # (2026-08-13 review, I5). No-op when nothing allocated the buffer, which is every plan that
+        # does not read `action_delta_norm` — `fill_rows` returns on an absent slot.
+        state.fill_rows(_PREV_ACTION_OK, env_idx, 0.0)
 
         def anchor(name, reader, width=None, allocate=False):
             """Re-READ one buffer from the post-restore state, rows only.
