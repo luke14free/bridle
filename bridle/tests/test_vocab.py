@@ -10,8 +10,8 @@ property tested here was paid for by a measured failure.
            default carries the rationale that justifies it, in the text the model reads.
   SIZE     the whole document must fit a 30B prompt alongside a task description and an example.
 
-Run: python -m pytest bridle/tests/test_vocab.py
-     PYTHONPATH=. python bridle/tests/test_vocab.py
+Run: PYTHONPATH=. python bridle/tests/test_vocab.py     (the project venv has no pytest)
+     python -m pytest bridle/tests/test_vocab.py
 
 NOTE (2026-08-12): the brief's step-1 test contained
     check("DistancePull is stateless", not TERMS["DistancePull"].stateless is False or True)
@@ -22,23 +22,28 @@ names.
 import re
 import sys
 
-from bridle.skill.spec import _quantity
+from bridle.skill.spec import _predicate_names, _quantity
 from bridle.skill.vocab import (
-    CHASSIS, MEASURES, PREDICATES, TERMS, Frame, Sign, base_term, vocab_document,
+    CHASSIS, MEASURES, PREDICATES, TERMS, Frame, Sign, base_term, desugar_brackets, vocab_document,
 )
 
 FAILS = []
 
 
 def _predicate_names_in(expr: str) -> set:
-    """Extract the predicate names an expression string references: either a bare name
-    ('grasped') or a nested call ('and_(grasped, above_z(z=0.06))'). A name in CALL position
-    (immediately followed by '(') is a predicate reference; anything else inside the call
-    (kwargs like 'anchor=target_pos') is scene data, not a predicate, so it's ignored. A string
-    with no call at all is itself a bare predicate name.
+    """The predicate names an expression references — `spec`'s own extractor, not a copy of it.
+
+    IT USED TO BE A COPY, and the copy was the PRE-FIX version: a call-position-only regex, so
+    `and_(grasped, typo_name)` extracted `{and_}` where `spec._predicate_names` sees all three.
+    Bare-operand names are exactly the position the 2026-08-12 review found unchecked, so this
+    file's "every predicate name in CHASSIS exists in PREDICATES" check was blind to the one
+    spelling the chassis actually write. Twenty lines below, this same file imports
+    `spec._quantity` on the stated grounds that it "cannot drift" — two drift policies in one
+    file, and this was the losing one.
+
+    The desugaring is `spec`'s too, so a `success:`-shaped `all[...]` reads here as it does there.
     """
-    calls = set(re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(", expr))
-    return calls if calls else {expr.strip()}
+    return _predicate_names(desugar_brackets(expr))
 
 
 def check(name, cond):
@@ -204,11 +209,30 @@ def run_checks():
     check("every predicate/gate name in CHASSIS exists in PREDICATES", not bad_predicate_refs)
     for ref in bad_predicate_refs:
         print(f"    unresolved: {ref}")
+    # ...and the check above is only as good as its extractor, which used to be a call-position-only
+    # copy. These pin what it must SEE, so a regression to the copy fails here and not silently.
+    check("...and the extractor sees a BARE OPERAND, the position a compound predicate puts its "
+          "operands in and the one the copied regex was blind to",
+          _predicate_names_in("and_(grasped, typo_name)") >= {"and_", "grasped", "typo_name"})
+    check("...and it sees through the `all[...]` sugar a `success:` line is written in",
+          _predicate_names_in("all[grasped, typo_name]") >= {"and_", "grasped", "typo_name"})
+    check("...and it still does NOT treat a keyword argument's VALUE as a predicate — "
+          "`anchor=target_pos` names a scene point, and every carry chassis writes one",
+          "target_pos" not in _predicate_names_in(
+              "within_radius(anchor=target_pos, radius_expr=0.05)"))
 
     # ── action_delta_norm ships OFF, or the numerical parity test breaks ──
+    # ASSERTED ON THE KEY'S PRESENCE, not on `.get(..., default)`: written as
+    # `ap.get("measure", "action_norm") == "action_norm"` this passed when the key was DELETED from
+    # the chassis, which is the failure it exists to catch (2026-08-13 review, minor). The chassis
+    # states the measure explicitly, and that is the property.
     ap = carry.defaults.get("ActionPenalty", {})
-    check("ActionPenalty defaults to action_norm, not the delta",
-          ap.get("measure", "action_norm") == "action_norm")
+    check("ActionPenalty NAMES action_norm, not the delta — and names it, rather than inheriting "
+          "it from a default this check supplied itself", ap.get("measure") == "action_norm")
+    check("...and every one of the six chassis does, so no chassis ships an `action_delta_norm` "
+          "row at any weight",
+          all(c.defaults.get("ActionPenalty", {}).get("measure") == "action_norm"
+              for c in CHASSIS.values()))
 
     # ── descend's success criterion, which was NOT EXPRESSIBLE before 2026-08-13 ─────────────────
     # `height_above_resting_in(band)` is `0 <= h <= band`. `descend_env.py`'s `low` is `h < band`

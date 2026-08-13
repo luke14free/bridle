@@ -19,8 +19,8 @@ The other properties paid for by a measured failure:
              success grades a frozen goal. One quantity, two frames, so two names.
   DEFAULTS   a chassis supplies the deployed weights; the diff against them is what gets reviewed.
 
-Run: python -m pytest bridle/tests/test_skillspec.py
-     PYTHONPATH=. python bridle/tests/test_skillspec.py
+Run: PYTHONPATH=. python bridle/tests/test_skillspec.py     (the project venv has no pytest)
+     python -m pytest bridle/tests/test_skillspec.py
 
 THREE DEVIATIONS FROM THE BRIEF'S SKETCH, all forced by the vocabulary as it actually shipped:
 

@@ -152,6 +152,26 @@ def run_checks():
     check("...and appears once for the row, not once per inherited parameter",
           text.count(inherited_why) == 1)
 
+    # ── `mode`/`scope` are annotated as CONSUMED, and the annotation was untested ────────────────
+    # `_lower_term_row` pops them into the Op's `kind`/`scope` — one representation, so a
+    # fingerprint cannot record a scope the fold is not using — which means they appear in the
+    # document and NOT in `op.params`. Without the annotation a reader diffing the report against
+    # the plan finds two authored parameters that the plan seems to have dropped. The branch is one
+    # `if op_value is _MISSING`, and nothing asserted on it (2026-08-13 review, minor).
+    consumed = "[consumed by the fold: it became this op's kind/scope]"
+    annotated = {ln.split("=")[0].strip() for ln in param_lines if consumed in ln}
+    check("the two parameters the fold consumes are BOTH annotated as consumed, by name",
+          annotated == {"mode", "scope"})
+    check("...and they still print their authored VALUES, so the annotation explains an absence "
+          "from the op rather than standing in for the value",
+          any(ln.strip().startswith("mode") and "'replace'" in ln and consumed in ln
+              for ln in param_lines)
+          and any(ln.strip().startswith("scope") and "'preceding'" in ln and consumed in ln
+                  for ln in param_lines))
+    check("...and no parameter the op DOES carry is annotated, so the marker is not decoration",
+          all(consumed not in ln for ln in param_lines
+              if ln.split("=")[0].strip() in ("weight", "value", "measure", "kernel", "condition")))
+
     # ── the compiler's own additions are shown, because they hash into the fingerprint ───────────
     check("the success criterion the compiler attaches to SuccessBonus is printed, and attributed",
           any(ln.strip().startswith("condition") and provenance_of(ln) == "compiler-supplied"

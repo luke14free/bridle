@@ -48,8 +48,8 @@ WHY THIS EXISTS, property by property, with the measurement each one was paid fo
                  and first proves the seeds really did differ (`hash()` of the same string differs)
                  so a green result cannot come from a botched probe.
 
-Run: python -m pytest bridle/tests/test_skillcompile.py
-     PYTHONPATH=. python bridle/tests/test_skillcompile.py
+Run: PYTHONPATH=. python bridle/tests/test_skillcompile.py     (the project venv has no pytest)
+     python -m pytest bridle/tests/test_skillcompile.py
 
 The descend fixture is imported from test_skillspec rather than re-derived: it is the deployed
 document, every weight is a trained number, and two copies would drift.

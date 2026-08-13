@@ -44,8 +44,8 @@ FOLD, and its input is a plan; going through `parse_spec`/`compile_spec` would a
 the schema for no extra coverage of the thing being pinned (`test_skillcompile.py` already covers
 document -> plan). It also keeps this file green while the schema is being edited.
 
-Run: python -m pytest bridle/tests/test_skill_env_fold.py
-     PYTHONPATH=. python bridle/tests/test_skill_env_fold.py
+Run: PYTHONPATH=. python bridle/tests/test_skill_env_fold.py     (the project venv has no pytest)
+     python -m pytest bridle/tests/test_skill_env_fold.py
 """
 import math
 import sys
