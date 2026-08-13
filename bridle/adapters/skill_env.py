@@ -58,8 +58,8 @@ from bridle.skill.vocab import MEASURES, PREDICATES, Sign
 
 __all__ = [
     "MEASURE_FNS", "PREDICATE_FNS", "SIGNED_MEASURES", "EnvBinding", "DEFAULT_BINDING",
-    "MeasureContext", "StateSlots", "SkillEnvError", "build_reward_fn", "build_success_fn",
-    "build_reset_fn", "SkillRuntime",
+    "MeasureContext", "StateSlots", "SkillEnvError", "build_reward_fn", "build_contribution_fn",
+    "plan_row_names", "build_success_fn", "build_reset_fn", "SkillRuntime",
 ]
 #: Re-exported so `skill_env.PREDICATE_FNS` and `except skill_env.SkillEnvError` keep resolving to
 #: the SAME objects after the split — this is a file move, not a second implementation. Named here
@@ -945,10 +945,92 @@ def build_reward_fn(plan: RewardPlan, *, binding: EnvBinding = DEFAULT_BINDING, 
     the same table `_HONOURED` builds its legal scope set from and `evaluate_plan` folds against.
     `bridle/tests/test_skill_env_fold.py` splices a second entry into that table and asserts the two
     folds still agree, which is the only thing that keeps the third reader honest.
+
+    THE PER-TERM BREAKDOWN IS `build_contribution_fn`, NOT A FLAG ON THIS ONE. Both are the same
+    fold (`_build_fold` below); this entry point returns the scalar and costs exactly what it always
+    did, because the training hot path runs it on 4096 envs every control step.
+    """
+    return _build_fold(plan, binding, slots, contributions=False)
+
+
+def build_contribution_fn(plan: RewardPlan, *, binding: EnvBinding = DEFAULT_BINDING, slots=None):
+    """`plan` -> `fn(env, obs, action, info) -> (reward, {row address -> (N,) Tensor})`.
+
+    THE SAME FOLD AS `build_reward_fn`, WITH THE ACCUMULATOR'S PER-ROW DELTA HANDED BACK. The
+    contribution of row k is `acc_after_k - acc_before_k`, which for an ORDERED fold is the row's
+    real effect: for descend's `reward[7] SuccessBonus{mode: replace}` that is the JUMP from the
+    accumulated shaping to 12.0, not the literal 12.0. Summing the deltas telescopes back to the
+    reward, which is what `[M]` in `bridle/tests/test_skill_env_fold.py` asserts.
+
+    THIS IS THE MECHANISM `scripts/reward_equivalence.py` SECTION [2] ALREADY USES, not a second one.
+    That script builds `len(ops)+1` PREFIX folds (`dataclasses.replace(plan, ops=plan.ops[:k])`) and
+    subtracts adjacent prefixes; the definition of a contribution is identical and `[M]` pins the two
+    against each other row by row, so a change to one that is not a change to the other fails a test.
+    The prefix construction is not used here for two measured reasons: it costs `len(ops)+1` full
+    folds per step (10 for descend) where this costs one plus `len(ops)` subtractions, and each
+    prefix fold carries its OWN `StateSlots`, so on a plan with a stateful row (`ProgressPotential`)
+    the prefixes each advance a private buffer and the differences stop being the live fold's rows.
+    `reward_equivalence.py` is unaffected by the second point — descend's plan has no state slots —
+    which is exactly why it could not have discovered it.
+
+    ROW ADDRESSES come from `plan_row_names`, so a diagnostic names the row in the coordinates the
+    document uses (`reward[3] HingePenalty(height_above_seat_live)`).
+    """
+    return _build_fold(plan, binding, slots, contributions=True)
+
+
+def plan_row_names(plan: RewardPlan):
+    """One address per op, in fold order: `reward[k] <term>(<subject>)`, with the mode when it is
+    not a plain add.
+
+    `reward[k]` IS THE ADDRESS THE DOCUMENT USES — `skill.yaml`'s own header, `reward_equivalence.py`
+    's `ROW_NAMES` and this project's prose are all 0-indexed `reward[k]` (that file's docstring
+    records the day a 1-indexed prose scheme met a 0-indexed output in the same paragraph). The
+    index also makes the names UNIQUE, which they must be: they are the keys of the `term_stats`
+    mapping `diagnose` reads, and two identically-parameterised rows in one document are legal.
+
+    The subject is the measure/predicate/target the row reads, because "reward[3] HingePenalty" does
+    not tell an author which of two hinge rows to edit. `SuccessBonus`'s `condition` is deliberately
+    NOT used as a subject: it is the whole success criterion and would run to a paragraph.
+    """
+    names = []
+    for k, op in enumerate(plan.ops):
+        params = op.params
+        subject = params.get("measure") or params.get("predicate") or params.get("target")
+        if subject is None and params.get("body") is not None:
+            subject = str(params["body"])
+        if subject is None and op.fn_key == "expr":
+            subject = getattr(params.get("expr"), "source", None)
+        mode = "" if op.kind == "add" else "{%s}" % op.kind
+        tail = f"({' '.join(str(subject).split())})" if subject else ""
+        names.append(f"reward[{k}] {op.fn_key}{mode}{tail}")
+    return tuple(names)
+
+
+def _build_fold(plan, binding, slots, contributions):
+    """The one fold. `contributions=False` is the training hot path and must stay what it was.
+
+    The only difference the flag makes inside the loop is one Python-level `if rows is not None` per
+    op — a branch on a value fixed at build time, identical for all 4096 environments, which is the
+    same reason `op.kind` may be branched on here (see the comment in the loop).
+
+    MEASURED, 2026-08-13, descend's 9-op plan over 4096 CUDA envs of raw tensors (no simulator),
+    400 iterations, on the box running the live 4096-env job:
+
+        HEAD's build_reward_fn        353.1 us/step     output bitwise identical
+        this file's default path      353.0 us/step     -0.0%
+        contributions=True            360.0 us/step     +2.0%  (9 extra (N,) subtractions)
+        ...plus TermWindow.observe    427.0 us/step     +21%   (+74 us)
+
+    Against the live run's 524 ms per control step (65536 env-steps per 8.38 s epoch at SPS 7822,
+    16 control steps per epoch, `logs/descend_to_target-skill-seed20-plan95babe2a3cc5.log`), the
+    whole diagnostics path costs 0.014% of a step. The DEFAULT path costs nothing at all, which is
+    the property this split exists to keep.
     """
     import torch
     _check_plan(plan)
     state = slots
+    row_names = plan_row_names(plan) if contributions else None
 
     def reward_fn(env, obs, action, info):
         nonlocal state
@@ -960,27 +1042,32 @@ def build_reward_fn(plan: RewardPlan, *, binding: EnvBinding = DEFAULT_BINDING, 
         values = _values_for(ctx, plan)
 
         acc = torch.zeros(ctx.num_envs, dtype=torch.float32, device=ctx.device)
+        rows = [] if contributions else None
         for op in plan.ops:
             # A Python `if` on `op.kind` is safe and a Python `if` on a VALUE is not: the kind is
             # fixed at compile time and identical for all 4096 envs, while the condition differs per
             # env and therefore goes through torch.where below.
+            before = acc
             if op.fn_key == "custom":
                 acc = acc + _custom_row(ctx, op.params["target"])
-                continue
-            if op.kind == "add":
+            elif op.kind == "add":
                 acc = acc + _TERM_VALUE[op.fn_key](op.params, values)
-                continue
-            condition, level = _TERM_CONDITION_LEVEL[op.fn_key](op.params, values)
-            condition = condition.to(torch.bool)
-            level = _fold_level(acc, level, op)
-            # `reached` is what the row's mode operates OVER. `_check_plan` has already refused a
-            # scope this table has no entry for, so the lookup cannot KeyError here.
-            reached = _SCOPE_REACH[op.scope](acc)
-            acc = (torch.where(condition, level, reached) if op.kind == "replace"
-                   else torch.where(condition, torch.maximum(reached, level), acc))
+            else:
+                condition, level = _TERM_CONDITION_LEVEL[op.fn_key](op.params, values)
+                condition = condition.to(torch.bool)
+                level = _fold_level(acc, level, op)
+                # `reached` is what the row's mode operates OVER. `_check_plan` has already refused a
+                # scope this table has no entry for, so the lookup cannot KeyError here.
+                reached = _SCOPE_REACH[op.scope](acc)
+                acc = (torch.where(condition, level, reached) if op.kind == "replace"
+                       else torch.where(condition, torch.maximum(reached, level), acc))
+            if rows is not None:
+                rows.append(acc - before)
 
         _advance_state(ctx, plan)
-        return acc
+        if rows is None:
+            return acc
+        return acc, dict(zip(row_names, rows))
 
     return reward_fn
 

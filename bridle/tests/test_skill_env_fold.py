@@ -1307,6 +1307,70 @@ def run_checks():
           SE._resolve_custom(CUSTOM_TARGET) is SE._resolve_custom(CUSTOM_TARGET)
           and CUSTOM_TARGET in SE._RESOLVED_CUSTOM)
 
+    # ── [O] per-term contributions ──────────────────────────────────────────────────────────────
+    # The input `bridle/skill/diagnose.py` shipped without: `build_reward_fn` returned the scalar and
+    # nothing produced a `term_stats` mapping (whole-branch review, I7). `build_contribution_fn`
+    # hands back the accumulator's per-row delta.
+    #
+    # O2 IS THE ANTI-DRIFT PIN AND IS THE REASON THIS BLOCK EXISTS AT ALL. `scripts/reward_
+    # equivalence.py` section [2] already computes a per-term breakdown, by building `len(ops)+1`
+    # PREFIX folds and subtracting adjacent ones. Two mechanisms for one quantity is the shape this
+    # codebase keeps getting bitten by, so the definition is pinned: the in-fold deltas must equal
+    # the prefix differences, row by row, or one of the two moved.
+    print("\n[O] per-term contributions — the input the third feedback tier never had")
+    import dataclasses
+    plan_o = descend_shaped_plan()
+    env_o, action_o, info_o = FakeEnv(), action_of(torch), {}
+    with _warnings_off():
+        total = SE.build_reward_fn(plan_o, slots=SE.StateSlots())(env_o, None, action_o, info_o)
+        got, rows = SE.build_contribution_fn(
+            plan_o, slots=SE.StateSlots())(env_o, None, action_o, info_o)
+        prefixes = [SE.build_reward_fn(dataclasses.replace(plan_o, ops=plan_o.ops[:k]),
+                                       slots=SE.StateSlots())(env_o, None, action_o, info_o)
+                    for k in range(len(plan_o.ops) + 1)]
+    names = SE.plan_row_names(plan_o)
+
+    check("O1 the default `build_reward_fn` still returns a bare tensor — the hot path is unchanged",
+          torch.is_tensor(total) and tuple(total.shape) == (N,), type(total).__name__)
+    check("O2 the contributions fold returns the SAME reward as the plain one, bitwise",
+          torch.equal(got, total), f"{got.tolist()} vs {total.tolist()}")
+    check("O3 one contribution per row, keyed by the row address, in fold order",
+          tuple(rows) == names and len(names) == len(plan_o.ops), str(tuple(rows))[:80])
+    worst_pref = max(float((rows[names[k]] - (prefixes[k + 1] - prefixes[k])).abs().max())
+                     for k in range(len(plan_o.ops)))
+    check("O4 every row equals `scripts/reward_equivalence.py` section [2]'s PREFIX-FOLD "
+          "contribution — one definition of 'what this row paid', not two",
+          worst_pref <= 2e-6, f"worst row differs by {worst_pref:.3e}")
+    telescoped = sum(rows[n] for n in names)
+    check("O5 the contributions telescope back to the reward (acc_k - acc_k-1 summed over k)",
+          float((telescoped - total).abs().max()) <= 2e-6,
+          f"max |sum - total| {float((telescoped - total).abs().max()):.3e}")
+
+    # THE ORDERED FOLD'S ROW 5 IS `SuccessBonus{mode: replace}` with `condition: grasped`, and the
+    # fake env grasps in envs 0, 1, 3. Its CONTRIBUTION is the jump from the accumulated shaping to
+    # 12.0, i.e. `12.0 - acc_before` — NOT the literal 12.0. The plausible wrong implementation
+    # (append the row's own VALUE rather than the accumulator's delta) reports 12.0 here and passes
+    # O5 only because the two coincide for `add` rows; this is the check that separates them.
+    replace_row = rows[names[5]]
+    before = prefixes[5]
+    grasping = (0, 1, 3)
+    check("O6 a `mode: replace` row's contribution is the JUMP to the level, not the level",
+          all(abs(float(replace_row[i]) - (12.0 - float(before[i]))) <= 2e-6 for i in grasping)
+          and all(abs(float(replace_row[i]) - 12.0) > 0.1 for i in grasping),
+          f"row 5 pays {[round(float(replace_row[i]), 4) for i in grasping]} on top of "
+          f"{[round(float(before[i]), 4) for i in grasping]}")
+    check("O7 ...and 0.0 in the env where its condition is false", abs(float(replace_row[2])) <= 2e-6,
+          f"{float(replace_row[2])}")
+
+    # THE ADDRESS IS THE PRODUCT AS MUCH AS THE TAG IS (the ablation: strip the typed content and
+    # 97.6% becomes 11.5%). A row named `reward[3] HingePenalty` with a second hinge row in the
+    # document does not tell the author which one to edit.
+    check("O8 every address is unique and carries its index, term and subject",
+          len(set(names)) == len(names)
+          and names[3] == "reward[3] HingePenalty(height_above_seat_live)"
+          and names[5] == "reward[5] SuccessBonus{replace}"
+          and names[6] == "reward[6] ActionPenalty(action_norm)", str(names[3]))
+
 
 def _run_and_collect():
     """Run the checks and turn an ABORT into a recorded failure.
