@@ -246,8 +246,18 @@ def init_metrics(env_id: str, module: str, paths, envs: int = 64, resets: int = 
         for i in range(max(1, resets)):
             _, info = env.reset(seed=seed + i)
             for key, value in (info or {}).items():
-                if torch.is_tensor(value) and value.dtype.is_floating_point \
-                        and value.numel() == envs:
+                # BOOL FLAGS COUNT, NOT ONLY FLOATS, and `.float()` below is what summarises one:
+                # `init_<flag>_mean` is the FRACTION of starts in which the predicate holds. A
+                # reset-time predicate is as much a property of where the episode starts as a
+                # distance is, and in this corpus it is often the ONLY way to state one — the
+                # so100 info dict publishes exactly two per-env floats (`tcp_to_obj_dist`,
+                # `cube_to_target_dist`) and everything else about the pose, including every
+                # statement about HEIGHT (`cube_on_table`, `cube_above_platform_top`,
+                # `cube_lifted`), as a bool. Without this line "the cube starts aloft, not resting
+                # on the table and not below the floor" is unassertable, which is one of the three
+                # clauses `composer/resolve_init_set.py` (lego-arm) gates a capture on.
+                if torch.is_tensor(value) and value.numel() == envs \
+                        and (value.dtype.is_floating_point or value.dtype is torch.bool):
                     samples.setdefault(key, []).append(value.reshape(-1).float().cpu())
     env.close()
 

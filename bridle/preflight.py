@@ -98,8 +98,10 @@ class Assert:
 # `needs="warm_start"` question to ask about one. A random policy, a warm-started one and no policy
 # whatsoever produce the same number, and only a broken CONFIGURATION moves it.
 #
-# THE NAMING IS A GENERAL MEASURE, NOT A DESCEND SPECIAL CASE. Any per-env float the env publishes
-# in its `info` dict can be summarised at reset:
+# THE NAMING IS A GENERAL MEASURE, NOT A DESCEND SPECIAL CASE. Any per-env float OR BOOL FLAG the
+# env publishes in its `info` dict can be summarised at reset (a flag's `_mean` is the fraction of
+# starts in which the predicate holds — often the only way to state a height claim, since the so100
+# info dict publishes every statement about z as a bool):
 #
 #     init_<info_key>_mean          init_<info_key>_min / _max
 #     init_<info_key>_frac_within_<x>     fraction of starts with <info_key> <= x
