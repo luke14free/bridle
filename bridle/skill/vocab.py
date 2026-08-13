@@ -152,8 +152,9 @@ MEASURES = dict([
 
     _m("action_delta_norm", Sign.MAGNITUDE, Frame.LIVE, "-",
        "L2 norm of (action_t - action_t-1) — the jerk-LIKE variant nine files describe but none "
-       "compute. Requires a new previous-action buffer. Ships as ActionPenalty's `measure` at "
-       "chassis weight 0.0 — enabling it is a sweep, not a silent parity break."),
+       "compute. Requires a new previous-action buffer. NO CHASSIS SHIPS A ROW OVER IT: all six "
+       "ship `ActionPenalty{measure: action_norm}`, so writing this measure is a deliberate sweep "
+       "against an unmeasured term, not a variant of the deployed one."),
 
     _m("yaw_diff_mod_symmetry", Sign.MAGNITUDE, Frame.LIVE, "rad",
        "symmetry-reduced angular diff, held-object yaw vs target yaw (`_shape_aware_yaw`). NOT wired "
@@ -409,9 +410,9 @@ TERMS = dict([
         ],
        "`reward -= weight * norm(measure)`. NOT a jerk penalty, despite NINE source files calling it "
        "one — no env has ever stored a previous action. `measure` defaults to `action_norm` "
-       "(identical everywhere: weight=0.001, norm=l2); `action_delta_norm` is the jerk-LIKE variant "
-       "those comments describe, and ships at chassis weight 0.0 so enabling it is a deliberate "
-       "sweep, not a silent parity break."),
+       "(identical everywhere: weight=0.001, norm=l2, and every one of the six chassis ships that "
+       "and only that); `action_delta_norm` is the jerk-LIKE variant those comments describe, "
+       "shipped by no chassis at any weight, so writing it is a deliberate sweep."),
 
     _t("SuccessBonus", [
             Param("value", "float", 9.0, "terminal bonus paid on success"),
@@ -450,14 +451,16 @@ TERMS = dict([
             Param("k", "float", 4.0, "kernel sharpness (tanh/gaussian); observed 3.0/4.0/5.0/6.0"),
             Param("setpoint", "float", 0.0,
                   "the kernel's peak, in measure units — NON-ZERO in 4 instances, load-bearing"),
-            Param("axes", "str", None, "restrict to a subset of axes, e.g. split xy from z"),
+            Param("axes", "str", None, "NOT IMPLEMENTED — any value but null is refused at compile "
+                                       "time. Split axes with two rows, as below"),
             Param("gate", "str", None, "predicate name; the whole row is multiplied by it"),
         ],
-       "`weight * kernel(measure - setpoint) * gate`. Two params are load-bearing, not decoration: "
-       "`setpoint != 0` — descend's hover attractor peaks at `_HOVER` ABOVE the seat and NEVER at "
-       "the seat (setpoint=0 pulled the cube INTO the platform, broke 16/16 grasps, the 2026-06-04 "
-       "slip-fix) — and `axes`: move_to_3d/descend split xy (weight 1.5, k=4) from z (weight 2.5, "
-       "k=6); collapsing both into a 3D norm changes the task."),
+       "`weight * kernel(measure - setpoint) * gate`. `setpoint != 0` is load-bearing, not "
+       "decoration: descend's hover attractor peaks at `_HOVER` ABOVE the seat and NEVER at the "
+       "seat (setpoint=0 pulled the cube INTO the platform, broke 16/16 grasps, the 2026-06-04 "
+       "slip-fix). SPLITTING AXES IS TWO ROWS OVER TWO MEASURES, not the `axes` param: move_to_3d "
+       "and descend pull xy (`object_to_goal_xy`, weight 1.5, k=4) and z (`height_above_seat_live`, "
+       "weight 2.5, k=6) as separate rows, and collapsing them into one 3D norm changes the task."),
 
     _t("HingePenalty", [
             Param("weight", "float", 1.0, "penalty magnitude"),
@@ -525,10 +528,11 @@ TERMS = dict([
             Param("unnormalized", "bool", False, "declare instead of dividing, if already at scale"),
         ],
        "a DOCUMENT-level field, not a summed reward row: `reward_ppo = dense / divisor` (or dense "
-       "unchanged if `unnormalized`). 7/15 primitives (reach, sphere_reach, grab, sphere_grab, lift, "
-       "sphere_lift, compact_grasp) inherit `compute_normalized_dense_reward` WITHOUT overriding it, "
-       "so they train at dense/12.0 even though it's semantically wrong for them — lift's per-step "
-       "max is ~18, reach's is ~9. A generated env that forgets this trains at 12x intended scale."),
+       "unchanged if `unnormalized`). ALL 15 primitives inherit `compute_normalized_dense_reward` "
+       "without overriding it — none of them redefines it — so all 15 train at dense/12.0. For 7 "
+       "(reach, sphere_reach, grab, sphere_grab, lift, sphere_lift, compact_grasp) that divisor is "
+       "semantically wrong: lift's per-step max is ~18, reach's is ~9. A generated env that forgets "
+       "this trains at 12x intended scale."),
 ])
 
 assert len(TERMS) == 9, "the vocabulary is frozen at 9 terms — additions need a measured justification"

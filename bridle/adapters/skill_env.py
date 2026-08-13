@@ -35,7 +35,9 @@ the bottom of the MEASURE/PREDICATE tables — free guards that cost nothing to 
 suite that actually runs. The import is cached after the first call, so the per-call cost is a dict
 lookup, not a re-import.
 THE PREDICATE MINI-LANGUAGE LIVES NEXT DOOR, in `bridle/adapters/skill_predicates.py`: the `ast`
-whitelist, the `all[...]`/`any[...]` desugarer, argument resolution and the sixteen predicates. It
+whitelist, argument resolution and the seventeen predicates — of which fifteen evaluate and two
+(`forall`/`for_n`) are stubs that `compile.py` refuses a document for using. The `all[...]`/`any[...]`
+desugarer is one layer up, in `vocab.desugar_brackets`, because the schema tier reads it too. This
 is a parser/evaluator rather than an env adapter, it re-implements the discipline `expr.py` already
 owns, and it is the part that grows when quantifiers land. It knows nothing about an env beyond the
 `MeasureContext` handed to it, so the dependency runs one way — this module imports it, never the
@@ -685,8 +687,10 @@ assert not (set(_SIGN_LOAD_BEARING) - SIGNED_MEASURES), (
 
 
 # ── the fold ────────────────────────────────────────────────────────────────────────────────────
-
-_SUCCESS_KEYS = ("success", "success_latched")
+# (`_SUCCESS_KEYS = ("success", "success_latched")` used to sit here and was read by nothing —
+# one occurrence repo-wide. The live table is `compile._SUCCESS_KEY`. Deleted 2026-08-13: a second,
+# unread copy of the success key-set is precisely the drift shape this file is otherwise built to
+# avoid, and it would have been the copy a reader edited.)
 
 
 def _custom_row(ctx, target):
@@ -721,11 +725,17 @@ def _success_value(ctx, plan):
     `scripts/probe_skill_env.py`'s reward-parity numbers (max abs diff 1.2e-07 / 2.4e-07 vs
     `descend_env.compute_dense_reward`) establish that the replace/floor MECHANICS agree — both sides
     consume the same `info["success"]` — and establish nothing about whether the document's
-    `success:` line is the same predicate the env publishes. On the §4 fixture it measurably is not:
-    the same probe's G5 finds `height_above_resting_in` and descend's `low` gate disagreeing on 29/29
-    rows below the seat, because the predicate carries a `>= 0` lower bound the gate lacks. Task 6
-    measures that disagreement separately; a preflight assert comparing `build_success_fn` against
-    the env's own `evaluate()` is what would close it.
+    `success:` line is the same predicate the env publishes.
+
+    THAT DISAGREEMENT WAS REAL AND HAS SINCE BEEN CLOSED IN THE DOCUMENT, and the history matters
+    because the fix was to the criterion, not to this function. The §4 fixture wrote
+    `height_above_resting_in`, which carries a `>= 0` lower bound descend's own `low` gate lacks;
+    the probe's G5 measured them disagreeing on 29/29 rows below the seat, later re-measured at
+    37/4456 sampled states and 37/64 at full criterion level. The shipped document moved to
+    `below_resting_height` (the 17th predicate, unbounded below, `descend_env.py`'s gate verbatim)
+    and the same measurements came back 0/4456 and 0/64. So this path still cannot PROVE the two
+    agree — it reads `info["success"]` and never compares — and a preflight assert comparing
+    `build_success_fn` against the env's own `evaluate()` is still what would close it in general.
     """
     published = ctx.info.get("success") if isinstance(ctx.info, dict) else None
     if published is not None:
