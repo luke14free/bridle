@@ -412,34 +412,61 @@ assert _STUBS == set(QUANTIFIER_PREDICATES) == {n for n, f in PREDICATE_FNS.item
     f"{len(PREDICATE_FNS) - len(_STUBS)} of {len(PREDICATE_FNS)} predicates are evaluable")
 
 
+def _node_source(node):
+    """`ast.unparse(node)`, computed once per node for the life of the process.
+
+    This string is the SLOT IDENTITY of a stateful predicate — two `sustained(...)` rows over
+    different operands must not share one streak counter — so it is needed on every control step,
+    for every node, and it was recomputed every time. Cached ON the node because the tree itself is
+    cached by `_eval_predicate_text` below, so each node exists exactly once per criterion and the
+    string cannot go stale: a different criterion is a different tree.
+    """
+    source = getattr(node, "_bridle_source", None)
+    if source is None:
+        source = ast.unparse(node)
+        node._bridle_source = source
+    return source
+
+
 def _eval_predicate_node(ctx, node, source):
     if isinstance(node, ast.Name):
         name = node.id
     elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
         name = node.func.id
     else:
-        raise SkillEnvError(f"{source}: {ast.unparse(node)!r} is not a predicate — write a bare name "
-                            f"from the vocabulary, or a call over them like "
+        raise SkillEnvError(f"{source}: {_node_source(node)!r} is not a predicate — write a bare "
+                            f"name from the vocabulary, or a call over them like "
                             f"`and_(grasped, above_z(z=0.06))`")
     fn = PREDICATE_FNS.get(name)
     if fn is None:
         raise SkillEnvError(f"{source}: unknown predicate {name!r} — legal: "
                             f"{', '.join(sorted(PREDICATES))}")
-    # The unparsed call text is the slot identity for a stateful predicate: two `sustained(...)`
-    # rows over different operands must not share one streak counter, and the same one read twice
-    # must not become two.
-    return fn(ctx, _Args(ctx, node, ast.unparse(node)))
+    return fn(ctx, _Args(ctx, node, _node_source(node)))
+
+
+#: One parsed, whitelisted tree per criterion STRING, for the life of the process. A criterion is
+#: fixed at compile time and re-evaluated every control step, so desugaring + `ast.parse` +
+#: `ast.walk` ran ~31 us per step for a three-clause criterion (measured 2026-08-13) to produce a
+#: tree identical to the last one. Keyed by the author's own text, which is what makes it safe:
+#: two documents with the same criterion string ARE the same criterion. Unbounded on purpose — the
+#: key set is the set of criteria in the loaded documents, a handful, and evicting one would only
+#: re-derive it. A REFUSAL is not cached: it raises before the tree is stored, so a malformed
+#: criterion refuses identically every time it is evaluated.
+_PARSED_PREDICATES = {}
 
 
 def _eval_predicate_text(ctx, text):
-    source = _desugar_brackets(text)
-    try:
-        tree = ast.parse(source, mode="eval")
-    except SyntaxError as exc:
-        raise SkillEnvError(f"predicate {text!r} does not parse: {exc}") from exc
-    for node in ast.walk(tree):
-        if type(node) not in _PRED_NODES:
-            raise SkillEnvError(
-                f"predicate {text!r} contains {type(node).__name__}, which a predicate expression "
-                f"may not: it is a bare name or a call over names, nothing else")
+    tree = _PARSED_PREDICATES.get(text)
+    if tree is None:
+        source = _desugar_brackets(text)
+        try:
+            tree = ast.parse(source, mode="eval")
+        except SyntaxError as exc:
+            raise SkillEnvError(f"predicate {text!r} does not parse: {exc}") from exc
+        for node in ast.walk(tree):
+            if type(node) not in _PRED_NODES:
+                raise SkillEnvError(
+                    f"predicate {text!r} contains {type(node).__name__}, which a predicate "
+                    f"expression may not: it is a bare name or a call over names, nothing else")
+        _PARSED_PREDICATES[text] = tree
     return _eval_predicate_node(ctx, tree.body, text)

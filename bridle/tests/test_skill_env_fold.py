@@ -1260,6 +1260,53 @@ def run_checks():
           torch.is_tensor(success_m) and tuple(success_m.shape) == (N,)
           and success_m.dtype == torch.bool, f"{success_m!r}")
 
+    # ── [N] the two per-step caches: they must not cache a REFUSAL ───────────────────────────────
+    # A criterion is fixed at compile time and re-parsed every control step (~31 us for three
+    # clauses), and `_custom_row` re-imported its module every step. Both are memoised now. The
+    # property worth a test is not the speed — it is that a memoised failure would make a malformed
+    # document refuse ONCE and then silently succeed, or refuse with a stale message.
+    print("\n[N] the hot-path caches")
+    criterion = "sustained(grasped, k=2, consecutive=True)"
+    SP._PARSED_PREDICATES.pop(criterion, None)
+    env_n, slots_n = FakeEnv(), SE.StateSlots()
+    slots_n.ensure(env_n)
+    ctx_n = SE.MeasureContext(env_n, None, action_of(torch), {}, slots_n, SE.DEFAULT_BINDING,
+                              where="test")
+    first_n = ctx_n.predicate(criterion)
+    tree_n = SP._PARSED_PREDICATES.get(criterion)
+    check("N1 a criterion is parsed once and the tree is kept", tree_n is not None)
+    env_n2, slots_n2 = FakeEnv(), SE.StateSlots()
+    slots_n2.ensure(env_n2)
+    ctx_n2 = SE.MeasureContext(env_n2, None, action_of(torch), {}, slots_n2,
+                               SE.DEFAULT_BINDING, where="test")
+    check("N2 ...and the second evaluation reuses that exact tree and returns the same values",
+          SP._PARSED_PREDICATES.get(criterion) is tree_n
+          and all(abs(float(a - b)) < 1e-9 for a, b in zip(first_n, ctx_n2.predicate(criterion))))
+    # `typo_name` is in this list and behaves differently on purpose: its tree PARSES and passes the
+    # whitelist, so the tree is cached and the refusal comes from `_eval_predicate_node` on every
+    # evaluation. That is the point of the split below — what must not be memoised is the REFUSAL,
+    # and only the first two fail before a tree exists to store.
+    for bad, fragment, cacheable in (("grasped + 1", "BinOp", False),
+                                     ("grasped(", "does not parse", False),
+                                     ("typo_name", "unknown predicate", True)):
+        msgs = []
+        for _ in range(2):
+            err_n = raises(SE.SkillEnvError, ctx_n.predicate, bad)
+            msgs.append(str(err_n) if err_n else "<nothing raised>")
+        check(f"N3 {bad!r} refuses IDENTICALLY the second time — no refusal is memoised",
+              msgs[0] == msgs[1] and fragment in msgs[0], msgs[0][:70])
+        check(f"...and the parse cache holds it only if the TREE was valid ({cacheable})",
+              (bad in SP._PARSED_PREDICATES) is cacheable)
+    SE._RESOLVED_CUSTOM.pop("no.such.module:nope", None)
+    for _ in range(2):
+        err_n = raises(SE.SkillEnvError, SE._resolve_custom, "no.such.module:nope")
+    check("N4 ...and neither does an unresolvable tier-3 target",
+          bool(err_n) and "cannot import" in str(err_n)
+          and "no.such.module:nope" not in SE._RESOLVED_CUSTOM)
+    check("N5 ...while a resolvable one IS cached, and to the same callable",
+          SE._resolve_custom(CUSTOM_TARGET) is SE._resolve_custom(CUSTOM_TARGET)
+          and CUSTOM_TARGET in SE._RESOLVED_CUSTOM)
+
 
 def _run_and_collect():
     """Run the checks and turn an ABORT into a recorded failure.

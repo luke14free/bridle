@@ -720,6 +720,13 @@ assert not (set(_SIGN_LOAD_BEARING) - SIGNED_MEASURES), (
 # avoid, and it would have been the copy a reader edited.)
 
 
+#: Resolved tier-3 targets, for the life of the process. `_custom_row` runs every control step and
+#: called `importlib.import_module` every time — cheap (a `sys.modules` lookup) but not free, and
+#: pointless for a target fixed at compile time. A FAILURE is not cached: it raises before the entry
+#: is stored, so a target that refuses refuses identically every time.
+_RESOLVED_CUSTOM = {}
+
+
 def _resolve_custom(target):
     """`"module:function"` -> the callable, or a `SkillEnvError` naming which half is wrong.
 
@@ -727,6 +734,9 @@ def _resolve_custom(target):
     the same code in both places on purpose: a plan that `_check_plan` accepted must not be able to
     fail to resolve later, and a plan it refused must not be reachable at all.
     """
+    cached = _RESOLVED_CUSTOM.get(target)
+    if cached is not None:
+        return cached
     module_name, sep, function_name = target.partition(":")
     if not sep or not module_name or not function_name:
         raise SkillEnvError(f"custom row {target!r}: a tier-3 target is `module:function` — one "
@@ -740,6 +750,7 @@ def _resolve_custom(target):
     if not callable(fn):
         raise SkillEnvError(f"custom row {target!r}: {module_name!r} has no callable "
                             f"{function_name!r}")
+    _RESOLVED_CUSTOM[target] = fn
     return fn
 
 
