@@ -191,7 +191,17 @@ def resolve_env_ref(env, *, search_dir=None, explicit_module=None):
         return ResolvedEnv(cls, uid, horizon, "class-ref")
     module, tried, notes = import_registering_module(env, search_dir, explicit_module)
     if env not in registry:
-        detail = f" (tried {tried})" if tried else ""
+        if tried:
+            detail = f" (tried {tried})"
+        elif search_dir and glob.glob(os.path.join(search_dir, "*_env.py")):
+            # There ARE candidate files and none of them could be named: the directory's package
+            # root is not on `sys.path`, which is a different problem from a missing env and used to
+            # be reported as the same one.
+            detail = (f" — {search_dir} holds *_env.py files but none of them is importable under "
+                      f"the current sys.path, so no module name could be derived. Put the "
+                      f"repository root on PYTHONPATH")
+        else:
+            detail = f" — no *_env.py sits next to it in {search_dir or '(no directory given)'}"
         detail += "".join(f"\n  note: {n}" for n in notes)
         raise EnvRefError(f"env_id {env!r} is registered by nothing importable from "
                           f"{search_dir or 'the current sys.path'}{detail}")

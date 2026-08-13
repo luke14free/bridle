@@ -272,6 +272,14 @@ def run_checks():
           descend_skill(training=Training(seed=7)).training.seed == 7
           and "training" not in skill.doc)
 
+    # ── the horizon is stated or resolved, and NEVER invented ───────────────────────────────────
+    check("a stated max_episode_steps is what horizon() returns",
+          descend_skill(max_episode_steps=64).horizon() == 64)
+    check("an env nothing can resolve reports NO horizon rather than a default",
+          descend_skill(env=FakeEnv).horizon() is None)
+    check("the defining file is captured, so runs land next to the skill",
+          skill.source == __file__)
+
     # ── the launcher seam ────────────────────────────────────────────────────────────────────────
     seen = {}
 

@@ -50,7 +50,9 @@ import dataclasses
 import difflib
 import inspect
 import json
+import os as _os
 import sys
+import warnings
 
 from bridle.skill.compile import compile_spec
 from bridle.skill.spec import ROW_TERMS, SpecError, parse_spec
@@ -442,7 +444,18 @@ class Skill:
 
     def __init__(self, *, name, env, kind, contract, reward, success,
                  params=None, scene=None, init=None, reward_scale=None, preflight=None,
-                 training=None, max_episode_steps=None):
+                 training=None, max_episode_steps=None, source=None):
+        #: The file that DEFINED this skill, captured from the caller's frame. It is what makes
+        #: `runs/<exp>` land next to the skill rather than in whatever directory the process was
+        #: started from — the one-file experience is only one file if its outputs know where it is.
+        #: Explicit `source=` wins; a skill built somewhere without a `__file__` (a REPL, an exec)
+        #: gets None and the launcher falls back to the working directory.
+        if source is None:
+            try:
+                source = sys._getframe(1).f_globals.get("__file__")
+            except Exception:                                     # noqa: BLE001 — best effort only
+                source = None
+        self.source = source
         self.name = name
         self.env = env
         self.env_ref = _env_reference(env)
@@ -510,9 +523,29 @@ class Skill:
         """`parse_spec(self.doc)` — the SAME schema tier a YAML document goes through."""
         return parse_spec(self.doc)
 
+    def horizon(self):
+        """The env's `max_episode_steps`, or None when it cannot be determined here.
+
+        AN OPTIONAL REACH FOR THE ADAPTER, AND THE ONLY ONE IN THIS MODULE. Stated
+        `max_episode_steps=` wins; otherwise `bridle.adapters.env_ref` is asked, because an env
+        CLASS carries its own `@register_env(..., max_episode_steps=N)` and reading N off it is the
+        whole reason a class is better than a string here. The import is guarded and the failure
+        returns None rather than a number: `compile_spec` then reports that the horizon-integrated
+        check could NOT be computed, which is the honest answer and is not the same as a pass.
+        Nothing here ever invents a horizon — CLAUDE.md gotcha (1) is a day lost to one that did.
+        """
+        if self.max_episode_steps is not None:
+            return self.max_episode_steps
+        try:
+            from bridle.adapters.env_ref import resolve_env_ref
+            search = _os.path.dirname(self.source) if self.source else None
+            return resolve_env_ref(self.env, search_dir=search).max_episode_steps
+        except Exception:                                         # noqa: BLE001 — absence is a state
+            return None
+
     def plan(self, *, horizon=None, terminate_on_success=True):
         """`compile_spec` over `self.spec()`. Every refusal — schema and compile — happens here."""
-        h = horizon if horizon is not None else self.max_episode_steps
+        h = horizon if horizon is not None else self.horizon()
         return compile_spec(self.spec(), horizon=h, terminate_on_success=terminate_on_success)
 
     def to_yaml(self):
@@ -584,13 +617,23 @@ class Skill:
         if a.yaml:
             print(self.to_yaml())
             return 0
-        plan = self.plan()
+        horizon = self.horizon()
+        with warnings.catch_warnings():
+            # Re-printed in full from `plan.warnings` below, which is the authoritative channel:
+            # the stdlib module's default filter is once per (message, location), so a second
+            # compile in one process would print nothing and the note would look like it went away.
+            warnings.simplefilter("ignore")
+            plan = self.plan(horizon=horizon)
         print(f"skill    {self.name} ({self.kind} chassis, contract {self.contract})")
-        print(f"env      {self.env_ref}")
+        print(f"env      {self.env_ref}  (max_episode_steps="
+              + (str(horizon) if horizon is not None
+                 else "UNKNOWN — not resolved, so the horizon-integrated check did NOT run") + ")")
         print(f"plan     plan@{plan.fingerprint()}, {len(plan.ops)} ops, scale {plan.scale}")
-        for w in plan.warnings:
-            print(f"  {w.level}: {' '.join(str(w).split())[:240]}")
         if not (a.verify or a.train or a.register_only):
+            # Printed HERE and not before the dispatch, because the launcher prints them again on
+            # its own recompile and one note printed twice reads as two notes.
+            for w in plan.warnings:
+                print(f"  {w.level}: {' '.join(str(w).split())[:240]}")
             print("\nchecked, nothing launched. Tiers 1-2 of 3 (schema -> compile): the document is "
                   "well-formed and internally consistent, NOT that the reward trains.")
             return 0
@@ -613,7 +656,10 @@ def _scalar(value):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return repr(value)
-    return json.dumps(value)
+    # `ensure_ascii=False`: the `why` prose is full of em dashes and the document is
+    # UTF-8. A double-quoted YAML scalar takes the same escapes JSON does, so this is
+    # still exact — it is only \uXXXX noise that goes away.
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _block_literal_ok(text):
