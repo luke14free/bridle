@@ -49,30 +49,48 @@ severities, checkpoint stamping, and the single rollout loop.
 
 ## 2 · Declare a skill
 
-A skill is a YAML document: a scene, a reward, and a criterion for success. No Python.
+A skill is **data**: an environment, a reward, a success criterion, and what to train it with. One
+file, and `python that_file.py` trains it.
 
-```yaml
-name: descend_to_target
-kind: carry                       # a chassis — supplies weight defaults and their rationale
-env_id: SO100DescendToTarget-v1
+```python
+from bridle.skill import Skill, Training, predicates as P, terms as T
 
-reward:
-  - PredicateBonus  {weight: 1.0, predicate: grasped,
-                     why: "hold on — never drop the cube; release is a separate skill"}
-  - DistancePull    {weight: 2.5, measure: height_above_seat_live, k: 6.0,
-                     setpoint: params.hover, gate: grasped,
-                     why: "peaks at hover, NOT at contact — peaking at contact broke 16/16 grasps"}
-  - SuccessBonus    {value: 12.0, mode: replace, scope: preceding, why: "..."}
+descend = Skill(
+    name="descend_to_target",
+    env=SO100DescendToTargetEnv,      # the env CLASS — its horizon is read off it, never typed
+    kind="carry",                     # a chassis: weight defaults AND the rationale for each
+    params={"hover": 0.015, "low_band": 0.03},
+    init={"after": "move_to_target",  # whose handoff this trains from — checked, not assumed
+          "snapshot": "descend_init_move", "sha256": "917e1025..."},
+    reward=[
+        T.PredicateBonus(1.0, P.grasped,
+            why="hold on — never drop the cube; release is a separate skill"),
+        T.DistancePull(2.5, "height_above_seat_live", k=6.0, setpoint="params.hover", gate=P.grasped,
+            why="peaks at hover, NOT at contact — peaking at contact broke 16/16 grasps"),
+        T.SuccessBonus(12.0, mode="replace", scope="preceding", why="..."),
+        T.ActionPenalty(0.001, why="..."),
+    ],
+    success=P.all(P.grasped, P.below_resting_height("params.low_band")),
+    training=Training(seed=20, num_envs=4096, gamma=0.9),
+)
 
-success: all[grasped, below_resting_height(band=params.low_band), ...]
+if __name__ == "__main__":
+    descend.train()
 ```
 
-Nine reward terms cover every row of a 15-primitive corpus. A shape they cannot express falls back to
-a safe arithmetic expression; a genuine one-off falls back to Python and is fingerprinted as opaque.
-`why:` is **mandatory on every row** — the rationale is the thing YAML usually destroys.
+**Rows are not summed — they fold in order**, because `mode` can be `add`, `replace` or `floor`. Put
+the action penalty after a `replace` row and a success step pays `12.0 - 0.001*||a||`, not a flat
+`12.0`. Order is part of the reward, and it is in the fingerprint.
 
-→ **[docs/skill-yaml.md](docs/skill-yaml.md)** — the document grammar, all nine terms, measures with
-sign and frame, predicates, and the six chassis.
+`why=` is **mandatory on every row**. The rationale for a number normally survives only in a source
+comment and dies in the next refactor; here it is a required field.
+
+**YAML is the same document, not a second system.** `bridle/skill/` imports no YAML at all —
+`parse_spec` takes a dict — so both spellings hit one compiler and produce the *same* fingerprint,
+pinned by a test. Write Python; hand a model YAML when the author is a model.
+
+→ **[docs/skill-yaml.md](docs/skill-yaml.md)** — the grammar, all nine terms, measures with sign and
+frame, the seventeen predicates, and the six chassis.
 
 ## 3 · Check it before the GPU
 
@@ -87,12 +105,27 @@ compiler also refuses combinations with a recorded failure mode — shaping that
 an attractor that peaks at the contact surface — and prints the resolved plan with every default it
 supplied on your behalf, so nothing you did not write is invisible.
 
+It also checks the reward's **inputs**, which is the half most systems leave unguarded:
+
+```console
+init.after:  MISMATCH — the document says move_to_target's handoff;
+             descend_init.npz records 'prim: grab'
+```
+
+That one is not hypothetical. A snapshot was swapped under a stable filename and fed the wrong
+handoff to a skill for two months; a reward proven byte-correct still trained to 0.06 instead of 0.94,
+because the *data* had changed and every fingerprint in the system stayed identical. Declaring
+`after:` makes the chain dependency checkable — no simulator required.
+
 ```console
 $ bridle skill vocab            # the whole authorable surface — paste into your model's prompt
 $ bridle skill compile f.yaml   # every row in fold order + the plan fingerprint
+$ bridle skill diagnose         # typed per-term diagnostics from a finished run
 ```
 
-Neither starts a simulator.
+None of these start a simulator. A preflight tier does, briefly, and asserts the things that make a
+run *capable* of succeeding — including where the episode starts — so a doomed run is refused in ~30
+seconds instead of discovered 15M steps later.
 
 ## 4 · Train it
 
@@ -113,6 +146,18 @@ class MySkillEnv(TheRegisteredEnv):       # scene, init and termination untouche
 
 Then PPO, exactly as before. The plan fingerprint goes into the run name, so *which reward document
 trained this checkpoint?* is answerable from your dashboard instead of from memory.
+
+**Does a reward authored this way actually train?** Measured, on the reference primitive:
+
+| | |
+|---|---|
+| compiled reward vs. the hand-written Python it reproduces | **0 of 4456** recorded states and **0 of 12,288** live env-steps above 1e-5 |
+| state teacher from the document | **0.9375**, early-stopped at 16.4M steps |
+| the Python-reward lineage it reproduces | **0.9375** |
+| distilled rgb+proprio student | **0.883**, and **0.133** with the camera blanked |
+
+The last row is the one that matters most: the ablation is what makes "it uses vision" a measurement
+rather than a claim, and the student reads no privileged state at all.
 
 → **[docs/training.md](docs/training.md)** — the derived env, numerical-equivalence verification,
 per-term diagnostics, `Foundry` stage planning, and checkpoint stamping.
@@ -155,7 +200,7 @@ PYTHONPATH=. python3 bridle/tests/test_resolve.py   # any module standalone, non
 python -m pytest bridle/tests                       # everything
 ```
 
-21 test modules, no simulator, no GPU, a few seconds.
+25 test modules, no simulator, no GPU, a few seconds.
 
 ## Status
 

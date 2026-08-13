@@ -26,10 +26,11 @@ adapter binding a live session to `Runner`.
 - **No skills ship with the library.** The store starts empty; you author or import apps.
 - **`scene:` is parsed, not synthesised.** A skill document's `env_id` must name an environment that
   already exists. Authoring a genuinely new scene still needs a Python env file.
-- **A skill document has not yet trained a policy to completion.** The compiled reward is proven
-  numerically equivalent to a hand-written one, and it trains — but the claim "a reward authored this
-  way reaches the same success as the reward it reproduces" is not yet demonstrated end to end. Treat
-  it as unproven until it is.
+- ~~**A skill document has not yet trained a policy to completion.**~~ **Resolved 2026-08-13.** A
+  document-compiled reward trained the reference primitive to **0.9375**, early-stopped at 16.4M
+  steps — the same number as the Python-reward lineage it reproduces — and distilled to an
+  rgb+proprio student at **0.883** (0.133 with the camera blanked, so it genuinely uses vision).
+  Demonstrated on **one** primitive. That is a proof of the mechanism, not a track record.
 - **`forall` / `for_n` are declared but not evaluable.** They are what "all bricks in the bin" will
   need; today a document using them is refused rather than silently wrong.
 - **Parallel-jaw grippers only.** Suction and multi-finger are not modelled.

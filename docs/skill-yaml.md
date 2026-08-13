@@ -2,6 +2,14 @@
 
 [← README](../README.md)
 
+> **YAML is a serialization, not the design.** `bridle/skill/` imports no YAML anywhere —
+> `parse_spec` takes a plain `dict`. There is a typed Python front-end (`bridle.skill.Skill`,
+> `Training`, `terms`, `predicates`) whose builders are generated from the vocabulary, so a new term
+> cannot leave it behind; it produces the same document, through the same compiler, to the **same
+> fingerprint**, pinned by a test. Write Python for yourself; hand a model YAML when the author is a
+> model, because you can safely parse an untrusted document and you cannot safely `exec` untrusted
+> code. Everything below describes the shared shape, in its YAML spelling.
+
 A skill is a YAML file declaring a scene, a reward, and a criterion for success. The intended author
 is a **local 27–30B model**, which is the constraint that shapes everything here: the vocabulary must
 fit in a prompt alongside a task description, and every refusal must be something the model can act
@@ -26,7 +34,10 @@ env_id: SO100DescendToTarget-v1    # an EXISTING registered env (see the scope l
 scene:
   goal: {type: platform, half: 0.04, top_z: 0.03}
   held: {type: cube, half: [0.014, 0.016]}
-init: {snapshot: descend_init}
+init:
+  after: move_to_target            # WHOSE handoff this trains from — see below
+  snapshot: descend_init_move
+  sha256: "917e1025..."            # the CONTENT, so a swapped file is a refusal
 
 params:                            # per-skill physics the Contract has no field for
   hover: {value: 0.015, severity: retrain, doc: "reward attractor height above resting"}
@@ -139,3 +150,31 @@ A model may still choose bad weights. It may not choose a combination that is al
 The `scene:` block is parsed, validated and printed, but **not synthesised into a simulator
 environment**. `env_id` must name an env that already exists. Authoring a genuinely new scene still
 needs a Python env file; generating one is a later phase.
+
+
+## `init:` — declaring the chain, not just naming a file
+
+A downstream skill trains on the states its predecessors actually leave it. That dependency used to
+be an opaque filename, and the failure mode is not theoretical: a snapshot was replaced under a
+stable name with a *different predecessor's* handoff, and it fed the wrong initiation set to a skill
+for two months. A reward proven byte-identical to its reference still trained to 0.06 instead of
+0.94, because the data had changed and the reward fingerprint — which covers ops and scale — could
+not see it.
+
+So `init:` declares what the document expects, and three checks enforce it:
+
+| check | needs | refuses when |
+|---|---|---|
+| `init.after` | nothing — pure data | the snapshot's own recorded provenance names a different predecessor |
+| `init.sha256` | nothing — pure data | the file's content is not the content the document declares |
+| preflight initiation distribution | a simulator, ~30 s | the episode does not start where this skill's reward was tuned for |
+
+The snapshot files already recorded their provenance (`{"after": "move_to_target", ...}` or
+`{"prim": "grab", ...}`); nothing had ever compared it to the document. When a file records no
+provenance at all the check reports **NOT CHECKED** — it never passes silently.
+
+The third check is the one the first two cannot replace. The project's own capture rule said to
+validate a fresh snapshot by asserting *grasped-majority and plausible z* — and the broken snapshot
+**passes both**: the cube is held, and it is airborne at a perfectly plausible height. What it is
+not, is anywhere near where this skill is supposed to move it from (29.6 cm versus 8.4). Assert the
+distance to the skill's own goal, not just that the object exists and is held.
