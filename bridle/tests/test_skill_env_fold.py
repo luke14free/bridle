@@ -25,10 +25,19 @@ ProgressPotential row (`prev_place_dist` appears only in its `_initialize_episod
 `.clone()`, and `_advance_state`'s write ordering were executed by no assertion at all. All of that
 is cheaper and better tested here, against a fake env of CPU tensors, than against a simulator.
 
-WHAT IS NOT COVERED HERE, deliberately: ground-truth VALUES for the ten measures that need a real
-robot (`contact_force`, `joint_qpos`, ...). This file uses a fake env, so a measure here is only as
-true as the fake. Those belong in `scripts/probe_skill_env.py` against ManiSkill, and are listed as
-outstanding in the task report.
+GROUND-TRUTH VALUES, AND THE FOUR THAT ARE STILL NOT HERE. Blocks [K] and [L] pin what each measure
+and each predicate actually READS, per environment — 15 of the 19 measures and 15 of the 17
+predicates. Until 2026-08-13 nothing did: `fold_both` reads the batch once and hands the same values
+to both evaluators, so a wrong reading is wrong identically on both sides and they agree. Measured
+that day: mutating `_m_height_above_seat_live` to `.abs()` left all 21 bridle test files green, and
+so did `_p_not` not negating and `_p_or` returning `_p_and`. Nineteen such mutations were run against
+[K]/[L] afterwards and all nineteen go red.
+
+Four measures remain uncovered and are declared as a partition rather than omitted (K1), because a
+fake env cannot fabricate their reading: `contact_force` (`robot.get_net_contact_forces`),
+`joint_pos_margin_to_limit` (`robot.get_qlimits`), and `joint_qpos` / `scene_object_xy_drift` (both
+refuse without an `EnvBinding` naming what they read). Those belong in `scripts/probe_skill_env.py`
+against ManiSkill.
 
 THE PLANS ARE BUILT AS `Op`s DIRECTLY, not compiled from a document. The unit under test is the
 FOLD, and its input is a plan; going through `parse_spec`/`compile_spec` would add a dependency on
@@ -810,6 +819,291 @@ def run_checks():
           [float(x) for x in below[1:]] == [1.0, 1.0, 0.0]
           and [float(x) for x in in_band[1:]] == [1.0, 1.0, 0.0],
           f"below={[float(x) for x in below]}, in_band={[float(x) for x in in_band]}")
+
+    # ── [K] absolute VALUES for every measure a fake env can compute exactly ─────────────────────
+    # WHY THIS BLOCK EXISTS, and what was wrong with the apparatus without it. Blocks [A]-[G]
+    # compare the two folds against EACH OTHER: `fold_both` reads the batch ONCE through
+    # `_values_for` and hands the same dict to both evaluators, so a measure that returns the wrong
+    # number returns the same wrong number to both and they agree. Block [J] checks predicates for
+    # dtype, shape and range and never for TRUTH. Measured 2026-08-13: mutating
+    # `_m_height_above_seat_live` to return `.abs()` — turning the signed reading into a magnitude —
+    # left ALL 21 bridle test files green. That is design §1 correction 1's exact defect: the crush
+    # penalty is `-3.0*clamp(-sdz, min=0)`, which becomes identically zero, so the term that exists
+    # because pressing the cube to dz=0 broke 16/16 grasps (2026-06-04) silently vanishes while
+    # training and logging look normal. Nine lines of docstring directly above that return say so;
+    # nothing executed the claim.
+    print("\n[K] measure values, pinned absolutely")
+    #: The seat: `platform_top_z + cube_half_sizes` = 0.03 + 0.014. Two of the four cubes below it
+    #: ON PURPOSE — a pin taken entirely above the seat is one `.abs()` cannot fail.
+    SEAT = 0.03 + 0.014
+    env_k = FakeEnv()
+    env_k.cube.pose.p[:] = torch.tensor([[0.25, 0.05, 0.100],     # dxy 0,     seat +0.056
+                                         [0.28, 0.05, 0.044],     # dxy 0.03,  seat  0.000
+                                         [0.25, 0.09, 0.030],     # dxy 0.04,  seat -0.014
+                                         [0.31, 0.13, 0.020]])    # dxy 0.10,  seat -0.024
+    slots_k = SE.StateSlots()
+    slots_k.ensure(env_k)
+    ctx_k = SE.MeasureContext(env_k, None, action, {}, slots_k, SE.DEFAULT_BINDING, where="test")
+
+    #: `||[0.1, -0.2, 0.3, 0.0, 0.05, -0.1]||` — `action_of`'s vector, spelled out rather than
+    #: recomputed from it, so this pin does not move when that helper does.
+    A_NORM = math.sqrt(0.1**2 + 0.2**2 + 0.3**2 + 0.0**2 + 0.05**2 + 0.1**2)
+    #: Every expected number is arithmetic on the FIXTURE constants above and reads nothing from the
+    #: adapter. tcp sits at (0.25, 0.05, 0.12); the goal at (0.25, 0.05, 0.045).
+    pinned = {
+        "tcp_to_object": [0.02,
+                          math.sqrt(0.03**2 + 0.000**2 + 0.076**2),
+                          math.sqrt(0.00**2 + 0.040**2 + 0.090**2),
+                          math.sqrt(0.06**2 + 0.080**2 + 0.100**2)],
+        "object_to_goal_xy": [0.0, 0.03, 0.04, 0.10],
+        "object_to_goal_z": [0.055, 0.001, 0.015, 0.025],
+        # L1 composite `||dxy|| + |dz|`, NOT a 3D norm — env 3 reads 0.125, a 3D norm would read
+        # sqrt(0.10^2 + 0.025^2) = 0.1031.
+        "object_to_goal_xy_plus_z": [0.055, 0.031, 0.055, 0.125],
+        # SIGNED, table frame (resting_surface_z=0.0): z - cube_half_sizes.
+        "height_above_resting": [0.086, 0.030, 0.016, 0.006],
+        # SIGNED, seat frame. THE ONE THIS BLOCK IS FOR — see K3.
+        "height_above_seat_live": [0.056, 0.000, -0.014, -0.024],
+        # No `_stack_goal` published by the fake, so the goal freezes on this first read at the
+        # live seat and the two frames coincide HERE. That they then diverge is E4/E5's subject.
+        "height_above_seat_static_goal": [0.056, 0.000, -0.014, -0.024],
+        "object_z": [0.100, 0.044, 0.030, 0.020],
+        # SIGNED: the jaw joint, `get_qpos()[..., -1]`. Negative is closed; a magnitude here would
+        # invert descend's `HingePenalty{threshold: -0.6, side: above}` grip term.
+        "gripper_qpos": [-0.70, -0.70, -0.70, -0.70],
+        "object_linear_velocity": [0.0, 0.0, 0.0, 0.0],
+        "object_angular_velocity": [0.0, 0.0, 0.0, 0.0],
+        "action_norm": [A_NORM] * N,
+        # Identity quaternions against goal_yaw=0.0.
+        "yaw_diff_mod_symmetry": [0.0, 0.0, 0.0, 0.0],
+        # Both seed their anchor from the FIRST read, so zero here is the definition and not a
+        # verdict; K4 below is where these two actually bite.
+        "action_delta_norm": [0.0, 0.0, 0.0, 0.0],
+        "object_xy_drift_from_reset": [0.0, 0.0, 0.0, 0.0],
+    }
+    #: Not pinned here, each with the reading a fake env cannot fabricate. This is a PARTITION, not
+    #: a list of exceptions: K1 asserts the two halves cover `MEASURE_FNS` exactly, so a measure
+    #: added tomorrow has to be pinned or declared unpinnable, and cannot simply be absent.
+    deferred = {
+        "contact_force": "needs robot.get_net_contact_forces over the finger-pad links",
+        "joint_pos_margin_to_limit": "needs robot.get_qlimits()",
+        "joint_qpos": "needs EnvBinding(joint=...); refuses by design without one",
+        "scene_object_xy_drift": "needs EnvBinding(scene_object=...); refuses by design without one",
+    }
+    check("K1 every measure is either pinned to a value here or declared unpinnable with a reason",
+          set(pinned).isdisjoint(deferred)
+          and set(pinned) | set(deferred) == set(SE.MEASURE_FNS),
+          f"{len(pinned)} pinned + {len(deferred)} deferred vs {len(SE.MEASURE_FNS)} implemented; "
+          f"unaccounted: {sorted(set(SE.MEASURE_FNS) ^ (set(pinned) | set(deferred)))}")
+
+    wrong = []
+    with _warnings_off():                      # `height_above_resting` warns about its frame — [H4]
+        for name, want in pinned.items():
+            got_m = ctx_k.measure(name)
+            if not all(abs(float(got_m[i]) - want[i]) <= 1e-6 for i in range(N)):
+                wrong.append(f"{name}: {[round(float(x), 6) for x in got_m]} != {want}")
+    check("K2 every pinned measure reads the value the fixture makes it, per environment",
+          not wrong, "; ".join(wrong) or f"{len(pinned)} measures")
+
+    # K3 restates part of K2 on purpose. K2 would go red for `.abs()` too, but it would go red as
+    # "one of fifteen numbers moved"; this one names the mutation and the 16/16 grasps behind it, so
+    # the next reader knows which property they are looking at rather than which line they broke.
+    seat_live = [float(x) for x in ctx_k.measure("height_above_seat_live")]
+    check("K3 `height_above_seat_live` is SIGNED: a cube pressed INTO the seat reads NEGATIVE, and "
+          "the magnitude of this reading is a different vector — `.abs()` here makes descend's "
+          "crush penalty `-3.0*clamp(-sdz, min=0)` identically zero (16/16 grasps, 2026-06-04)",
+          min(seat_live) < 0.0
+          and sum(1 for v in seat_live if v < 0.0) == 2
+          and [abs(v) for v in seat_live] != [round(v, 9) for v in seat_live],
+          f"{[round(v, 4) for v in seat_live]} — abs() would read "
+          f"{[round(abs(v), 4) for v in seat_live]}")
+
+    # K4: the two measures whose first read is zero by construction, read a SECOND time after the
+    # thing they track has moved. Without this they are pinned at a number any broken implementation
+    # returning a constant zero would also produce.
+    env_k.cube.pose.p[:, 0] += 0.03
+    env_k.cube.pose.p[:, 1] += 0.04                       # 3-4-5: the xy drift is exactly 0.05
+    ctx_k2 = SE.MeasureContext(env_k, None, action_of(torch, 2.0), {}, slots_k,
+                               SE.DEFAULT_BINDING, where="test")
+    drift = [float(x) for x in ctx_k2.measure("object_xy_drift_from_reset")]
+    delta = [float(x) for x in ctx_k2.measure("action_delta_norm")]
+    check("K4 `object_xy_drift_from_reset` measures FROM the seeded anchor (moved 3cm x, 4cm y) and "
+          "`action_delta_norm` measures from the previous action (doubled, so the delta is `a`)",
+          all(abs(v - 0.05) <= 1e-6 for v in drift) and all(abs(v - A_NORM) <= 1e-6 for v in delta),
+          f"drift={[round(v, 5) for v in drift]} (want 0.05), "
+          f"delta={[round(v, 5) for v in delta]} (want {A_NORM:.5f})")
+
+    # ── [L] the boolean predicates, as TRUTH TABLES ──────────────────────────────────────────────
+    # [J] proves each predicate returns an (N,) float in [0,1]. It cannot see a wrong answer, and
+    # measured 2026-08-13 it did not: `_p_not` returning its argument unchanged, and `_p_or`
+    # returning `_p_and`, both left all 21 test files green. Every table below is chosen so the
+    # answer differs per environment — a predicate that is constant, inverted, or confused with its
+    # sibling produces a different vector, not a differently-shaped one.
+    print("\n[L] predicate truth tables")
+    env_l = FakeEnv()
+    env_l.cube.pose.p[:] = torch.tensor([[0.25, 0.05, 0.100],      # dxy 0.00, above 0.06
+                                         [0.28, 0.05, 0.044],      # dxy 0.03
+                                         [0.25, 0.09, 0.030],      # dxy 0.04
+                                         [0.31, 0.13, 0.020]])     # dxy 0.10
+    # Rest for envs 0 only: env 1 is moving, env 2 is spinning, env 3 is moving fast.
+    env_l.cube.linear_velocity = torch.tensor([[0.0, 0.0, 0.00], [0.0, 0.0, 0.05],
+                                               [0.0, 0.0, 0.00], [0.3, 0.0, 0.00]])
+    env_l.cube.angular_velocity = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0],
+                                                [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]])
+    slots_l = SE.StateSlots()
+    slots_l.ensure(env_l)
+    ctx_l = SE.MeasureContext(env_l, None, action, {}, slots_l, SE.DEFAULT_BINDING, where="test")
+
+    def truth(ctx, text):
+        return [float(x) for x in ctx.predicate(text)]
+
+    #: `_Agent.is_grasping` is fixed at [T, T, F, T], and above_z(0.06) is [1, 0, 0, 0] on the z
+    #: column above — two DIFFERENT vectors, which is what makes and_/or_ distinguishable at all.
+    tables = {
+        "grasped": [1.0, 1.0, 0.0, 1.0],
+        "not_grasped": [0.0, 0.0, 1.0, 0.0],
+        "above_z(z=0.06)": [1.0, 0.0, 0.0, 0.0],
+        # Strict `>`: env 1 sits exactly AT 0.044 and is not above it.
+        "above_z(z=0.044)": [1.0, 0.0, 0.0, 0.0],
+        "above_z(z=0.019)": [1.0, 1.0, 1.0, 1.0],
+        "not_(grasped)": [0.0, 0.0, 1.0, 0.0],
+        "not_(above_z(z=0.06))": [0.0, 1.0, 1.0, 1.0],
+        "not_(not_(grasped))": [1.0, 1.0, 0.0, 1.0],
+        "and_(grasped, above_z(z=0.06))": [1.0, 0.0, 0.0, 0.0],
+        "or_(grasped, above_z(z=0.06))": [1.0, 1.0, 0.0, 1.0],
+        "and_(grasped, above_z(z=0.019))": [1.0, 1.0, 0.0, 1.0],
+        "or_(not_grasped, above_z(z=0.06))": [1.0, 0.0, 1.0, 0.0],
+        # Three arguments, not two: a fold that stops after the first pair reads [1, 0, 0, 0] here.
+        "and_(grasped, above_z(z=0.019), not_(above_z(z=0.06)))": [0.0, 1.0, 0.0, 1.0],
+        "or_(above_z(z=0.06), not_grasped, at_rest(linear=0.02, angular=0.5))": [1.0, 0.0, 1.0, 0.0],
+        "below_height(z=0.044)": [0.0, 0.0, 1.0, 1.0],
+        # Strict `<` on the xy distance to the goal: 0.00, 0.03, 0.04, 0.10.
+        "within_radius(anchor=target_pos, radius_expr=0.035)": [1.0, 1.0, 0.0, 0.0],
+        "within_radius(anchor=target_pos, radius_expr=0.05)": [1.0, 1.0, 1.0, 0.0],
+        # The strictness itself, probed at radius ZERO. Env 0's cube xy is the goal literal, so its
+        # distance is exactly 0.0 and `<=` would admit it where `<` does not — a boundary the other
+        # two radii cannot see, because every non-zero distance here runs through a sqrt and lands
+        # a few ULP off the round decimal it was built from.
+        "within_radius(anchor=target_pos, radius_expr=0.0)": [0.0, 0.0, 0.0, 0.0],
+        # `in_cylinder` takes its centre from the goal and applies BOTH the radius and the floor:
+        # radius alone is [1,1,1,0], floor=0.035 alone is [1,1,0,0].
+        "in_cylinder(radius=0.05, floor=0.01)": [1.0, 1.0, 1.0, 0.0],
+        "in_cylinder(radius=0.05, floor=0.035)": [1.0, 1.0, 0.0, 0.0],
+        # BOTH bounds are applied: linear alone is [1,0,1,0], angular alone is [1,1,0,1].
+        "at_rest(linear=0.02, angular=0.5)": [1.0, 0.0, 0.0, 0.0],
+        "at_rest(linear=0.02)": [1.0, 0.0, 1.0, 0.0],
+        "at_rest(angular=0.5)": [1.0, 1.0, 0.0, 1.0],
+    }
+    bad_truth = [f"{text} -> {truth(ctx_l, text)} != {want}"
+                 for text, want in tables.items() if truth(ctx_l, text) != want]
+    check("L1 every boolean predicate answers the truth table its fixture dictates",
+          not bad_truth, "; ".join(bad_truth) or f"{len(tables)} spellings")
+
+    # L2 names the two mutations the reviewer ran, because L1 going red says "a table moved" and a
+    # reader deserves to know which property that is.
+    check("L2 `not_` NEGATES (it is not the identity) and `or_` is not `and_`",
+          truth(ctx_l, "not_(grasped)") != truth(ctx_l, "grasped")
+          and truth(ctx_l, "or_(grasped, above_z(z=0.06))")
+              != truth(ctx_l, "and_(grasped, above_z(z=0.06))"),
+          f"not_(grasped)={truth(ctx_l, 'not_(grasped)')}, "
+          f"or_={truth(ctx_l, 'or_(grasped, above_z(z=0.06))')}, "
+          f"and_={truth(ctx_l, 'and_(grasped, above_z(z=0.06))')}")
+
+    # L3-L5: `latched` and `sustained` are the two predicates whose answer is a function of the
+    # HISTORY, so a single read cannot pin either. Each step below is a fresh MeasureContext over
+    # the same StateSlots — that is what a control step is — and `env.move(0.0)` ticks
+    # `elapsed_steps`, which is the guard `StateSlots.fresh_rows` uses to advance a streak at most
+    # once per step.
+    def step_l(texts):
+        c = SE.MeasureContext(env_l, None, action, {}, slots_l, SE.DEFAULT_BINDING, where="test")
+        return [truth(c, t) for t in texts]
+
+    LATCH = "latched(above_z(z=0.06))"
+    first = step_l([LATCH])[0]
+    env_l.move(-0.05)                       # every cube drops 5cm: nothing is above 0.06 any more
+    dropped = step_l([LATCH, "above_z(z=0.06)"])
+    env_l.cube.pose.p[1, 2] = 0.090         # env 1 rises above the line for the first time
+    risen = step_l([LATCH])[0]
+    check("L3 `latched` is OR-accumulated over the episode: it holds env 0 true after the cube "
+          "falls back below the line, and admits env 1 the step it first crosses",
+          first == [1.0, 0.0, 0.0, 0.0]
+          and dropped == [[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]
+          and risen == [1.0, 1.0, 0.0, 0.0],
+          f"{first} -> {dropped[0]} (live {dropped[1]}) -> {risen}")
+
+    # `_p_grasped` prefers `info["is_grasped"]` when the dict carries it, which is what makes the
+    # streak drivable step by step on a fake whose `is_grasping` is a constant.
+    env_s, slots_s = FakeEnv(), SE.StateSlots()
+    slots_s.ensure(env_s)
+    K2_, K3_ = "sustained(grasped, k=2, consecutive=True)", "sustained(grasped, k=3, consecutive=True)"
+
+    def step_s(held, texts):
+        env_s.move(0.0)                                            # tick elapsed_steps
+        c = SE.MeasureContext(env_s, None, action,
+                              {"is_grasped": torch.tensor(held)}, slots_s,
+                              SE.DEFAULT_BINDING, where="test")
+        return [truth(c, t) for t in texts]
+
+    HOLD = [True, True, False, True]
+    s1 = step_s(HOLD, [K2_, K3_])
+    s2 = step_s(HOLD, [K2_, K3_])
+    s3 = step_s(HOLD, [K2_, K3_])
+    check("L4 `sustained`'s `k` IS the threshold: k=2 is false after one step and true after two, "
+          "k=3 is still false after two and true after three",
+          s1 == [[0.0] * N, [0.0] * N]
+          and s2 == [[1.0, 1.0, 0.0, 1.0], [0.0] * N]
+          and s3 == [[1.0, 1.0, 0.0, 1.0], [1.0, 1.0, 0.0, 1.0]],
+          f"step1 k2={s1[0]} k3={s1[1]}; step2 k2={s2[0]} k3={s2[1]}; step3 k2={s3[0]} k3={s3[1]}")
+
+    env_c, slots_c = FakeEnv(), SE.StateSlots()
+    slots_c.ensure(env_c)
+    CONS = "sustained(grasped, k=2, consecutive=True)"
+    CUML = "sustained(grasped, k=2, consecutive=False)"
+
+    def step_c(held):
+        env_c.move(0.0)
+        c = SE.MeasureContext(env_c, None, action, {"is_grasped": torch.tensor(held)}, slots_c,
+                              SE.DEFAULT_BINDING, where="test")
+        return [truth(c, CONS), truth(c, CUML)]
+
+    step_c([True, True, False, True])                    # env 1 has held for one step
+    step_c([True, False, False, True])                   # ...and slips
+    c3 = step_c([True, True, False, True])               # ...and re-grips
+    check("L5 `consecutive` is not cosmetic: after a slip the consecutive streak restarts from zero "
+          "while the cumulative one carries its earlier steps — the cumulative form false-passed "
+          "flaky grips before 2026-06-25 (vocab.PREDICATES)",
+          c3[0] == [1.0, 0.0, 0.0, 1.0] and c3[1] == [1.0, 1.0, 0.0, 1.0],
+          f"consecutive={c3[0]}, cumulative={c3[1]} on env 1 (held, slipped, re-gripped)")
+
+    # L6: `undisturbed`'s drift arm, which is also a two-read property — the anchor is seeded on the
+    # first read, so a single read can only ever return "true" and pins nothing.
+    env_u, slots_u = FakeEnv(), SE.StateSlots()
+    slots_u.ensure(env_u)
+    UND = "undisturbed(drift=0.01, tilt=0.3)"
+    settled = truth(SE.MeasureContext(env_u, None, action, {}, slots_u, SE.DEFAULT_BINDING,
+                                      where="test"), UND)
+    env_u.cube.pose.p[:2, 0] += 0.05                    # envs 0 and 1 are shoved 5cm, 2 and 3 are not
+    moved = truth(SE.MeasureContext(env_u, None, action, {}, slots_u, SE.DEFAULT_BINDING,
+                                    where="test"), UND)
+    check("L6 `undisturbed` measures drift SINCE the reset anchor, not against zero: the two envs "
+          "shoved 5cm past a 1cm budget go false and the two that did not move stay true",
+          settled == [1.0] * N and moved == [0.0, 0.0, 1.0, 1.0],
+          f"{settled} -> {moved}")
+
+    # L0 LAST, so it is a statement about what the block above actually did. Same rule as K1: this
+    # is a PARTITION over `PREDICATE_FNS`, so a predicate added tomorrow lands in one of the three
+    # lists or the check goes red — it cannot simply be missing, which is how `_p_not` and `_p_or`
+    # came to have no truth table at all.
+    pinned_here = {"grasped", "not_grasped", "above_z", "below_height", "within_radius",
+                   "in_cylinder", "at_rest", "and_", "or_", "not_", "latched", "sustained",
+                   "undisturbed"}
+    pinned_in_j = {"height_above_resting_in", "below_resting_height"}     # J3/J4, the 37/64 gap
+    refuse_here = {"forall", "for_n"}                                     # J2, unimplemented
+    check("L0 every predicate has a truth table here, a value pin in [J], or is a declared refusal",
+          len(pinned_here | pinned_in_j | refuse_here) == 17
+          and pinned_here | pinned_in_j | refuse_here == set(SE.PREDICATE_FNS),
+          f"unaccounted: "
+          f"{sorted(set(SE.PREDICATE_FNS) ^ (pinned_here | pinned_in_j | refuse_here))}")
 
 
 def _run_and_collect():
