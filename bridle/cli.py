@@ -525,6 +525,40 @@ def _skill_env_check(a, spec):
     return check_env_ref(spec.env_id, search_dir=os.path.dirname(os.path.abspath(a.file)))
 
 
+def _skill_init_check(a, spec):
+    """Do the document's `init:` claims match the capture on disk? `(findings, refused)`.
+
+    THE CHEAPEST REAL CHECK IN THIS COMMAND. It opens one file, reads its recorded provenance and
+    hashes its contents — no simulator, no GPU, no import of the primitive. The bug it exists to
+    refuse cost ~a day of GPU across two dead runs: the bytes behind `snapshot: descend_init` were
+    replaced on 2026-06-10 by a different primitive's handoff, and the file SAID SO in its own
+    metadata while the document did not, for two months (`bridle.adapters.snapshot_ref`).
+
+    SAME THREE OUTCOMES AS `env_id` ABOVE, for the same reason. A MISMATCH refuses. A claim that
+    could not be evaluated — no capture reachable from this machine, no provenance recorded in the
+    file, no adapter importable — prints NOT CHECKED and does not fail: this checker must never
+    render "could not verify" as "verified", and must not refuse a document merely because the
+    machine reading it does not hold the captures.
+    """
+    if not spec.init:
+        return [], False
+    try:
+        from bridle.adapters.snapshot_ref import NOT_CHECKED, Finding, check_init
+    except Exception as e:                                        # noqa: BLE001
+        return [type("_F", (), {"line": lambda self: (
+            f"init: NOT CHECKED — bridle.adapters.snapshot_ref unavailable "
+            f"({type(e).__name__}: {e})"), "refused": False})()], False
+    findings = check_init(spec.init, search_dir=os.path.dirname(os.path.abspath(a.file)))
+    if not findings:
+        name = spec.init.get("snapshot")
+        findings = [Finding(NOT_CHECKED, "init",
+                            f"`init:` names {name!r} and claims nothing about it. Declare "
+                            f"`after:` (the predecessor whose handoff this is) and/or `sha256:` "
+                            f"(its content digest) and this line becomes a check."
+                            if name else "`init:` is empty")]
+    return findings, any(f.refused for f in findings)
+
+
 def _skill_contract_check(spec):
     """Does `contract:` name a `bridle.contract.Contract` factory? Reported, never refused.
 
@@ -609,6 +643,23 @@ def cmd_skill(a):
 
     env_status, env_detail = _skill_env_check(a, spec)
     contract_line = _skill_contract_check(spec)
+    init_findings, init_refused = _skill_init_check(a, spec)
+    if init_refused:
+        # Printed BEFORE the env tier and returning immediately: this refusal is about the states
+        # the run would start from, and a document whose initiation set is a different task from the
+        # one it describes is not made acceptable by its env resolving.
+        body = "\n".join(wrap(f.line(), "  ") for f in init_findings)
+        print("skill check FAILED — tier 1.5, the initiation set is not the one the document "
+              "describes\n\n" + body + "\n\n" + wrap(
+                  f"The reward compiled — plan@{plan.fingerprint()} — and it is not the reward that "
+                  f"is wrong. A skill trains on the states its predecessor leaves it, so an "
+                  f"initiation set swapped underneath a document silently changes the task: on "
+                  f"2026-06-10 exactly this swap (move_to_target's handoff replaced by grab's, mean "
+                  f"8.4 cm from target replaced by mean 29.6 cm) cost two full training runs and "
+                  f"~a day of GPU with nothing objecting. Point `init.snapshot:` at the right "
+                  f"capture, or — if the capture was deliberately regenerated — update the claim "
+                  f"and say why.", "  "))
+        return 1
     if env_status == "unknown":
         tail = (f"The reward compiled — plan@{plan.fingerprint()} — but a document that names an "
                 f"env nothing can build trains nothing. Fix `env_id:`, or point the check at an "
@@ -623,6 +674,8 @@ def cmd_skill(a):
     print(f"  env_id    {spec.env_id} — " + ("resolved: " + env_detail if env_status == "ok"
                                              else "NOT CHECKED: " + env_detail))
     print(f"  contract  {contract_line}")
+    for f in init_findings:
+        print(f"  {f.line()}")
     print(format_warnings(plan))
     print("\n" + wrap(
         "Passed tiers 1-2 of 3 (schema -> compile -> preflight). No simulator was started, so this "

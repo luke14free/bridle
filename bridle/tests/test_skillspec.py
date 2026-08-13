@@ -654,6 +654,40 @@ def run_checks():
     refuses("a param with no severity", doc_with(params={"hover": {"value": 0.015}}),
             "severity", "retrain", path="params.hover.severity")
 
+    # ── init: THE CLAIMS A DOCUMENT MAKES ABOUT ITS INITIATION SET ──────────────────────────────
+    # 2026-06-10: the bytes behind `snapshot: descend_init` were replaced with a different
+    # primitive's handoff (mean 29.6 cm from the target instead of 8.4, 0.000 of starts inside the
+    # 6 cm the re-centring reward was tuned for) and nothing objected — `init:` carried a NAME and
+    # nothing else. `after:`/`sha256:` are the checkable claims; the FILE is read by
+    # `bridle.adapters.snapshot_ref`, so what is asserted here is only the shape and the coherence.
+    full_init = {"snapshot": "descend_init_move", "after": "move_to_target",
+                 "chain": ["reach", "grab", "lift", "move_to_target"], "sha256": "ab" * 32}
+    s = accepts("a full init block", doc_with(init=full_init))
+    check("init carries its digest and predecessor through",
+          s is not None and s.init["sha256"] == "ab" * 32
+          and s.init["after"] == "move_to_target" and tuple(s.init["chain"])[-1] == "move_to_target")
+    check("a bare `snapshot:` still parses — every claim is optional and existing documents "
+          "must not break",
+          parse_spec(doc_with(init={"snapshot": "descend_init"})).init["snapshot"] == "descend_init")
+    check("so does no init block at all", parse_spec(doc_with(init=DROP)).init == {})
+    # No `suggestion=` asserted: difflib does not consider `shasum` close enough to `sha256`, and a
+    # test that demanded one would be asserting difflib's threshold rather than this module's
+    # contract. The LEGAL SET is what must always be printed, and it is.
+    refuses("an unknown init field", doc_with(init={"snapshot": "x", "shasum": "ab" * 32}),
+            "shasum", "after, chain, sha256, snapshot", path="init.shasum")
+    refuses("a digest that is not 64 hex", doc_with(init={"snapshot": "x", "sha256": "deadbeef"}),
+            "64 lowercase hex", path="init.sha256")
+    refuses("an uppercase digest (one spelling, so two documents cannot disagree by case)",
+            doc_with(init={"snapshot": "x", "sha256": "AB" * 32}), path="init.sha256")
+    refuses("a digest with nothing to check it against", doc_with(init={"sha256": "ab" * 32}),
+            "names nothing to check", path="init.sha256")
+    refuses("a chain whose last step contradicts `after`",
+            doc_with(init={"snapshot": "x", "after": "move_to_target",
+                           "chain": ["reach", "grab"]}),
+            "move_to_target", path="init.chain")
+    refuses("a chain that is not a list", doc_with(init={"snapshot": "x", "chain": "reach,grab"}),
+            path="init.chain")
+
     # ── preflight asserts, checked against what bridle.preflight can actually run ───────────────
     refuses("an unknown preflight tier", doc_with(preflight={"statix": {}}), "statix", "static",
             path="preflight.statix", suggestion="static")

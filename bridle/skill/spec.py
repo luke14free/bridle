@@ -707,6 +707,127 @@ def _parse_scene(raw):
     return _freeze(raw)
 
 
+#: `init:` fields. `snapshot` names the initiation set; the other three are the CLAIMS about it that
+#: `bridle.adapters.snapshot_ref` checks. All optional — see `_parse_init`.
+_INIT_FIELDS = ("snapshot", "sha256", "after", "chain")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _parse_init(raw):
+    """`init:` — WHERE THE EPISODE STARTS, and the claims about it that can be checked.
+
+    WHY THIS BLOCK GREW TEETH (2026-06-10 -> 2026-08-13, ~a day of GPU). `init:` used to be a free
+    mapping whose only content was a NAME: `snapshot: descend_init`. On 2026-06-10 the BYTES behind
+    that name were replaced — a `move_to_target` handoff (cube already carried above the
+    destination, mean 8.4 cm away) was swapped for a `grab` handoff (cube freshly gripped at the
+    pickup point, mean 29.6 cm away, 0.000 of starts inside the ~6 cm the re-centring reward was
+    tuned for, against a 4.5 cm success tolerance in a 64-step episode). The task became close to
+    unwinnable and NOTHING objected: the plan fingerprint is identical for `snapshot: descend_init`
+    and `snapshot: TOTALLY_DIFFERENT` (it covers the reward's ops and scale, not its inputs), the
+    preflight asserted tolerances and competence but never where the cube starts, and the env
+    docstring's claim about the file contradicted the file's own metadata for two months. Two full
+    runs died on it — a YAML-reward run (32M steps, best 0.0625) and an unmodified PYTHON-reward
+    control (27.9M, best 0.25) — against a June lineage that reached 0.9375.
+
+    SO A DOCUMENT MAY NOW DECLARE WHAT IT EXPECTS TO FIND, not just what it is called:
+
+        init:
+          after: move_to_target                       # the predecessor whose handoff this is
+          chain: [reach, grab, lift, move_to_target]   # optional, the full upstream path
+          snapshot: descend_init_move                  # the materialised capture
+          sha256: "<64 hex>"                           # the content of that capture
+
+    `after:` is the cheaper and sharper of the two guards, and it is the one that would have caught
+    THIS bug in the first second: a skill is trained on the states its predecessors actually leave
+    it, so `descend` is `reach -> grab -> lift -> move_to_target -> descend` and its initiation set
+    is move's handoff. The capture files already record their own provenance and nothing compared it
+    to the document — `descend_init_move.npz` says `"after": "move_to_target"`, the swapped-in
+    `descend_init.npz` says `"prim": "grab"`. `after: move_to_target` against a file saying `grab`
+    is a refusal, and needs no simulator and no GPU to make. `sha256:` catches the narrower case the
+    provenance cannot see: the same predecessor, recaptured or edited into different data.
+
+    EVERY FIELD IS OPTIONAL AND A DOCUMENT WITHOUT THEM IS UNCHANGED. This repo is full of existing
+    snapshots and documents; a guard that broke them would not be adopted. What is refused here is
+    only INCOHERENCE — a digest or a provenance claim about no snapshot at all, a `chain:` whose
+    last element contradicts `after:`.
+
+    THIS MODULE DOES NOT READ THE FILE, AND THAT SEAM IS DELIBERATE. `bridle.skill` is stdlib-only:
+    it validates the SHAPE of the claim and carries it. Resolving `descend_init_move` to a path,
+    opening an `.npz`, canonicalising it and hashing it belongs to a backend adapter — the same
+    seam `env_id` resolution sits on (`bridle.adapters.env_ref`, "a second backend is a NEW MODULE
+    beside this one rather than an edit to the schema"). The adapter is
+    `bridle.adapters.snapshot_ref`, and it reports THREE outcomes, never two: OK, MISMATCH (a
+    refusal), and NOT CHECKED (no file reachable, or the file records no provenance). "Cannot
+    verify" is never rendered as "verified" here any more than it is for `env_id`.
+
+    NOT IN THE PLAN FINGERPRINT, ON PURPOSE. `RewardPlan.fingerprint()` answers exactly one
+    question — "is this the same reward function?" — and it already excludes `env_id`, `scene` and
+    `contract` for that reason (its own docstring closes on it). An initiation set is not the reward:
+    two documents with identical rows compute the identical function whatever states they are rolled
+    from, and folding the digest in would (a) say those two rewards differ, (b) move every existing
+    document's `plan@` the moment it adopts a digest, stranding checkpoints over a field that did
+    not change the arithmetic, and (c) put a value that changes when a file is RE-CAPTURED into a
+    digest whose stability is what makes a stamped checkpoint verifiable. The honest home for "which
+    initiation set was this trained from" is the TRAINING RECORD, which already carries
+    `plan@<fingerprint>` beside it — see `scripts/train_from_skill.py`, which verifies the digest at
+    launch and prints it into the run's log header. The counter-argument, stated so the next reader
+    can weigh it rather than re-derive it: a policy trained from a different initiation set is not
+    interchangeable with one trained from this one, so the digest IS part of "can I reuse this
+    checkpoint" — but that is `Contract.fingerprint()`'s question and the training record's, not
+    this one's, and answering it in two places is how the two answers start disagreeing.
+    """
+    if not isinstance(raw, dict):
+        raise SpecError("init", f"`init:` is a mapping, got {type(raw).__name__}")
+    for key in raw:
+        if key not in _INIT_FIELDS:
+            raise _unknown(f"init.{key}", "init field", key, _INIT_FIELDS)
+
+    snapshot = raw.get("snapshot")
+    if "snapshot" in raw and (not isinstance(snapshot, str) or not snapshot.strip()):
+        raise SpecError("init.snapshot", f"`init.snapshot:` names the initiation set (a capture "
+                                         f"key like `descend_init_move`), got {snapshot!r}")
+
+    digest = raw.get("sha256")
+    if "sha256" in raw:
+        if not isinstance(digest, str) or not _SHA256_RE.match(digest.strip()):
+            raise SpecError("init.sha256", f"`init.sha256:` is 64 lowercase hex characters — the "
+                                           f"content digest of the initiation set, as printed by "
+                                           f"`bridle.adapters.snapshot_ref.snapshot_digest` — got "
+                                           f"{digest!r}")
+        if not snapshot:
+            raise SpecError("init.sha256", "a digest with no `init.snapshot:` names nothing to "
+                                           "check it against — declare the snapshot, or drop the "
+                                           "digest")
+
+    after = raw.get("after")
+    if "after" in raw and (not isinstance(after, str) or not after.strip()):
+        raise SpecError("init.after", f"`init.after:` names the PREDECESSOR skill whose handoff "
+                                      f"this initiation set is (descend's is `move_to_target`), "
+                                      f"got {after!r}")
+
+    chain = raw.get("chain")
+    if "chain" in raw:
+        if not isinstance(chain, (list, tuple)) or not chain:
+            raise SpecError("init.chain", f"`init.chain:` is the non-empty upstream path, in order "
+                                          f"(`[reach, grab, lift, move_to_target]`), got "
+                                          f"{type(chain).__name__}")
+        for i, step in enumerate(chain):
+            if not isinstance(step, str) or not step.strip():
+                raise SpecError(f"init.chain[{i}]", f"a chain step is a skill name, got {step!r}")
+        # The last step of the chain IS the predecessor. Two spellings of one fact that disagree is
+        # the shape of bug this whole block exists to refuse, so it is refused here rather than left
+        # for the adapter (which checks only ONE of them against the file and would report the
+        # document self-consistent while it is not).
+        if after and chain[-1] != after:
+            raise SpecError("init.chain", f"`init.chain:` ends at {chain[-1]!r} but `init.after:` "
+                                          f"says {after!r} — the last step of the upstream path IS "
+                                          f"the predecessor this initiation set was captured after")
+        if not snapshot and not after:
+            raise SpecError("init.chain", "a `chain:` with no `snapshot:` and no `after:` claims "
+                                          "nothing checkable — name the initiation set it produces")
+    return _freeze(raw)
+
+
 def _parse_reward_scale(raw, chassis, declared_params):
     """`reward_scale:` — `reward_ppo = dense / divisor`, stated explicitly (§1.4). 7 of 15 primitives
     inherit `compute_normalized_dense_reward` without overriding it and so train at dense/12.0 even
@@ -850,9 +971,7 @@ def parse_spec(doc: dict) -> SkillSpec:
     params = _parse_params(doc["params"]) if "params" in doc else {}
     scene = _parse_scene(doc["scene"]) if "scene" in doc else {}
 
-    init = doc.get("init", {})
-    if not isinstance(init, dict):
-        raise SpecError("init", f"`init:` is a mapping, got {type(init).__name__}")
+    init = _parse_init(doc["init"]) if "init" in doc else {}
 
     # `doc.get(..., {})` and NOT `doc.get(...)`: an ABSENT `reward_scale:` inherits the chassis
     # divisor, a PRESENT-but-null one is refused like `init: null` — `_parse_reward_scale` can only
@@ -968,7 +1087,29 @@ def json_schema() -> dict:
                 "additionalProperties": {"type": "object", "required": ["type"],
                                          "properties": {"type": {"type": "string"}}},
             },
-            "init": {"type": "object"},
+            # Every field optional (a document with a bare `snapshot:`, or no `init:` at all, is
+            # still legal); what the schema pins is the SHAPE of each claim, so a constrained
+            # decoder cannot emit `sha256: true` or `chain: "reach, grab"`. The cross-field rules
+            # (`sha256` needs a `snapshot`, `chain[-1] == after`) are in `_parse_init` — JSON Schema
+            # can express them only as a thicket of `allOf`/`dependentRequired` that no author reads.
+            "init": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "snapshot": {"type": "string", "minLength": 1,
+                                 "description": "the initiation set: the capture the episode is "
+                                                "restored from at reset"},
+                    "sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$",
+                               "description": "content digest of that capture; a mismatch is a "
+                                              "refusal, an absent one reports NOT CHECKED"},
+                    "after": {"type": "string", "minLength": 1,
+                              "description": "the predecessor skill whose handoff this is — checked "
+                                             "against the provenance the capture file records"},
+                    "chain": {"type": "array", "minItems": 1, "items": {"type": "string",
+                                                                        "minLength": 1},
+                              "description": "the full upstream path, in order; its last step is "
+                                             "`after`"},
+                },
+            },
             "params": {"type": "object", "additionalProperties": {"$ref": "#/$defs/param"}},
             "reward_scale": {
                 "type": "object", "additionalProperties": False,
