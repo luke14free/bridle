@@ -720,12 +720,17 @@ assert not (set(_SIGN_LOAD_BEARING) - SIGNED_MEASURES), (
 # avoid, and it would have been the copy a reader edited.)
 
 
-def _custom_row(ctx, target):
-    """Tier 3: an imported `module:function`, which the stdlib evaluator refuses by construction
-    ("only the adapter can call it", `compile._v_custom`). Called with the same four arguments a
-    ManiSkill `compute_dense_reward` receives, so an existing env method can be lifted into a skill
-    document without rewriting it."""
-    module_name, _, function_name = target.partition(":")
+def _resolve_custom(target):
+    """`"module:function"` -> the callable, or a `SkillEnvError` naming which half is wrong.
+
+    Called from `_check_plan` (before any GPU) AND from `_custom_row` (every step). Resolution is
+    the same code in both places on purpose: a plan that `_check_plan` accepted must not be able to
+    fail to resolve later, and a plan it refused must not be reachable at all.
+    """
+    module_name, sep, function_name = target.partition(":")
+    if not sep or not module_name or not function_name:
+        raise SkillEnvError(f"custom row {target!r}: a tier-3 target is `module:function` — one "
+                            f"colon, an importable module on the left, a callable on the right")
     import importlib
     try:
         module = importlib.import_module(module_name)
@@ -735,6 +740,15 @@ def _custom_row(ctx, target):
     if not callable(fn):
         raise SkillEnvError(f"custom row {target!r}: {module_name!r} has no callable "
                             f"{function_name!r}")
+    return fn
+
+
+def _custom_row(ctx, target):
+    """Tier 3: an imported `module:function`, which the stdlib evaluator refuses by construction
+    ("only the adapter can call it", `compile._v_custom`). Called with the same four arguments a
+    ManiSkill `compute_dense_reward` receives, so an existing env method can be lifted into a skill
+    document without rewriting it."""
+    fn = _resolve_custom(target)
     return _check_batch(fn(ctx.env, ctx.obs, ctx.action, ctx.info), target, ctx.num_envs)
 
 
@@ -878,6 +892,13 @@ def _check_plan(plan):
                     f"and a tier-3 row is one opaque number — express the criterion as a "
                     f"`SuccessBonus`/`PredicateBonus` row with `mode: {op.kind}`, and keep the "
                     f"custom row for the value it computes")
+            # ...and the TARGET is resolved here too, which this function's own docstring promised
+            # and did not do: `"no.such.module:nope"` built a callable and raised at step 1, after
+            # the env was created and the policy allocated (measured 2026-08-13). Importing is the
+            # only way to know a tier-3 row exists — the compiler cannot, it is stdlib and this
+            # target is an arbitrary module — so it happens at the one moment before any GPU work
+            # where an import is cheap and a refusal is free.
+            _resolve_custom(op.params.get("target"))
             continue
         if op.fn_key not in _TERM_VALUE:
             raise SkillEnvError(f"no evaluator for reward row kind {op.fn_key!r}")

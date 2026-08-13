@@ -148,6 +148,33 @@ def _where(c, a, b):
     return c * a + (1 - c) * b
 
 
+def _truth(c):
+    """A row's CONDITION as a strict 0/1, so the two folds cannot disagree about a fractional one.
+
+    `_where` INTERPOLATES — that is the whole point of the branch-free idiom, and it is right for
+    every internal caller (`_max`/`_min`/`_clamp`/`_relu`), whose condition is a comparison and is
+    therefore already 0 or 1. A replace/floor row's condition is different: it arrives from outside
+    as `values["success"]`, and the adapter folds it with `torch.where(condition.to(torch.bool), ...)`,
+    which is "nonzero is true". At `condition = 0.5` the two returned 6.0 and 12.0 (measured
+    2026-08-13). Unreachable today — every predicate returns a 0.0/1.0 float by contract — but
+    `_success_value` passes the env's own `info["success"]` through untouched, so the guarantee is
+    somebody else's type discipline rather than this fold's.
+
+    NONZERO-IS-TRUE, matching the ADAPTER and not the evaluator, deliberately: the adapter is the
+    side a trained policy was folded on, and the parity numbers (1.2e-07 / 2.4e-07 vs
+    `descend_env.compute_dense_reward`) are measured against it. It is exactly the identity for a c
+    that is already 0 or 1, so nothing pinned moves.
+
+    WRITTEN AS TWO COMPARISONS AND A `_max`, NOT AS `(c != 0) * 1`, for the same batch-safety reason
+    everything else here is: `>` and `<` are the two operators a batched condition is guaranteed to
+    support all the way down — `test_skillcompile`'s `BoolMask` models a torch bool tensor and
+    admits `*` and nothing else — while `!=` would need a new operator on every batch type in the
+    fold's contract.
+    """
+    c = _numeric(c)      # first, because a raw bool batch admits `*` and not `>` (BoolMask's own
+    return _max(_numeric(c > 0), _numeric(0 > c))    # docstring: "the only route out of this type")
+
+
 def _max(a, b):
     return _where(a > b, a, b)
 
@@ -1258,6 +1285,10 @@ def evaluate_plan(plan: RewardPlan, values: dict):
             acc = acc + _VALUE[op.fn_key](op.params, values)
             continue
         condition, level = _CONDITION_LEVEL[op.fn_key](op.params, values)
+        # `_truth`, not the raw condition: this is the one `_where` whose condition comes from
+        # OUTSIDE (`values["success"]`) rather than from a comparison built here, and the adapter
+        # thresholds it. See `_truth` for the 6.0-vs-12.0 measurement.
+        condition = _truth(condition)
         # What the row's mode operates OVER comes from `_SCOPE_REACH`, the same table `_HONOURED`
         # builds its legal scope set from — so a scope this fold cannot implement is refused at
         # compile time instead of arriving here and being folded as `preceding` anyway.

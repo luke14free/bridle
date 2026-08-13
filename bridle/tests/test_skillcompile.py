@@ -72,7 +72,7 @@ from bridle.skill.compile import (
 from bridle.skill.compile import (
     _bind_number, _clamp, _CONTACT_SURFACE_MEASURES, _derive_contact_surfaces,
     _derive_peaked_kernels, _HONOURED, _KERNEL_PEAK_IS_NOT_AT_SETPOINT, _max, _min, _PEAKED_KERNELS,
-    _relu, _SCOPE_REACH, _UNIMPLEMENTED, _where, _ZERO_IS_NOT_A_CONTACT_SURFACE,
+    _relu, _SCOPE_REACH, _truth, _UNIMPLEMENTED, _where, _ZERO_IS_NOT_A_CONTACT_SURFACE,
 )
 from bridle.skill.spec import SpecError, parse_spec
 from bridle.skill.vocab import (
@@ -1434,6 +1434,25 @@ def run_checks():
           close_all(folded(fplan, pbatch),
                     [folded(fplan, values(grasped=g, not_grasped=1.0 - g))
                      for g in (1.0, 0.0, 1.0)]))
+
+    # ── a FRACTIONAL condition: the two folds used to disagree (2026-08-13 review, minor) ────────
+    # `_where` INTERPOLATES, which is right for every internal caller because their condition is a
+    # comparison. A replace/floor row's condition is the one that arrives from OUTSIDE — the adapter
+    # takes `info["success"]` straight from the env and folds it as
+    # `torch.where(condition.to(torch.bool), ...)`, i.e. nonzero-is-true. At `condition = 0.5` the
+    # evaluator returned 6.0 where the adapter returned 12.0. Unreachable today (every predicate
+    # returns a 0.0/1.0 float by contract) but nothing in the fold enforces that, so `_truth` now
+    # thresholds the condition on THIS side to match the side a trained policy was folded on.
+    check("a fractional success folds to the same branch the adapter takes, not to a blend",
+          close(_truth(0.5), 1) and close(_truth(0.0), 0) and close(_truth(1.0), 1)
+          and close(_truth(-0.25), 1))
+    half = values(success=0.5)
+    check("...and the replace row pays the FULL level for it, as `torch.where` would",
+          close(folded(plan, half), folded(plan, values(success=1.0))))
+    check("...and a 0/1 condition is untouched by the thresholding, which is why nothing pinned "
+          "above moved", close(folded(plan, values(success=1.0)), 12.0 - 0.001 * ACTION_NORM)
+          and close(folded(plan, values(success=0.0)),
+                    descend_reward_by_hand(values(), success=False)))
 
     # ── the evaluator's own contract ────────────────────────────────────────────────────────────
     missing = values()

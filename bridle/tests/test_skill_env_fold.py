@@ -592,6 +592,31 @@ def run_checks():
     check("F6 ...and a plain `add` custom row still passes the same check",
           SE._check_plan(plan_of(op("add", "custom", target=CUSTOM_TARGET))) is None)
 
+    # F7-F9 `_check_plan`'s own docstring says "Refuse, before any GPU is spent", and it did not
+    # RESOLVE a tier-3 target: `"no.such.module:nope"` built a callable and raised at step 1, after
+    # the env was created (measured 2026-08-13). Importing is the only way to know a tier-3 row
+    # exists — the compiler is stdlib and the target is an arbitrary module — so it belongs at the
+    # one moment before any GPU work where an import is cheap.
+    for label, target, fragment in (
+            ("an unimportable module", "no.such.module:nope", "cannot import"),
+            ("a name the module does not have", "math:no_such_fn", "no callable"),
+            ("a name that exists but is not callable", "math:pi", "no callable"),
+            ("a target with no colon at all", "math", "`module:function`")):
+        err_t = raises(SE.SkillEnvError, SE._check_plan,
+                       plan_of(op("add", "custom", target=target)))
+        check(f"F7 a custom row naming {label} is refused before a step is taken",
+              bool(err_t) and fragment in str(err_t) and target in str(err_t), str(err_t)[:90])
+    check("F8 ...and a resolvable target is still accepted, so this is a refusal and not a ban on "
+          "tier 3", SE._check_plan(plan_of(op("add", "custom", target="math:cos"))) is None)
+    # ...and the check and the step-1 call go through ONE resolver, so a plan `_check_plan` accepted
+    # cannot fail to resolve later. Compared by qualified name rather than by identity: run
+    # standalone this file is `__main__`, and `bridle.tests.test_skill_env_fold` is then a second
+    # import of it with its own function objects — an `is` check would be asserting the entry point.
+    check("F9 ...and `_check_plan` and `_custom_row` resolve through the SAME resolver, so a plan "
+          "the check accepted cannot fail to resolve at step 1",
+          SE._resolve_custom(CUSTOM_TARGET).__qualname__ == custom_row_fn.__qualname__
+          and SE._custom_row.__code__.co_names.count("_resolve_custom") == 1)
+
     # ── [G] the scope the fold used to drop ──────────────────────────────────────────────────────
     # `compile._SCOPE_REACH` is ONE table read by `_HONOURED` (what compiles) and by `evaluate_plan`
     # (what runs), precisely so a scope cannot be declared legal that the fold ignores. The adapter
